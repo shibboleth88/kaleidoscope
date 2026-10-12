@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaleidoscope"
+version = "0.1.0"
+description = "Cellular interactions as Bigraphical Reactive Systems, built on process-bigraph."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "bigraph-schema",
+    "process-bigraph",
+    "bigraph-viz",
+    "matplotlib",
+    "imageio",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "build",
+]
+
+[project.scripts]
+kaleidoscope = "kaleidoscope.systems.mapk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kaleidoscope*"]
+
+[tool.uv.sources]
+process-bigraph = { path = "../process-bigraph", editable = true }

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.uv/
+.pytest_cache/
+out/
+*.json
+!pyproject.toml.json
+target/
+result
+result-*
+.direnv/
