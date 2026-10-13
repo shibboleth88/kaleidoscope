@@ -48,7 +48,7 @@ type Tok =
   | { t: 'num'; v: number; float: boolean; nl: boolean; at: number }
   | { t: 'str'; v: string; nl: boolean; at: number }
   | { t: 'link'; v: string; nl: boolean; at: number }
-  | { t: 'site'; v: string; nl: boolean; at: number }
+  | { t: 'site'; v: string; attr?: string; nl: boolean; at: number }
   | { t: 'sym'; v: string; nl: boolean; at: number }
   | { t: 'eof'; nl: boolean; at: number };
 
@@ -82,8 +82,15 @@ function lex(src: string): Tok[] {
         ident.lastIndex = i + 1;
         const m = ident.exec(src);
         if (!m) throw new ReadError(`a name must follow ${c} at ${i}`);
-        push({ t: c === '~' ? 'link' : 'site', v: m[0], nl, at });
         i = ident.lastIndex;
+        // `?ps.x`: in a fold over a rest of points, the far node's attribute x
+        let attr: string | undefined;
+        if (c === '?' && src[i] === '.') {
+          ident.lastIndex = i + 1;
+          const a = ident.exec(src);
+          if (a) (attr = a[0]), (i = ident.lastIndex);
+        }
+        push(c === '~' ? { t: 'link', v: m[0], nl, at } : { t: 'site', v: m[0], ...(attr ? { attr } : {}), nl, at });
       } else if (c === '"') {
         let s = '';
         i++;
@@ -123,7 +130,9 @@ type Key = Scalar;
 export type Value =
   | { k: 'term'; head: string; attrs: Item[]; body: Item[] | null; at: number }
   | { k: 'lit'; v: Scalar }
-  | { k: 'site'; name: string }
+  | { k: 'site'; name: string; attr?: string }
+  /** A port's points: links, free points, and at most one rest (`(~c | ?ps)`). */
+  | { k: 'points'; items: Value[] }
   | { k: 'link'; name: string }
   | { k: 'free' }
   /** An expression: an operator (or a function) applied to values. */
@@ -143,7 +152,7 @@ export interface RuleAst {
 }
 
 class Parser {
-  private i = 0;
+  i = 0;
   constructor(private toks: Tok[]) {}
   peek(o = 0) {
     return this.toks[this.i + o];
@@ -228,9 +237,31 @@ class Parser {
     return lhs;
   }
 
+  /** `(~a | ! | ?rest)`: a port's points, where the brackets hold only those; else nothing (and nothing read). */
+  points(): Value | null {
+    const start = this.i;
+    this.next();
+    const items: Value[] = [];
+    for (;;) {
+      const t = this.peek();
+      if (t.t === 'link') items.push({ k: 'link', name: (this.next() as { v: string }).v });
+      else if (t.t === 'site' && !t.attr) items.push({ k: 'site', name: (this.next() as { v: string }).v });
+      else if (t.t === 'sym' && t.v === '!') this.next(), items.push({ k: 'free' });
+      else if (t.t === 'sym' && t.v === '|') this.next();
+      else if (t.t === 'sym' && t.v === ')' && items.length) {
+        this.next();
+        return { k: 'points', items };
+      } else break;
+    }
+    this.i = start;
+    return null;
+  }
+
   primary(): Value {
     const t = this.peek();
     if (t.t === 'sym' && t.v === '(') {
+      const pts = this.points();
+      if (pts) return pts.k === 'points' && pts.items.length === 1 && pts.items[0].k === 'site' ? pts.items[0] : pts;
       this.next();
       const v = this.value();
       this.expect(')');
@@ -266,7 +297,7 @@ class Parser {
 
   atom(): Value {
     const t = this.next();
-    if (t.t === 'site') return { k: 'site', name: t.v };
+    if (t.t === 'site') return { k: 'site', name: t.v, ...(t.attr ? { attr: t.attr } : {}) };
     if (t.t === 'link') return { k: 'link', name: t.v };
     if (t.t === 'sym' && t.v === '!') return { k: 'free' };
     if (t.t === 'num') return { k: 'lit', v: t.float || !Number.isInteger(t.v) ? { float: t.v } : { int: t.v } };
@@ -306,18 +337,20 @@ const KIND_TYPE: Record<ScalarKind, string> = { int: 'Int', float: 'Float', text
 const ZERO: Record<ScalarKind, Scalar> = { int: { int: 0 }, float: { float: 0 }, text: { text: '' }, bool: { bool: false } };
 
 /** An expression as the engine evaluates it: sites by their index in the redex. */
-function toExpr(v: Value, sites: Map<string, number> | null): Expr {
+function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> = new Set()): Expr {
   switch (v.k) {
     case 'lit':
       return { lit: v.v };
     case 'site': {
+      if (rests.has(v.name)) return v.attr ? { restAttr: v.name, key: v.attr } : { rest: v.name };
+      if (v.attr) throw new ReadError(`?${v.name}.${v.attr}: ?${v.name} is no rest of points`);
       if (!sites) throw new ReadError(`?${v.name}: a site is read only in a reactum or a guard`);
       const i = sites.get(v.name);
       if (i === undefined) throw new ReadError(`?${v.name} is no site of the redex`);
       return { site: i };
     }
     case 'expr':
-      return { op: v.op, args: v.args.map((a) => toExpr(a, sites)) };
+      return { op: v.op, args: v.args.map((a) => toExpr(a, sites, rests)) };
     case 'term':
       // a bare type name: what count[?x Type] counts
       if (!v.attrs.length && v.body === null) return { type: v.head };
@@ -341,6 +374,9 @@ class Builder {
   source = new Map<Id, MemberItem>();
   /** In a reactum: the redex's sites, by name, which expressions read. */
   readSites: Map<string, number> | null = null;
+  /** Rests of points this part names (each once), and in a reactum the redex's, which expressions fold over. */
+  rests = new Set<string>();
+  readRests: Set<string> | null = null;
   /** In a reactum: the scalar nodes whose values are computed. */
   computed: { node: Id; expr: Expr; kind: ScalarKind }[] = [];
   /** The item each site was read from (null for an unwritten attribute's). */
@@ -407,13 +443,13 @@ class Builder {
       this.siteSource.push(it);
       return;
     }
-    if (v.k === 'link' || v.k === 'free') throw new ReadError(`a link stands only at a port`);
+    if (v.k === 'link' || v.k === 'free' || v.k === 'points') throw new ReadError(`a link stands only at a port`);
     if (v.k === 'expr') {
       const kinds: ScalarKind[] = ['int', 'float', 'text', 'bool'];
       const slotKind = slotType !== null && (kinds as string[]).includes(this.sig.get(slotType).kind) ? (this.sig.get(slotType).kind as ScalarKind) : null;
       if (this.mode === 'reactum') {
         // a value computed from what the redex's sites hold, when the rule fires
-        const expr = toExpr(v, this.readSites ?? new Map());
+        const expr = toExpr(v, this.readSites ?? new Map(), this.readRests ?? new Set());
         const kind = slotKind ?? kindOf(expr);
         const type = slotType ?? this.sig.id(KIND_TYPE[kind]);
         this.source.set(this.ids.node, it);
@@ -483,6 +519,29 @@ class Builder {
     for (const p of decl.ports) {
       const w = written.get(p.key);
       const points: [Scalar, { contract: Id; target: Handle }][] = [];
+      if (p.arity === 0) {
+        // any number of points: those written, and perhaps a rest
+        const items = !w ? [] : w.k === 'points' ? w.items : [w];
+        let rest: string | undefined;
+        for (const it of items) {
+          if (it.k === 'site') {
+            if (rest) throw new ReadError(`port ${p.key} of ${v.head}: one rest of points at most`);
+            rest = it.name;
+          } else if (it.k === 'link') points.push([{ int: points.length }, { contract: p.contract, target: this.link(it.name, p.contract) }]);
+          else if (it.k === 'free') points.push([{ int: points.length }, { contract: p.contract, target: this.freeEdge(p.contract) }]);
+          else throw new ReadError(`port ${p.key} of ${v.head} takes links, ! and a rest`);
+        }
+        // unwritten: in a pattern, whatever points there are; on a kept node, those same points
+        if (!w && (this.mode === 'redex' || this.mode === 'negative' || (this.mode === 'reactum' && named))) rest = `_${named ?? id}_${p.key}`;
+        if (rest && (this.mode === 'state' || (this.mode === 'reactum' && !this.readRests?.has(rest))))
+          throw new ReadError(`?${rest}: a rest of points is met in a redex, and put back in its reactum`);
+        if (rest && this.mode !== 'reactum') {
+          if (this.rests.has(rest)) throw new ReadError(`?${rest} is a rest of points twice`);
+          this.rests.add(rest);
+        }
+        ports.push({ key: { text: p.key }, contract: p.contract, points, ...(rest ? { rest } : {}) });
+        continue;
+      }
       for (let j = 0; j < p.arity; j++) {
         let target: Handle;
         if (w?.k === 'link') target = this.link(p.arity > 1 ? `${w.name}` : w.name, p.contract);
@@ -620,8 +679,9 @@ export function buildRule(
   lhs.forEach((items, r) => redex.region(items, r));
   const reactum = new Builder(sig, 'reactum', ids, outer);
   reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
+  reactum.readRests = redex.rests;
   rhs.forEach((items, r) => reactum.region(items, r));
-  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites) : undefined;
+  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests) : undefined;
   let rate: number | undefined;
   let rateExpr: Expr | undefined;
   if (typeof opts.rate === 'number') rate = opts.rate;
@@ -630,7 +690,7 @@ export function buildRule(
     if (Number.isFinite(n)) rate = n;
     else {
       try {
-        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites);
+        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites, redex.rests);
       } catch (e) {
         throw new ReadError(`rate: ${(e as Error).message}`);
       }
@@ -710,7 +770,8 @@ const litOut = (s: Scalar): string =>
 
 export function valueText(v: Value): string {
   switch (v.k) {
-    case 'site': return `?${v.name}`;
+    case 'site': return `?${v.name}${v.attr ? `.${v.attr}` : ''}`;
+    case 'points': return `(${v.items.map(valueText).join(' | ')})`;
     case 'link': return `~${v.name}`;
     case 'free': return '!';
     case 'lit': return litOut(v.v);
@@ -798,7 +859,8 @@ export function print(g: Carrier, sig: Signature): string {
     }
     const kids = kidsOf({ node: n.id });
     const attrs = [
-      ...n.ports.map(
+      // a group of no points is written as nothing (unwritten, a port of any arity holds none)
+      ...n.ports.filter((grp) => grp.points.length > 0).map(
         (grp) =>
           `${keyText(grp.key)} = ${grp.points.length === 1 ? linkName(grp.points[0][1].target) : `(${grp.points.map(([, p]) => linkName(p.target)).join(' ')})`}`,
       ),

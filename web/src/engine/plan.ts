@@ -14,6 +14,7 @@
 import {
   type Carrier,
   type Handle,
+  type Port,
   type Id,
   type Index,
   type Node,
@@ -33,6 +34,10 @@ export interface Found {
   sites: Id[][];
   places: Parent[];
   names: [Id, Handle][];
+  /** Each rest of points: whose group it is, and the points it holds. */
+  rests: [string, { owner: Id; ports: Port[] }][];
+  /** In variadic groups, which state point each pattern point met: [pattern node, group key, pattern point, state point]. */
+  points: [Id, string, string, string][];
 }
 
 const NONE = -1;
@@ -48,6 +53,10 @@ interface GroupPlan {
   key: string;
   contract: Id;
   points: PointPlan[];
+  /** Points matched as a multiset, any of the group's for any of the pattern's (a group of any arity). */
+  variadic: boolean;
+  /** The rest of points, if the pattern has one: then the group may hold more. */
+  rest: string | null;
 }
 interface Step {
   pn: Node;
@@ -81,7 +90,7 @@ const payloadKey = (n: Node) => (typeof n.payload === 'string' ? n.payload : `s$
 const planCache = new WeakMap<Carrier, Map<string, Plan>>();
 
 /** The plan for a pattern, with the roots holding `firstRoots` met first in each region. */
-function planFor(pattern: Carrier, seeded: Set<Id> | null): Plan {
+function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan {
   let byOrder = planCache.get(pattern);
   if (!byOrder) planCache.set(pattern, (byOrder = new Map()));
   // which roots go first depends only on which of them hold a seeded node
@@ -119,9 +128,12 @@ function planFor(pattern: Carrier, seeded: Set<Id> | null): Plan {
   const bound = new Set<string>(); // `${kind}:${target}` bound by an earlier step
   const steps: Step[] = order.map(({ n, region }, i) => {
     stepOf.set(n.id, i);
+    const decl = sig.has(sig.name(n.type)) ? sig.get(n.type) : undefined;
     const ports: GroupPlan[] = n.ports.map((g) => ({
       key: scalarKey(g.key),
       contract: g.contract,
+      variadic: g.rest !== undefined || decl?.ports.find((p) => 'text' in g.key && p.key === g.key.text)?.arity === 0,
+      rest: g.rest ?? null,
       points: g.points.map(([k, p]) => ({
         key: scalarKey(k),
         contract: p.contract,
@@ -181,7 +193,7 @@ export function runPlan(
   seedEdges?: Map<Id, Id>,
   places0?: (Parent | undefined)[],
 ): void {
-  const plan = planFor(pattern, seed?.size ? new Set(seed.keys()) : null);
+  const plan = planFor(pattern, seed?.size ? new Set(seed.keys()) : null, sig);
   const { steps, edgeIds } = plan;
   const S = steps.length;
   const nodeOf = new Array<Id>(S).fill(NONE);
@@ -204,43 +216,84 @@ export function runPlan(
     return undefined;
   };
 
-  /** Bind a step's points to `gn`'s; false (with what it bound undone by the caller) where they cannot. */
-  const bind = (st: Step, gn: Node): boolean => {
-    for (const pg of st.ports) {
-      const gg = groupOf(gn, pg.key);
-      if (!gg || gg.points.length !== pg.points.length || !sig.sub(gg.contract, pg.contract)) return false;
+  /** Bind one pattern point to a state handle; false where it cannot be (what it bound is undone by the caller). */
+  const bindPoint = (pp: PointPlan, h: Handle): boolean => {
+    if (pp.kind === EDGE) {
+      if (!('edge' in h)) return false;
+      const have = edgeOf[pp.target];
+      if (have !== NONE) return h.edge === have;
+      if (usedEdges.has(h.edge) || nameUses.has(handleKey(h))) return false;
+      edgeOf[pp.target] = h.edge;
+      usedEdges.set(h.edge, pp.target);
+      edgeStack.push(pp.target);
+      return true;
+    }
+    if (pp.kind === NAME) {
+      const hk = handleKey(h);
+      if (nameOf[pp.target]) return nameKeyOf[pp.target] === hk;
+      if ('edge' in h && usedEdges.has(h.edge)) return false;
+      nameOf[pp.target] = h;
+      nameKeyOf[pp.target] = hk;
+      nameUses.set(hk, (nameUses.get(hk) ?? 0) + 1);
+      nameStack.push(pp.target);
+      return true;
+    }
+    return false; // binders: not yet
+  };
+
+  const restStack: [string, { owner: Id; ports: Port[] }][] = [];
+  const pointStack: [Id, string, string, string][] = [];
+
+  /**
+   * Bind a step's port groups to `gn`'s, from group `gi` on, and go on (`done`) for every way they bind. A group of
+   * fixed arity binds point by key; a variadic one binds each pattern point to any state point not yet taken, and
+   * its rest (if any) takes what is left.
+   */
+  const bindGroups = (st: Step, gn: Node, gi: number, done: () => void): void => {
+    if (stopped) return;
+    if (gi === st.ports.length) return done();
+    const pg = st.ports[gi];
+    const gg = groupOf(gn, pg.key);
+    if (!gg || !sig.sub(gg.contract, pg.contract)) return;
+    const em = edgeStack.length, nm = nameStack.length;
+    if (!pg.variadic) {
+      if (gg.points.length !== pg.points.length) return;
+      let ok = true;
       for (const pp of pg.points) {
         let gp: (typeof gg.points)[number] | undefined;
         for (const x of gg.points) if (scalarKey(x[0]) === pp.key) { gp = x; break; }
-        if (!gp || !sig.sub(gp[1].contract, pp.contract)) return false;
-        const h = gp[1].target;
-        if (pp.kind === EDGE) {
-          if (!('edge' in h)) return false;
-          const have = edgeOf[pp.target];
-          if (have !== NONE) {
-            if (h.edge !== have) return false;
-          } else {
-            if (usedEdges.has(h.edge) || nameUses.has(handleKey(h))) return false;
-            edgeOf[pp.target] = h.edge;
-            usedEdges.set(h.edge, pp.target);
-            edgeStack.push(pp.target);
-          }
-        } else if (pp.kind === NAME) {
-          const hk = handleKey(h);
-          const have = nameOf[pp.target];
-          if (have) {
-            if (nameKeyOf[pp.target] !== hk) return false;
-          } else {
-            if ('edge' in h && usedEdges.has(h.edge)) return false;
-            nameOf[pp.target] = h;
-            nameKeyOf[pp.target] = hk;
-            nameUses.set(hk, (nameUses.get(hk) ?? 0) + 1);
-            nameStack.push(pp.target);
-          }
-        } else return false; // binders: not yet
+        if (!gp || !sig.sub(gp[1].contract, pp.contract) || !bindPoint(pp, gp[1].target)) { ok = false; break; }
       }
+      if (ok) bindGroups(st, gn, gi + 1, done);
+      undo(em, nm);
+      return;
     }
-    return true;
+    if (pg.rest === null ? gg.points.length !== pg.points.length : gg.points.length < pg.points.length) return;
+    const taken = new Array<boolean>(gg.points.length).fill(false);
+    const place = (pi: number): void => {
+      if (stopped) return;
+      if (pi === pg.points.length) {
+        if (pg.rest !== null) restStack.push([pg.rest, { owner: gn.id, ports: gg.points.filter((_, j) => !taken[j]).map(([, p]) => p) }]);
+        bindGroups(st, gn, gi + 1, done);
+        if (pg.rest !== null) restStack.pop();
+        return;
+      }
+      const pp = pg.points[pi];
+      for (let j = 0; j < gg.points.length; j++) {
+        if (taken[j] || !sig.sub(gg.points[j][1].contract, pp.contract)) continue;
+        const e2 = edgeStack.length, n2 = nameStack.length;
+        if (bindPoint(pp, gg.points[j][1].target)) {
+          taken[j] = true;
+          pointStack.push([st.pn.id, pg.key, pp.key, scalarKey(gg.points[j][0])]);
+          place(pi + 1);
+          pointStack.pop();
+          taken[j] = false;
+        }
+        undo(e2, n2);
+      }
+    };
+    place(0);
+    undo(em, nm);
   };
 
   const undo = (edgeMark: number, nameMark: number) => {
@@ -307,7 +360,7 @@ export function runPlan(
       const em = edgeStack.length, nm = nameStack.length;
       nodeOf[k] = gn.id;
       used.add(gn.id);
-      if (bind(st, gn)) assign(k + 1);
+      bindGroups(st, gn, 0, () => assign(k + 1));
       undo(em, nm);
       used.delete(gn.id);
       nodeOf[k] = NONE;
@@ -412,6 +465,8 @@ export function runPlan(
       sites,
       places: places.map((p) => p!),
       names: plan.nameIds.flatMap((id, i) => (nameOf[i] ? [[id, nameOf[i]!] as [Id, Handle]] : [])),
+      rests: restStack.map(([n, r]) => [n, { owner: r.owner, ports: [...r.ports] }]),
+      points: [...pointStack],
     };
     if (found(f) === false) stopped = true;
   };

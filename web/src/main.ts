@@ -369,6 +369,7 @@ function renderEditor(fresh: boolean) {
       <input class="name" value="${esc(se.name)}" spellcheck="false">
       ${isRule ? `<label title="A number, or an expression over the redex's sites, worked out at each place it can fire: max[count[?x Yang] - 12 0]">rate <input class="rate" spellcheck="false" value="${esc(String((se as RuleEntry).rate))}"></label>` : ''}
       ${isRule ? `<label class="guard" title="Fires only where this holds, over the redex's sites: ?m >= 2, count[?x] < 10, …">where <input class="guard-in" spellcheck="false" placeholder="always" value="${esc(guardOf(se.text))}"></label>` : ''}
+      ${isRule ? `<button class="ghost unless" title="Show a slot below the redex to drop what must not be there">+ unless</button>` : ''}
       ${isRule ? `<button class="toggle">${lib.system.rules.includes(se.id) ? 'in the system ●' : 'not in the system ○'}</button>` : `<button class="toggle">${lib.system.initial === se.id ? 'the initial state ★' : 'make initial ☆'}</button>`}
       <button class="ghost del" title="Delete">delete</button>`;
     textarea.value = se.text;
@@ -394,6 +395,14 @@ function renderEditor(fresh: boolean) {
       const v = (ev.target as HTMLInputElement).value.trim();
       (se as RuleEntry).rate = v === '' ? 1 : Number.isFinite(Number(v)) ? Number(v) : v;
       changed();
+    });
+    let adding = false;
+    editor.addingUnless(false);
+    $('.unless', head)?.addEventListener('click', (ev) => {
+      adding = !adding;
+      (ev.target as HTMLElement).classList.toggle('on', adding);
+      editor.addingUnless(adding);
+      if (adding) preview.frame();
     });
     $('.toggle', head).addEventListener('click', () => {
       if (selection.kind === 'rule')

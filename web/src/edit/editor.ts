@@ -67,6 +67,8 @@ export class Editor {
   private hint: HTMLElement;
   /** A rule's rate, as written: shown under the reactum where it is an expression. */
   private rate: string | undefined;
+  /** Whether the slot that starts a new unless is shown (each unless written is shown regardless). */
+  private adding = false;
   /** What was last written, so the text box echoing it back does not re-read it. */
   private lastText = '';
 
@@ -112,6 +114,13 @@ export class Editor {
     this.selected = null;
     this.selectedItem = null;
     return this.build();
+  }
+
+  /** Show (or hide) the slot that starts a new unless. */
+  addingUnless(on: boolean) {
+    if (this.adding === on) return;
+    this.adding = on;
+    this.show();
   }
 
   /** The types, side by side: a showroom. */
@@ -240,7 +249,7 @@ export class Editor {
         [
           ...sides,
           ...negSlots,
-          {
+          ...(this.adding ? [{
             key: 'U',
             carrier: r.redex,
             offset: new THREE.Vector3(-w, -(r.negatives.length + 1) * h, 0),
@@ -249,7 +258,7 @@ export class Editor {
             names: b.redex.names,
             quietSites: redexSites,
             tint: new Map(r.redex.nodes.map((n) => [n.id, 'ghost' as const])),
-          },
+          }] : []),
         ],
       );
       // what is one thing on both sides: kept nodes, and each site and its uses

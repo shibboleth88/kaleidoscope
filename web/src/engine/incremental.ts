@@ -17,7 +17,7 @@
  */
 
 import { type Carrier, type Id, Index, isAttr, keyed, memberKey, scalarKey } from './carrier';
-import { evaluate, sitesOf } from './expr';
+import { evaluate, readsAcross, sitesOf } from './expr';
 import { type Occurrence, discover, siteEnv, spotKey } from './match';
 import type { Transition } from './react';
 import type { Rule } from './rule';
@@ -81,6 +81,8 @@ export class Discovery {
   private readonly isLocal: boolean[];
   /** For each rule whose site contents may go stale: the redex nodes holding its one anonymous site. */
   private readonly lazy: (Set<number> | null)[];
+  /** Rules whose expressions read the far ends of a rest of points (`?ps.x`): a change there is a change to them. */
+  private readonly across: boolean[];
 
   constructor(
     readonly rules: Rule[],
@@ -88,6 +90,7 @@ export class Discovery {
   ) {
     this.isLocal = rules.map(local);
     this.lazy = rules.map(lazySites);
+    this.across = rules.map((r) => [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(readsAcross));
   }
 
   /** An occurrence as it stands now: where its rule's site contents may be stale, found again, from its nodes. */
@@ -145,6 +148,16 @@ export class Discovery {
         if (!ix.node.get(id)) affected.add(id);
       }
 
+    // what is linked to a changed node: a rule reading across links (`?ps.x`) reads them
+    const linked = new Set<Id>();
+    if (this.across.some(Boolean))
+      for (const ix of [before, after])
+        for (const id of changed) {
+          const n = ix.node.get(id);
+          if (!n) continue;
+          for (const grp of n.ports) for (const [, pt] of grp.points) for (const p of ix.pointsOn(pt.target)) if (!changed.has(p.node)) linked.add(p.node);
+        }
+
     // the changed nodes and their parents, before and after: where a lazy rule's new occurrences can be
     const near = new Set<Id>(changed);
     for (const ix of [before, after])
@@ -181,6 +194,12 @@ export class Discovery {
         if (kids.length && (!lz.has(pn) || kids.some((c) => [before, after].some((ix) => { const n = ix.node.get(c); return !!n && isAttr(n.member); }))))
           drop(k);
       }
+    // a rule reading across links: what met a node linked to a change read the change
+    for (const id of linked)
+      for (const k of [...(this.byNode.get(id) ?? [])]) {
+        const v = this.occs.get(k);
+        if (v && this.across[this.rules.indexOf(v.rule)]) drop(k);
+      }
     // a rule that lost most of what it had is found again whole: one search, not one per anchor
     const whole = this.rules.map((rule, i) => !this.isLocal[i] || (lost.get(rule) ?? 0) * 2 > (had.get(rule) ?? 0));
     this.rules.forEach((rule, i) => {
@@ -194,7 +213,7 @@ export class Discovery {
         for (const o of discover(next, rule, this.sig, { index: after })) this.add(o, rule, after);
         return;
       }
-      const anchors = this.lazy[i] ? near : affected;
+      const anchors = this.across[i] ? new Set([...(this.lazy[i] ? near : affected), ...linked]) : this.lazy[i] ? near : affected;
       for (const id of anchors) {
         const n = after.node.get(id);
         if (!n) continue;
@@ -248,7 +267,7 @@ export class Discovery {
       let rate = rule.rate ?? 1;
       if (rule.rateExpr) {
         try {
-          rate = (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig), 'float') as { float: number }).float;
+          rate = (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig, o.rests), 'float') as { float: number }).float;
         } catch {
           rate = 0;
         }

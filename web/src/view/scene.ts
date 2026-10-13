@@ -61,7 +61,8 @@ interface Body {
   /** What the breadcrumbs call it. */
   name: string;
   flash: number;
-  ports: { key: string; dir: THREE.Vector3; handle: string }[];
+  /** Each port's point: its direction on the body (or, `face`, toward what it is linked to), and its handle. */
+  ports: { key: string; dir: THREE.Vector3; handle: string; face?: boolean }[];
   container: boolean;
   /** A leaf is drawn as an instance of its shape; a place has a mesh of its own. */
   inst?: Shape;
@@ -116,7 +117,7 @@ export class BigraphView {
   private portCores: THREE.InstancedMesh;
   /** A hyperedge's meeting point: where its spokes join. */
   private hubs: THREE.InstancedMesh;
-  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean; any: boolean; carried: boolean }[] = [];
+  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean; any: boolean; carried: boolean; color?: THREE.Color }[] = [];
   /** Nodes drawn as links: each, and the handles its ports are on. */
   private asLinks: { key: string; handles: string[] }[] = [];
   /** The points on each handle, but those of nodes drawn as links. */
@@ -401,13 +402,17 @@ export class BigraphView {
       b.name = vis.label ?? `${keyWord}${this.sig.name(n.type)}${words.length ? ` ${words.join(' ')}` : ''}`;
       if (vis.label !== undefined || vis.asLink) this.setLabel(b, vis.asLink ? '' : vis.label!, container ? 'place' : 'node');
       else this.setLabel(b, `${b.tint === 'forbid' ? '⊘ ' : ''}${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
-      b.ports = n.ports.flatMap((grp, gi) =>
-        grp.points.map(([pt], pi) => ({
+      const decl = this.sig.get(n.type);
+      b.ports = n.ports.flatMap((grp, gi) => {
+        // a port of any arity: each point faces what it is linked to
+        const face = 'text' in grp.key && decl.ports.find((p) => p.key === (grp.key as { text: string }).text)?.arity === 0;
+        return grp.points.map(([pt], pi) => ({
           key: `${JSON.stringify(grp.key)}/${JSON.stringify(pt)}`,
           dir: PORT_DIRS[(gi * 3 + pi) % PORT_DIRS.length],
           handle: this.handleKey(slot, grp.points[pi][1].target),
-        })),
-      );
+          ...(face ? { face: true } : {}),
+        }));
+      });
     }
 
     g.sites.forEach((s, i) => {
@@ -569,9 +574,12 @@ export class BigraphView {
         if (isName && !any && this.bodies.has(h)) points.push(`${h}|anchor`);
         this.handlePoints.set(h, points);
         const c = carried.has(h);
-        this.edges.push({ slot: slot.key, points, key: h, free: !c && (any || points.length < 2), name: isName, any, carried: c });
+        // a link drawn in its contract's colour, where the contract's type says one
+        const eid = /:e(\d+)$/.exec(h)?.[1];
+        const contract = eid !== undefined ? g.edges.find((e) => e.id === Number(eid))?.contract : undefined;
+        const st = contract !== undefined && this.sig.has(this.sig.name(contract)) ? (this.sig.get(contract).style as { color?: string } | undefined) : undefined;
+        this.edges.push({ slot: slot.key, points, key: h, free: !c && (any || points.length < 2), name: isName, any, carried: c, ...(st?.color ? { color: new THREE.Color(st.color) } : {}) });
       }
-      void g;
     }
   }
 
@@ -585,9 +593,18 @@ export class BigraphView {
     }
     const p = b.ports.find((x) => x.key === port);
     if (!p) return false;
-    dir?.copy(p.dir);
+    let d = p.dir;
+    if (p.face) {
+      // toward the other end of its link
+      const other = (this.handlePoints.get(p.handle) ?? []).map((r) => this.bodies.get(r.split('|')[0])).find((o) => o && o !== b);
+      if (other) {
+        const v = other.world.clone().sub(b.world);
+        if (v.lengthSq() > 1e-8) d = v.normalize();
+      }
+    }
+    dir?.copy(d);
     // just off the surface, so the ring sits on it
-    out.copy(p.dir).multiplyScalar(b.r * b.grow * (b.container ? 1 : 0.95) + 0.08 * b.grow).add(b.world);
+    out.copy(d).multiplyScalar(b.r * b.grow * (b.container ? 1 : 0.95) + 0.08 * b.grow).add(b.world);
     return true;
   }
 
@@ -967,7 +984,7 @@ export class BigraphView {
         }
       }
       if (!linked || e.carried) continue;
-      const lit = tmp.copy(BOUND).multiplyScalar(Math.max(0.06, Math.max(...e.points.map(seenOf)))).toArray();
+      const lit = tmp.copy(e.color ?? BOUND).multiplyScalar(Math.max(0.06, Math.max(...e.points.map(seenOf)))).toArray();
       if (ends.length === 2) {
         // a bond: out of each ring, round, and into the other
         const [x, y] = ends;

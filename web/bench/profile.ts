@@ -10,6 +10,7 @@ const d = new Discovery(rules, c.sig);
 const random = rng(1);
 const cells = () => g.nodes.filter((n) => n.type === c.sig.id('Cell')).length;
 const stop = Number(process.argv[2] ?? 4000);
+const until28 = process.argv[3] === 'until28';
 const t0 = performance.now();
 let last = t0;
 const fired = new Map<string, number>();
@@ -18,6 +19,10 @@ for (let i = 1; i <= stop; i++) {
   if (!s) break;
   g = s.state;
   fired.set(s.transition.rule, (fired.get(s.transition.rule) ?? 0) + 1);
+  if (until28 && cells() >= 28) {
+    console.log(`28 cells at reaction ${i}, embryo time ${(g.nodes.find((n) => JSON.stringify(n.member) === '{"attr":{"text":"t"}}')!.payload as { scalar: { float: number } }).scalar.float.toFixed(1)}`);
+    break;
+  }
   if (i % 500 === 0) {
     const now = performance.now();
     console.log(`step ${i}  cells ${cells()}  nodes ${g.nodes.length}  ${((now - last) / 500).toFixed(2)} ms/step`);

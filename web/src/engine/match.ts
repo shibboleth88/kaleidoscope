@@ -19,7 +19,9 @@ import {
   Index,
   type Node,
   type Parent,
+  type Port,
   handleKey,
+  scalarKey,
   isAttr,
   keyed,
   memberKey,
@@ -46,6 +48,10 @@ export interface Occurrence {
   places: Parent[];
   /** Each redex outer name: the state handle the context joins it to. */
   names: [Id, Handle][];
+  /** Each rest of points (kaleidoscope's, F28): whose group it is, and the points it holds. */
+  rests?: [string, { owner: Id; ports: Port[] }][];
+  /** In variadic groups, which state point each redex point met: [redex node, group key, redex point, state point]. */
+  points?: [Id, string, string, string][];
 }
 
 export interface MatchOptions {
@@ -139,8 +145,25 @@ function blockedReference(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, 
 }
 
 /** What an occurrence's sites hold, for expressions to read. */
-export function siteEnv(ix: Index, sites: Id[][], sig?: Signature): Env {
+export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [string, { owner: Id; ports: Port[] }][]): Env {
+  const rest = (name: string) => rests?.find(([n]) => n === name)?.[1];
   return {
+    far(name) {
+      const r = rest(name);
+      if (!r) return [];
+      const out: Id[] = [];
+      for (const p of r.ports) for (const pt of ix.pointsOn(p.target)) if (pt.node !== r.owner) out.push(pt.node);
+      return out;
+    },
+    points: (name) => rest(name)?.ports.length ?? 0,
+    shared(a, b) {
+      const ka = new Set((rest(a)?.ports ?? []).map((p) => handleKey(p.target)));
+      return (rest(b)?.ports ?? []).filter((p) => ka.has(handleKey(p.target))).length;
+    },
+    attr(node, key) {
+      const c = ix.childAt({ node }, `a${scalarKey({ text: key })}`);
+      return c && typeof c.payload === 'object' ? c.payload.scalar : null;
+    },
     scalar(i) {
       const roots = sites[i] ?? [];
       const n = roots.length === 1 ? ix.node.get(roots[0]) : undefined;
@@ -160,7 +183,7 @@ export function siteEnv(ix: Index, sites: Id[][], sig?: Signature): Env {
 /** The guard holds here, and every computed value can be computed here. */
 function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
   if (!rule.guard && !rule.computed?.length) return true;
-  const env = siteEnv(ix, occ.sites, sig);
+  const env = siteEnv(ix, occ.sites, sig, occ.rests);
   try {
     if (rule.guard && !holds(rule.guard, env)) return false;
     for (const c of rule.computed ?? []) evaluate(c.expr, env, c.kind);

@@ -441,3 +441,101 @@ change is a claim about what a reaction can and cannot affect, and so a candidat
 The rest is the same per-search cost spread thin (site bookkeeping, garbage). A Lean implementation's
 `reaction.impl` would want 1–3 as lemmas, since they are what make discovery cost what changed rather than what
 is there.
+
+### F34. Whitespace-separated arguments and minus collide
+
+**Came up:** `clamp[F -1.0 1.0]` and `if[c a -0.02 * x b]`. v004 separates a call's arguments by whitespace
+(`add[3 4]`), and has infix `-`. After a value, `-1.0` reads as "minus 1.0", so the arguments run together:
+`F - 1.0` and `1.0` (two values, not three). The reader cannot tell `[a -b]` (two arguments) from `[a - b]`
+(one).
+
+**Kaleidoscope:** a minus after a value is subtraction, and it is a sign only where a value may start. Authors
+write `(-1.0)` or rearrange the term. The reader refuses the wrong count (`if takes 3 values`), so the mistake is
+caught, not silently miscomputed.
+
+**Question:** v004 decision 2 makes juxtaposition sequence. Should a negative literal argument need brackets, or
+should `-` with no space after it before a number always be a sign (`[a -1]` two arguments, `[a - 1]` one, `[a-1]`
+one?), as some languages decide by spacing?
+
+### F35. A rest of points, built (F28), and what it settled (F30)
+
+Kaleidoscope now has F28's rest of points, PROVISIONAL:
+- A port may hold any number of points (`contacts :: Link *`).
+- A pattern names a rest: `contacts = ?ps` (whatever is there), or `contacts = (~c | ?ps)` (a point on `~c`, and
+  the rest).
+- In the redex, an explicit point meets *any* of the group's points (a branch per choice), and the rest holds the
+  others. In the reactum, `?ps` puts them back, and leaving it out lets them go.
+- In the carrier, a rest is a field of a pattern's port group (`PortGroup.rest`). Its points pass through the
+  decomposition as F6's implicit names, so `discover_sound` (decompose, then compose back) still holds, and is
+  tested.
+- Expressions fold over it: `sum[?ps E]` with `?ps.x` the far node's `x`, `count[?ps]`, and `shared[?ps ?qs]` (how
+  many links two rests share, which is "not already in contact" as a guard rather than a negative).
+
+What it settled:
+- **F30 goes away.** A link has no direction, so "an AB daughter in contact with the signaller" is one rule
+  (`contacts = (~k | ?as)` on both), not two.
+- **Reified contacts go away.** Contacts are links again, and the embryo is simpler.
+- **Mechanics in a fold** (F29, the first route): `settle` moves a cell by its net force over all its contacts.
+  Reaching 28 cells takes 4,568 reactions (2,701 of them `settle`), against more than 6,000 for 26 cells with one
+  reaction per contact.
+
+What it costs, and the spec questions:
+- **A fold reads across links.** An occurrence of `settle` depends on its neighbours' attributes, so a neighbour that
+  moves makes it stale. Incremental discovery has to know which rules read across links (`readsAcross`), and stale
+  them when a linked node changes. Is "an occurrence depends on what its rests reach" part of `Occurrence`, so the
+  F26 laws can account for it?
+- **Choice of a point is an occurrence.** `(~c | ?ps)` meets a cell once per contact. Each choice is a distinct
+  occurrence, with different name bindings and the same `SameSpot` (same nodes, same edges). Under the random
+  policy these share one spot, so "part a contact" fires per pair of cells, not per contact. Is `SameSpot` the
+  right unit when the choice is a link? (Here the contact's closed edge puts it in the spot, so it does fire per
+  contact. With an open name it would not.)
+- **A rest is not a site:** it holds points, not places, and nothing in `Rule.formed` or `Instantiates` knows it.
+  Adopting it means a site map for points beside the one for places.
+
+### F36. No way to name a value within a rule
+
+**Came up:** folding the eggshell into `settle` (as wyrm's mechanics does: move by the net force, then project back
+inside the shell). The new position is `?x + clamp[FX (-1.0) 1.0]`, and the projection divides it by the square root
+of where the moved point lies in the shell, which reads all three new coordinates, twice each. With no way to name
+a value, each coordinate's expression spells out every force sum again: the rule's text is about 30 copies of
+`sum[?ps …]`.
+
+**Kaleidoscope:** the library builds the text from helpers, and the engine works out a top-level `sum` once per
+occurrence (memoised by its structure, as the state cannot change while an occurrence's expressions are evaluated).
+Folding the shell in took the embryo from 4,568 reactions to 28 cells (1,425 of them `eggshell`, undoing what
+`settle` had just done) to 2,759, and 12.9 s to 7.9 s.
+
+**Question:** a `let` in a rule (`let FX = sum[…] in …`, or named values beside `where`) shared by the guard, the
+rate and the reactum. In v004 terms it is a binding whose scope is the whole rule; the spec would have to say it is
+evaluated once per occurrence, over the redex's sites, before the guard.
+
+### F37. Subtypes and ports: a supertype's pattern cannot meet a node with more ports
+
+**Came up:** ember · moss · mist wanted one rule for "a kind breeds inside whatever creature holds it", written
+over a supertype (`?h = Creature(?x = Moss(?i) | ?s)`). Ember, Moss and Mist each declare a port (`pact`), so they
+are not met by a `Creature` pattern unless `Creature` declares the same ports. Two things combine:
+- **Ports are not inherited.** `Ember[pact :: Link] <: Creature` declares `pact` itself; `Creature` does not give it.
+- **A pattern node meets a node with exactly its ports** (the same groups). A subtype that adds a port is not met
+  by its supertype's pattern, though `≤` says it is one.
+
+**Kaleidoscope:** the matcher compares port groups exactly, so the example writes each rule per kind (generated)
+and keeps rules that need "any parent" parentless (siblings in a region), avoiding the question.
+
+**Question:** width subtyping for ports. Either a subtype inherits its supertypes' ports (and may add more), and a
+pattern of type T meets a node of type S ≤ T on T's ports alone, S's extra ports being "any link" as an unwritten
+port is; or ports stay exact and supertypes are only for kinds with the same shape. The first is what `<:` reads
+as, and what an author reaches for.
+
+### F38. Idle edges, decided (F8)
+
+**Came up:** ember · moss · mist lets a creature die with a pact (`Ember(?i) => ?i`, its port unwritten: any link).
+The pact edge loses its last point when the partner dies too, and stays. Over 39,000 reactions, 2,800 idle edges
+accumulated, invisible but carried in every state (and costing every index).
+
+**Kaleidoscope:** states are now taken up to idle edges. After a reaction, an edge with no points that had a point
+on a removed node, and no value, is dropped (`react`, listed in `edgesRemoved`). Nothing could match it: a redex's
+closed edge has points.
+
+**Question for the spec:** the same as F8, now with an answer to weigh. Dropping idle edges makes reaction
+congruent up to them; `discover_sound` still holds (the occurrence composes back to the state before), but the
+result is the composition *minus* idle edges, which the reaction theorem would have to say.

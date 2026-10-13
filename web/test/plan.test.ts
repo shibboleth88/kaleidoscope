@@ -15,7 +15,9 @@ describe('the compiled matcher', () => {
       let g = c.states.get(lib.states[0].id) as Carrier;
       const random = rng(4);
       for (let i = 0; i < 120; i++) {
-        if (i % 6 === 0) for (const r of rules) expect([r.name, canon(discover(g, r, c.sig))]).toEqual([r.name, canon(discoverReference(g, r, c.sig))]);
+        // (the reference matcher predates rests of points and groups of any arity: those rules are the compiled one's alone)
+        const variadic = (r: Rule) => [r.redex, ...r.negatives].some((x) => x.nodes.some((n) => n.ports.some((grp) => grp.rest !== undefined || c.sig.get(n.type).ports.some((p) => p.arity === 0))));
+        if (i % 6 === 0) for (const r of rules.filter((r) => !variadic(r))) expect([r.name, canon(discover(g, r, c.sig))]).toEqual([r.name, canon(discoverReference(g, r, c.sig))]);
         const s = step(g, rules, c.sig, random);
         if (!s) break;
         g = s.state;

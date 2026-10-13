@@ -33,6 +33,7 @@ header .mode { margin-left: auto; }
 button { background: rgba(127, 246, 255, 0.08); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.ghost { background: none; color: var(--dim); }
+button.ghost.unless.on { color: var(--accent); }
 button.big { background: linear-gradient(180deg, rgba(255, 211, 110, 0.25), rgba(255, 211, 110, 0.08)); border-color: rgba(255, 211, 110, 0.5); font-weight: 600; font-size: 14px; padding: 6px 16px; }
 button.big:hover { border-color: var(--warm); }
 select, input:not([type='range']) { background: rgba(255,255,255,0.04); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }

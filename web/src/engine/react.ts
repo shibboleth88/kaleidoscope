@@ -20,7 +20,9 @@ import {
   Index,
   type Interface,
   type Node,
+  type PortGroup,
   handleKey,
+  scalarKey,
   keyed,
   nextIds,
   relabel,
@@ -110,6 +112,9 @@ export function decompose(g: Carrier, rule: Rule, occ: Occurrence): Decompositio
     });
   }
 
+  // what a rest of points holds is linked outside the redex: through names of its own, as a site's contents are
+  for (const [, r] of occ.rests ?? []) for (const p of r.ports) innerNameFor(p.target);
+
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   const metInner = extend(R.inner);
   const metOuter = extend(R.outer);
@@ -117,7 +122,9 @@ export function decompose(g: Carrier, rule: Rule, occ: Occurrence): Decompositio
   // the redex as it stands in the state: its nodes and edges sent where the occurrence sends them, narrowed
   const redexPoint = new Map<string, Handle>();
   for (const pn of R.nodes)
-    for (const grp of pn.ports) for (const [k, p] of grp.points) redexPoint.set(`${pn.id}/${JSON.stringify(grp.key)}/${JSON.stringify(k)}`, p.target);
+    for (const grp of pn.ports) for (const [k, p] of grp.points) redexPoint.set(`${pn.id}/${scalarKey(grp.key)}/${scalarKey(k)}`, p.target);
+  // in a group of any arity, the state point a redex point met (by key, elsewhere)
+  const pointMet = new Map((occ.points ?? []).map(([pn, g, pp, sp]) => [`${pn}/${g}/${sp}`, pp]));
   const metNodes: Node[] = R.nodes.map((pn) => {
     const gn = ix.node.get(nmap.get(pn.id)!)!;
     return {
@@ -127,7 +134,10 @@ export function decompose(g: Carrier, rule: Rule, occ: Occurrence): Decompositio
       ports: gn.ports.map((grp) => ({
         ...grp,
         points: grp.points.map(([k, p]) => {
-          const t = redexPoint.get(`${pn.id}/${JSON.stringify(grp.key)}/${JSON.stringify(k)}`)!;
+          const gk = scalarKey(grp.key), sk = scalarKey(k);
+          const t = redexPoint.get(`${pn.id}/${gk}/${pointMet.get(`${pn.id}/${gk}/${sk}`) ?? sk}`);
+          // a point the redex does not write is its rest's: through its name
+          if (!t) return [k, { ...p, target: { name: innerNameFor(p.target) } }];
           return [k, { ...p, target: 'edge' in t ? { edge: emap.get(t.edge)! } : t }];
         }),
       })),
@@ -288,14 +298,24 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature):
   const relabelled = relabel(rule.reactum, (x) => fn.get(x) ?? x, (x) => fe.get(x) ?? x);
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   // values computed from what the sites held
-  const env = siteEnv(ix, occ.sites, sig);
+  const env = siteEnv(ix, occ.sites, sig, occ.rests);
   const computed = new Map((rule.computed ?? []).map((c) => [fn.get(c.node)!, evaluate(c.expr, env, c.kind)]));
+  // a group with a rest of points: its own points, then the rest's, through the names the decomposition gave them
+  const nameOfHandle = new Map(implicit.map(([z, h]) => [handleKey(h), z]));
+  const withRests = (groups: PortGroup[]): PortGroup[] =>
+    groups.map(({ rest, ...g }) => {
+      if (!rest) return g;
+      const held = occ.rests?.find(([n]) => n === rest)?.[1].ports ?? [];
+      const points = [...g.points.map(([, p]) => p), ...held.map((p) => ({ contract: p.contract, target: { name: nameOfHandle.get(handleKey(p.target))! } }))];
+      return { ...g, points: points.map((p, i) => [{ int: i }, p] as [{ int: number }, typeof p]) };
+    });
   const freshReactum: Carrier = {
     ...relabelled,
     inner: extend(relabelled.inner),
     outer: extend(relabelled.outer),
     nodes: relabelled.nodes.map((n) => ({
       ...n,
+      ports: withRests(n.ports),
       type: keptRetype.get(n.id) ?? n.type,
       ...(computed.has(n.id) ? { payload: { scalar: computed.get(n.id)! } } : {}),
     })),
@@ -304,15 +324,25 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature):
 
   // the pieces are this function's own, built formed: composed without checking them again (the tests compose
   // every decomposition back, checked)
-  const state = compose(compose(inst, freshReactum, { trusted: true }), context, { trusted: true });
+  const composed = compose(compose(inst, freshReactum, { trusted: true }), context, { trusted: true });
 
   const keptIds = new Set(keptTo.values());
   const removed = [...occ.nodes.map(([, s]) => s).filter((s) => !keptIds.has(s)), ...dropped];
+  // states up to idle edges (F8): an edge whose last points went with what was removed goes too
+  const before = Index.of(g);
+  const touched = new Set<Id>();
+  for (const id of removed)
+    for (const pg of before.node.get(id)?.ports ?? []) for (const [, pt] of pg.points) if ('edge' in pt.target) touched.add(pt.target.edge);
+  const after = Index.of(composed);
+  const idle = [...touched].filter((e) => after.pointsOn({ edge: e }).length === 0 && composed.edges.some((x) => x.id === e && x.value === null));
+  const idleSet = new Set(idle);
+  const state = idle.length ? { ...composed, edges: composed.edges.filter((e) => !idleSet.has(e.id)) } : composed;
   const keptEdgeIds = new Set(keptEdgeTo.values());
   const droppedSet = new Set(dropped);
   const edgesRemoved = [
     ...occ.edges.map(([, s]) => s).filter((s) => !keptEdgeIds.has(s)),
     ...parameter.edges.filter((e) => Index.of(parameter).pointsOn({ edge: e.id }).every((p) => droppedSet.has(p.node))).map((e) => e.id),
+    ...idle,
   ];
   return {
     state,

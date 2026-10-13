@@ -49,7 +49,7 @@ export function spots(g: Carrier, rules: Rule[], sig: Signature): Spot[] {
       let rate = rule.rate ?? 1;
       if (rule.rateExpr) {
         try {
-          rate = (evaluate(rule.rateExpr, siteEnv(ix, occurrences[0].sites, sig), 'float') as { float: number }).float;
+          rate = (evaluate(rule.rateExpr, siteEnv(ix, occurrences[0].sites, sig, occurrences[0].rests), 'float') as { float: number }).float;
         } catch {
           rate = 0;
         }

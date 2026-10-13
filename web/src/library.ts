@@ -75,9 +75,10 @@ export function parseType(text: string): TypeDef {
   const [, name, slots, supers, style] = m;
   const def: TypeDef = { name, supers: supers ? supers.split(',').map((x) => x.trim()).filter(Boolean) : [], slots: [], style: {} };
   for (const slot of (slots ?? '').split('|').map((x) => x.trim()).filter(Boolean)) {
-    const sm = /^([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)(?:\s*\*\s*(\d+))?$/.exec(slot);
+    const sm = /^([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)(?:\s*(\*)\s*(\d+)?)?$/.exec(slot);
     if (!sm) throw new Error(`a slot is "key :: Type", not "${slot}"`);
-    def.slots.push({ key: sm[1], type: sm[2], ...(sm[3] ? { arity: Number(sm[3]) } : {}) });
+    // `p :: Link * 2`: two points; `p :: Link *`: any number of points
+    def.slots.push({ key: sm[1], type: sm[2], ...(sm[3] ? { arity: sm[4] ? Number(sm[4]) : 0 } : {}) });
   }
   if (style) {
     try {
@@ -91,7 +92,7 @@ export function parseType(text: string): TypeDef {
 
 /** A type written back as its line. */
 export function typeText(d: TypeDef): string {
-  const slots = d.slots.map((x) => `${x.key} :: ${x.type}${x.arity && x.arity > 1 ? ` * ${x.arity}` : ''}`).join(' | ');
+  const slots = d.slots.map((x) => `${x.key} :: ${x.type}${x.arity === 0 ? ' *' : x.arity && x.arity > 1 ? ` * ${x.arity}` : ''}`).join(' | ');
   const style = Object.entries(d.style)
     .filter(([, v]) => v !== undefined && v !== '')
     .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
@@ -111,7 +112,7 @@ export function signatureOf(defs: TypeDef[]): Signature {
     const spec: TypeSpec = { supers: d.supers, ports: {}, attrs: {}, style: d.style };
     if (linkish.has(d.name)) spec.kind = 'link';
     for (const x of d.slots) {
-      if (linkish.has(x.type)) spec.ports![x.key] = x.arity && x.arity > 1 ? [x.type, x.arity] : x.type;
+      if (linkish.has(x.type)) spec.ports![x.key] = x.arity !== undefined && x.arity !== 1 ? [x.type, x.arity] : x.type;
       else spec.attrs![x.key] = x.type;
     }
     specs[d.name] = spec;
@@ -250,6 +251,84 @@ export const growth = (): Library => {
 };
 
 /**
+ * Ember, moss and mist: three kinds that eat one another round a circle (ember burns moss, moss drinks mist, mist
+ * quenches ember), in a pond, and inside one another.
+ *
+ * - **Only moss grows by itself** (in the light, while the pond has room). Ember and mist live by eating, and a
+ *   hunter holding no prey starves.
+ * - **Engulf, then digest.** A hunter takes its prey inside itself (up to three at a time), with whatever the prey
+ *   holds. Digested, the prey's contents spill into the hunter, and the hunter buds. So a mist that has eaten an
+ *   ember holds the moss the ember had eaten: its own hunter, carried inside it until it starves and lets it go.
+ * - **Pacts across layers.** A hunter's prey is its hunter's hunter. An ember inside a mist can make a pact (a link,
+ *   through the mist's skin) with a moss outside; while it lasts the ember cannot be digested, and the moss comes
+ *   for the mist. Once the moss has digested the mist, the ember is inside the moss, still linked to it, and eats
+ *   it from within.
+ * - **Arrivals.** Now and then one of each drifts into the pond, so no ending is final.
+ *
+ * Every combination has its own dynamics. Moss alone fills the pond and holds. Ember alone, or mist alone, starves.
+ * Ember and moss boom and bust (or ember overgrazes and both crash); mist with moss is eaten; mist with ember eats
+ * it out and starves. All three chase one another round: mist booms when ember is high and moss low, ember
+ * crashes, moss recovers and eats the mist. Each kind's population, the nesting and the pacts rise and fall.
+ */
+export const emberMossMist = (): Library => {
+  // who eats whom: the hunter, its prey, and the hunter of the hunter (the prey's own prey)
+  const circle: [string, string, string][] = [
+    ['Ember', 'Moss', 'Mist'],
+    ['Moss', 'Mist', 'Ember'],
+    ['Mist', 'Ember', 'Moss'],
+  ];
+  // how keenly each hunts (per pair that could meet)
+  // (moss, the one that grows by itself and so is always about, hunts gently; mist, at the top of the chain moss
+  // feeds, keenly: an even circle would leave mist no room)
+  const hunt: Record<string, number> = { Ember: 0.02, Moss: 0.005, Mist: 0.05 };
+  const rules: RuleEntry[] = circle.flatMap(([x, y, z]) => [
+    // only moss grows by itself (in the light); ember and mist live by eating
+    ...(x === 'Moss' ? [{ name: 'Moss grows', rate: '0.8 * max[1 - count[?s] / 40 0]', text: '?p = Pond(?x = Moss(?i) | ?s)\n  => ?p = Pond(?x = Moss(?i) | Moss | ?s)' }] : []),
+    { name: `${x} engulfs ${y}`, rate: hunt[x], text: `?x = ${x}(?i) | ?y = ${y}(?j) where count[?i ${y}] < 3\n  => ?x = ${x}(?i | ?y = ${y}(?j))` },
+    { name: `${x} digests ${y}`, rate: 0.5, text: `?x = ${x}(${y}[pact = !](?j) | ?i)\n  => ?x = ${x}(?i | ?j) | ${x}` },
+    // moss withers slowly; a hunter holding no prey starves
+    x === 'Moss' ? { name: 'Moss withers', rate: 0.05, text: 'Moss(?i)\n  => ?i' } : { name: `${x} starves`, rate: 0.25, text: `${x}(?i) where count[?i ${y}] == 0\n  => ?i` },
+    { name: `${x} arrives`, rate: 0.04, text: `?p = Pond(?s)\n  => ?p = Pond(?s | ${x})` },
+    {
+      name: `${y} in ${x} calls ${z}`,
+      rate: 0.005,
+      text: `?z = ${z}[pact = !](?k) | ?x = ${x}(?y = ${y}[pact = !](?j) | ?i)\n  => ?z = ${z}[pact = ~b](?k) | ?x = ${x}(?y = ${y}[pact = ~b](?j) | ?i)`,
+    },
+    {
+      name: `${z} comes for ${x}`,
+      rate: 2,
+      text: `~b :: Link | ?z = ${z}[pact = ~b](?k) | ?x = ${x}(?y = ${y}[pact = ~b](?j) | ?i)\n  => ?z = ${z}[pact = ~b](?k | ?x = ${x}(?y = ${y}[pact = ~b](?j) | ?i))`,
+    },
+    {
+      name: `${y} eats ${z} from within`,
+      rate: 1,
+      text: `~b :: Link | ?z = ${z}[pact = ~b](?y = ${y}[pact = ~b](?j) | ?k)\n  => ?y = ${y}[pact = !](?j) | ${y} | ?k`,
+    },
+    {
+      name: `${y} and ${z} part`,
+      rate: 0.15,
+      text: `~b :: Link | ?y = ${y}[pact = ~b](?j) || ?z = ${z}[pact = ~b](?k)\n  => ?y = ${y}[pact = !](?j) || ?z = ${z}[pact = !](?k)`,
+    },
+  ]).map((r) => ({ ...r, id: uid() }));
+  const pond: StateEntry = {
+    id: uid(),
+    name: 'pond',
+    text: `Pond(\n${['Ember', 'Moss', 'Mist'].flatMap((k) => Array.from({ length: 6 }, () => `  ${k}`)).join('\n')})`,
+  };
+  return {
+    types: [
+      'Pond {color: "#123247", container: true}',
+      'Ember[pact :: Link] {color: "#ff6a3d", container: true}',
+      'Moss[pact :: Link] {color: "#7bd389", container: true}',
+      'Mist[pact :: Link] {color: "#7fb8ff", container: true}',
+    ].map((text) => ({ id: uid(), text })),
+    states: [pond],
+    rules,
+    system: { initial: pond.id, rules: rules.map((r) => r.id), seed: 9, pace: 'time' },
+  };
+};
+
+/**
  * The lac operon: a gene that is read only when it is needed. `unless` does the work twice:
  * - the gene is transcribed UNLESS a repressor sits on its operator;
  * - a repressor binds the operator UNLESS one already does.
@@ -352,30 +431,32 @@ export const yinYang = (): Library => {
  * The C. elegans embryo, from the zygote to 28 cells: a port of wyrm (`~/code/wyrm`, its `embryo-mechanics.ys`).
  *
  * Cells have positions and radii (µm) inside a 25 × 15 × 15 µm eggshell, and each divides when its lineage
- * class's period has passed since its birth (wyrm's measured periods, volume shares and axes). Contacts are
- * nodes joining two cells' identity links (a cell has as many contacts as it touches, which a port of fixed arity
- * cannot hold); daughters are joined by a Sister contact. Contacts form where cells come within reach and part
- * where they drift apart. Mechanics is pairwise: each contact pushes its two cells apart where they overlap and
- * draws them together where they are near, one reaction at a time (wyrm sums forces over neighbours per tick; a
- * one-reaction-at-a-time engine relaxes contact by contact instead). P2 signals: AB's daughter touching it takes
- * Notch (ABp), EMS touching it takes Wnt, and so divides into MS and E.
+ * class's period has passed since its birth (wyrm's measured periods, volume shares and axes). A cell's contacts
+ * are links (a port of any arity: `contacts :: Link *`); sisters are joined by a Sister link. Contacts form where
+ * cells come within reach and part where they drift apart.
+ *
+ * Mechanics is one rule per cell, `settle`: it moves the cell by the net force from all its contacts at once,
+ * folded over the rest of its points (`sum[?ps …]`, `?ps.x` the neighbour's x), wyrm's force law, and then keeps
+ * it inside the shell (projected back onto it, as wyrm's `confine`). P2 signals:
+ * AB's daughter touching it takes Notch (ABp), EMS touching it takes Wnt, and so divides into MS and E. A link has
+ * no direction, so each is one rule.
  *
  * As in wyrm, no rule reads a name: names are written, never read.
  */
 export const embryo = (): Library => {
   const S = 0.7937; // the cube root of a half: equal daughters
   const A = ['name', 'founder', 'depth', 'pgen', 'born', 'x', 'y', 'z', 'r', 'signal', 'wnt', 'glp1', 'fate'];
-  const cell = (v: Record<string, string | number>, id: string, named?: string) =>
-    `${named ? `?${named} = ` : ''}Cell[id = ~${id} | ${A.map((k) => `${k} = ${v[k]}`).join(' | ')}]`;
+  const cell = (v: Record<string, string | number>, contacts: string, named?: string) =>
+    `${named ? `?${named} = ` : ''}Cell[contacts = ${contacts} | ${A.map((k) => `${k} = ${v[k]}`).join(' | ')}]`;
   const mother = (fixed: Record<string, string | number>) =>
-    cell({ name: '?n', pgen: '?p', born: '?b', x: '?x', y: '?y', z: '?z', r: '?r', signal: '?s', wnt: '?w', glp1: '?g', fate: '?f', ...fixed }, 'i', 'm');
+    cell({ name: '?n', pgen: '?p', born: '?b', x: '?x', y: '?y', z: '?z', r: '?r', signal: '?s', wnt: '?w', glp1: '?g', fate: '?f', ...fixed }, '?cs', 'm');
   const inEmbryo = (inner: string) => `?e = Embryo[t = ?t](${inner} | ?rest)`;
-  const division = (name: string, period: number, before: string, after: string[]): RuleEntry => ({
+  // the mother is the first daughter, keeping her contacts; the second starts with only her sister
+  const division = (name: string, period: number, before: string, after: [string, string]): RuleEntry => ({
     id: uid(),
     name,
     rate: 8,
-    text: `${inEmbryo(before)} where ?t >= ?b + ${period.toFixed(1)}
-  => ${inEmbryo([...after, 'Sister[a = ~i | b = ~d]'].join(' | '))}`,
+    text: `${inEmbryo(before)} where ?t >= ?b + ${period.toFixed(1)}\n  => ~s :: Sister | ${inEmbryo(after.join(' | '))}`,
   });
 
   // the germline: P_k gives a founder and P_k+1, unequally (wyrm's shares: the founder's part of the volume)
@@ -383,15 +464,15 @@ export const embryo = (): Library => {
     const cs = Math.cbrt(share).toFixed(4), cp = Math.cbrt(1 - share).toFixed(4);
     const keep = { pgen: k, born: '?t', y: '?y', signal: 'false', wnt: 'false', glp1: 'false' };
     return division(`P${k} divides`, period, mother({ founder: '"p"', depth: 0, pgen: k }), [
-      cell({ ...keep, name: `"${fname}"`, founder: `"${founder}"`, depth: 0, x: `?x - 0.5 * ?r * ${cp}`, z: k === 1 ? '?z - 2.0' : '?z', r: `?r * ${cs}`, fate: `"${fname}"` }, 'i', 'm'),
-      cell({ ...keep, name: `"P${k + 1}"`, founder: '"p"', depth: 0, pgen: k + 1, x: `?x + 0.5 * ?r * ${cs}`, z: '?z', r: `?r * ${cp}`, signal: k === 1 ? 'true' : 'false', fate: '"germline"' }, 'd'),
+      cell({ ...keep, name: `"${fname}"`, founder: `"${founder}"`, depth: 0, x: `?x - 0.5 * ?r * ${cp}`, z: k === 1 ? '?z - 2.0' : '?z', r: `?r * ${cs}`, fate: `"${fname}"` }, '(?cs | ~s)', 'm'),
+      cell({ ...keep, name: `"P${k + 1}"`, founder: '"p"', depth: 0, pgen: k + 1, x: `?x + 0.5 * ?r * ${cs}`, z: '?z', r: `?r * ${cp}`, signal: k === 1 ? 'true' : 'false', fate: '"germline"' }, '~s'),
     ]);
   };
 
   // a somatic division: two equal daughters along an axis, named by their side
-  const soma = (name: string, founder: string, depth: number, period: number, axis: 'x' | 'y', o: { tilt?: number; sides?: [string, string] } = {}) => {
-    const [s1, s2] = o.sides ?? (axis === 'x' ? ['a', 'p'] : ['l', 'r']);
-    const daughter = (sign: '-' | '+', side: string, id: string, named?: string) =>
+  const soma = (name: string, founder: string, depth: number, period: number, axis: 'x' | 'y', o: { tilt?: number } = {}) => {
+    const [s1, s2] = axis === 'x' ? ['a', 'p'] : ['l', 'r'];
+    const daughter = (sign: '-' | '+', side: string, contacts: string, named?: string) =>
       cell(
         {
           name: `?n ++ "${side}"`, founder: `"${founder}"`, depth: depth + 1, pgen: '?p', born: '?t',
@@ -400,36 +481,45 @@ export const embryo = (): Library => {
           z: sign === '+' && o.tilt ? `?z + ${o.tilt.toFixed(1)}` : '?z',
           r: `?r * ${S}`, signal: 'false', wnt: '?w', glp1: '?g', fate: '?f',
         },
-        id,
+        contacts,
         named,
       );
-    return division(name, period, mother({ founder: `"${founder}"`, depth }), [daughter('-', s1, 'i', 'm'), daughter('+', s2, 'd')]);
+    return division(name, period, mother({ founder: `"${founder}"`, depth }), [daughter('-', s1, '(?cs | ~s)', 'm'), daughter('+', s2, '~s')]);
   };
 
   // EMS: with Wnt from P2, MS (anterior) and E; without it, two MS
   const ems = (wnt: boolean): RuleEntry => {
-    const d = (sign: '-' | '+', nm: string, founder: string, fate: string, id: string, named?: string) =>
-      cell({ name: `"${nm}"`, founder: `"${founder}"`, depth: 0, pgen: '?p', born: '?t', x: `?x ${sign} 0.5 * ?r * ${S}`, y: '?y', z: '?z', r: `?r * ${S}`, signal: 'false', wnt: wnt ? 'true' : 'false', glp1: '?g', fate: `"${fate}"` }, id, named);
+    const d = (sign: '-' | '+', nm: string, founder: string, fate: string, contacts: string, named?: string) =>
+      cell({ name: `"${nm}"`, founder: `"${founder}"`, depth: 0, pgen: '?p', born: '?t', x: `?x ${sign} 0.5 * ?r * ${S}`, y: '?y', z: '?z', r: `?r * ${S}`, signal: 'false', wnt: wnt ? 'true' : 'false', glp1: '?g', fate: `"${fate}"` }, contacts, named);
     return division(wnt ? 'EMS divides (Wnt)' : 'EMS divides (no Wnt)', 14.3, mother({ founder: '"ems"', depth: 0, wnt: wnt ? 'true' : 'false' }), [
-      d('-', 'MS', 'ms', 'mesoderm', 'i', 'm'),
-      wnt ? d('+', 'E', 'e', 'endoderm', 'd') : d('+', 'MS', 'ms', 'mesoderm', 'd'),
+      d('-', 'MS', 'ms', 'mesoderm', '(?cs | ~s)', 'm'),
+      wnt ? d('+', 'E', 'e', 'endoderm', '~s') : d('+', 'MS', 'ms', 'mesoderm', '~s'),
     ]);
   };
 
+  // distance, reach and the pair force (wyrm: k_rep 0.2, k_adh 0.02, adhesion out to 1.2 × the summed radii)
   const D = 'hypot[?ax - ?bx ?ay - ?by ?az - ?bz]';
   const S0 = '(?ra + ?rb)';
-  const pair = (contact: boolean) =>
-    `${contact ? '?c = Contact[a = ~i | b = ~j] | ' : ''}?p = Cell[id = ~i | x = ?ax | y = ?ay | z = ?az | r = ?ra] | ?q = Cell[id = ~j | x = ?bx | y = ?by | z = ?bz | r = ?rb]`;
-  const moved = (f: string) =>
-    `?c = Contact[a = ~i | b = ~j] | ?p = Cell[id = ~i | x = ?ax + ${f} * (?ax - ?bx) | y = ?ay + ${f} * (?ay - ?by) | z = ?az + ${f} * (?az - ?bz) | r = ?ra]` +
-    ` | ?q = Cell[id = ~j | x = ?bx - ${f} * (?ax - ?bx) | y = ?by - ${f} * (?ay - ?by) | z = ?bz - ${f} * (?az - ?bz) | r = ?rb]`;
-  const still = '?p = Cell[id = ~i | x = ?ax | y = ?ay | z = ?az | r = ?ra] | ?q = Cell[id = ~j | x = ?bx | y = ?by | z = ?bz | r = ?rb]';
-  const signal = (name: string, who: string, then: string, flip: boolean): RuleEntry => {
-    const link = flip ? 'Contact[a = ~j | b = ~i]' : 'Contact[a = ~i | b = ~j]';
-    return { id: uid(), name, rate: 2, text: `?a = Cell[id = ~i | ${who}] | ?c = ${link} | ?g = Cell[id = ~j | signal = true]
-  => ?a = Cell[id = ~i | ${then}] | ?c = ${link} | ?g = Cell[id = ~j | signal = true]` };
-  };
-  const SH = '?x * ?x / (max[25 - ?r 1] * max[25 - ?r 1]) + ?y * ?y / (max[15 - ?r 1] * max[15 - ?r 1]) + ?z * ?z / (max[15 - ?r 1] * max[15 - ?r 1])';
+  const both = (ps: string, qs: string, extra = '') =>
+    `?p = Cell[contacts = ${ps} | x = ?ax | y = ?ay | z = ?az | r = ?ra${extra}] | ?q = Cell[contacts = ${qs} | x = ?bx | y = ?by | z = ?bz | r = ?rb${extra}]`;
+  // settle: the net force from every contact, over the rest of the cell's points
+  const nd = 'hypot[?x - ?ps.x ?y - ?ps.y ?z - ?ps.z]';
+  // (no term starts with a minus: between whitespace-separated values it would read as a subtraction, F34)
+  const f = `if[${nd} < ?r + ?ps.r 0.2 * (?r + ?ps.r - ${nd}) if[${nd} < 1.2 * (?r + ?ps.r) 0.02 * (?r + ?ps.r - ${nd}) 0.0]]`;
+  const F = (ax: 'x' | 'y' | 'z') => `sum[?ps ${f} * (?${ax} - ?ps.${ax}) / max[${nd} 0.01]]`;
+  // the shell: where a point lies within it, shrunk by the cell's radius (1: on its surface)
+  const SH = (x: string, y: string, z: string) =>
+    `(${x}) * (${x}) / (max[25 - ?r 1] * max[25 - ?r 1]) + (${y}) * (${y}) / (max[15 - ?r 1] * max[15 - ?r 1]) + (${z}) * (${z}) / (max[15 - ?r 1] * max[15 - ?r 1])`;
+  // settle moves a cell by its net force, then keeps it inside the shell (wyrm's confine: projected back onto it)
+  const step = (ax: 'x' | 'y' | 'z') => `?${ax} + clamp[${F(ax)} (-1.0) 1.0]`;
+  const moved = SH(step('x'), step('y'), step('z'));
+  const confine = (ax: 'x' | 'y' | 'z') => `if[${moved} <= 1.0 ${step(ax)} (${step(ax)}) / sqrt[${moved}]]`;
+  const signal = (name: string, who: string, then: string): RuleEntry => ({
+    id: uid(),
+    name,
+    rate: 2,
+    text: `?a = Cell[contacts = (~k | ?as) | ${who}] | ?g = Cell[contacts = (~k | ?gs) | signal = true]\n  => ?a = Cell[contacts = (~k | ?as) | ${then}] | ?g = Cell[contacts = (~k | ?gs) | signal = true]`,
+  });
 
   const rules: RuleEntry[] = [
     { id: uid(), name: 'clock', rate: 4, text: '?e = Embryo[t = ?t](?rest)\n  => ?e = Embryo[t = ?t + 0.25](?rest)' },
@@ -448,27 +538,21 @@ export const embryo = (): Library => {
     soma('E divides', 'e', 0, 18.2, 'x'),
     soma('C divides', 'c', 0, 18.3, 'x'),
     soma('C2 divide', 'c', 1, 23.8, 'x'),
-    { id: uid(), name: 'push apart', rate: 3, text: `${pair(true)} where ${D} < ${S0}
-  => ${moved(`clamp[0.15 * (${S0} - ${D}) 0 0.6] / max[${D} 0.01]`)}` },
-    { id: uid(), name: 'hold together', rate: 3, text: `${pair(true)} where ${D} >= ${S0} and ${D} < 1.2 * ${S0}
-  => ${moved(`-clamp[0.05 * (${D} - ${S0}) 0 0.6] / max[${D} 0.01]`)}` },
+    {
+      id: uid(),
+      name: 'settle',
+      rate: 3,
+      text: `?p = Cell[contacts = ?ps | x = ?x | y = ?y | z = ?z | r = ?r] where hypot[${F('x')} ${F('y')} ${F('z')}] > 0.05 or ${SH('?x', '?y', '?z')} > 1.001\n  => ?p = Cell[contacts = ?ps | x = ${confine('x')} | y = ${confine('y')} | z = ${confine('z')} | r = ?r]`,
+    },
     {
       id: uid(),
       name: 'touch',
       rate: 2,
-      text: `${pair(false)} where (?ax < ?bx or ?ax == ?bx and ?ay < ?by) and ${D} < ${S0}
-  => ${still} | Contact[a = ~i | b = ~j]
-  unless Contact[a = ~i | b = ~j]
-  unless Contact[a = ~j | b = ~i]`,
+      text: `${both('?ps', '?qs')} where (?ax < ?bx or ?ax == ?bx and ?ay < ?by) and ${D} < ${S0} and shared[?ps ?qs] == 0\n  => ${both('(?ps | ~c)', '(?qs | ~c)')}`,
     },
-    { id: uid(), name: 'part', rate: 2, text: `${pair(true)} where ${D} > 1.2 * ${S0}
-  => ${still}` },
-    { id: uid(), name: 'eggshell', rate: 3, text: `?p = Cell[x = ?x | y = ?y | z = ?z | r = ?r] where ${SH} > 1
-  => ?p = Cell[x = ?x / sqrt[${SH}] | y = ?y / sqrt[${SH}] | z = ?z / sqrt[${SH}] | r = ?r]` },
-    signal('Notch (ABp)', 'founder = "ab" | depth = 1 | glp1 = false | fate = ?f', 'founder = "ab" | depth = 1 | glp1 = true | fate = "ABp-type"', false),
-    signal('Notch (ABp) ·', 'founder = "ab" | depth = 1 | glp1 = false | fate = ?f', 'founder = "ab" | depth = 1 | glp1 = true | fate = "ABp-type"', true),
-    signal('Wnt (EMS)', 'founder = "ems" | wnt = false', 'founder = "ems" | wnt = true', false),
-    signal('Wnt (EMS) ·', 'founder = "ems" | wnt = false', 'founder = "ems" | wnt = true', true),
+    { id: uid(), name: 'part', rate: 2, text: `~c :: Link | ${both('(~c | ?ps)', '(~c | ?qs)')} where ${D} > 1.2 * ${S0}\n  => ${both('?ps', '?qs')}` },
+    signal('Notch (ABp)', 'founder = "ab" | depth = 1 | glp1 = false | fate = ?f', 'founder = "ab" | depth = 1 | glp1 = true | fate = "ABp-type"'),
+    signal('Wnt (EMS)', 'founder = "ems" | wnt = false', 'founder = "ems" | wnt = true'),
     {
       id: uid(),
       name: 'ABa',
@@ -479,15 +563,13 @@ export const embryo = (): Library => {
   const zygote: StateEntry = {
     id: uid(),
     name: 'zygote',
-    text: `Embryo[t = 0.0](
-  Cell[name = "P0" | founder = "p" | depth = 0 | pgen = 0 | born = 0.0 | x = 0.0 | y = 0.0 | z = 0.0 | r = 14.0 | signal = false | wnt = false | glp1 = false | fate = "germline"])`,
+    text: `Embryo[t = 0.0](\n  Cell[name = "P0" | founder = "p" | depth = 0 | pgen = 0 | born = 0.0 | x = 0.0 | y = 0.0 | z = 0.0 | r = 14.0 | signal = false | wnt = false | glp1 = false | fate = "germline"])`,
   };
   return {
     types: [
       'Embryo[t :: Float] {color: "#8a8fb8", container: true, ellipsoid: [25, 15, 15], scale: 0.25}',
-      'Cell[id :: Link | name :: Text | founder :: Text | depth :: Int | pgen :: Int | born :: Float | x :: Float | y :: Float | z :: Float | r :: Float | signal :: Bool | wnt :: Bool | glp1 :: Bool | fate :: Text] {shape: "sphere", position: "x y z", radiusBy: "r", colorBy: "founder", label: "name", scale: 0.25, opacity: 0.55}',
-      'Contact[a :: Link | b :: Link] {color: "#ffffff", asLink: true}',
-      'Sister[a :: Link | b :: Link] <: Contact {color: "#ffd36e", asLink: true}',
+      'Cell[contacts :: Link * | name :: Text | founder :: Text | depth :: Int | pgen :: Int | born :: Float | x :: Float | y :: Float | z :: Float | r :: Float | signal :: Bool | wnt :: Bool | glp1 :: Bool | fate :: Text] {shape: "sphere", position: "x y z", radiusBy: "r", colorBy: "founder", label: "name", scale: 0.25, opacity: 0.55}',
+      'Sister <: Link {color: "#ffd36e"}',
     ].map((text) => ({ id: uid(), text })),
     states: [zygote],
     rules,
@@ -496,7 +578,14 @@ export const embryo = (): Library => {
 };
 
 /** The examples that come with it: always loaded fresh, never overwritten. */
-export const EXAMPLES: Record<string, () => Library> = { 'embryo (wyrm)': embryo, 'yin yang': yinYang, 'lac operon': lacOperon, Growth: growth, MAPK: mapk };
+export const EXAMPLES: Record<string, () => Library> = {
+  MAPK: mapk,
+  'ember · moss · mist': emberMossMist,
+  Growth: growth,
+  'lac operon': lacOperon,
+  'yin yang': yinYang,
+  'embryo (wyrm)': embryo,
+};
 
 /**
  * The shelf: libraries saved by name, and the one being worked on. A saved one saves itself as it is edited;

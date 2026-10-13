@@ -16,7 +16,7 @@ export interface PortDecl {
   key: string;
   /** The contract (a link type) of the links its points may be on. */
   contract: Id;
-  /** How many points the group has. */
+  /** How many points the group has; 0: any number (a variadic group, `contacts :: Link *`). */
   arity: number;
 }
 

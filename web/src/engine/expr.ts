@@ -9,7 +9,15 @@
 
 import type { Scalar } from './carrier';
 
-export type Expr = { lit: Scalar } | { site: number } | { type: string } | { op: string; args: Expr[] };
+export type Expr =
+  | { lit: Scalar }
+  | { site: number }
+  | { type: string }
+  /** A rest of points (as `sum`, `count` and `shared` take it). */
+  | { rest: string }
+  /** Within `sum[?ps …]`: the attribute `key` of the node at the far end of the point being summed over. */
+  | { restAttr: string; key: string }
+  | { op: string; args: Expr[] };
 
 export class EvalError extends Error {}
 
@@ -19,7 +27,24 @@ export interface Env {
   scalar(site: number): Scalar | null;
   /** How many things a site holds; of a type (or a subtype of it), if one is given. */
   count(site: number, type?: string): number;
+  /** The nodes at the far ends of a rest's points (a point on a hyperedge: each other node on it). */
+  far?(rest: string): number[];
+  /** How many points a rest holds. */
+  points?(rest: string): number;
+  /** How many links two rests have in common. */
+  shared?(a: string, b: string): number;
+  /** The scalar attribute `key` of a node, if it has one. */
+  attr?(node: number, key: string): Scalar | null;
 }
+
+/** What `?ps.x` reads: the far node being summed over, for each rest (set by `sum`). */
+const current = new Map<string, number>();
+/**
+ * The sums already worked out at an occurrence (its `Env`), by what is summed. A state does not change while an
+ * occurrence's expressions are evaluated, so a sum repeated within a guard or across a reactum's values (as there is
+ * no `let` to name it, F36) is worked out once.
+ */
+const sums = new WeakMap<Env, Map<string, number>>();
 
 export const NO_SITES: Env = {
   scalar: () => {
@@ -37,14 +62,19 @@ const toV = (s: Scalar): V => ('int' in s ? s.int : 'float' in s ? s.float : 'te
 /** Whether a value is a whole number held as such (an Int), so arithmetic on Ints stays whole. */
 const isInt = (e: Expr, env: Env): boolean => {
   if ('lit' in e) return 'int' in e.lit;
-  if ('type' in e) return false;
+  if ('type' in e || 'rest' in e) return false;
+  if ('restAttr' in e) {
+    const n = current.get(e.restAttr);
+    const s = n === undefined ? null : (env.attr?.(n, e.key) ?? null);
+    return !!s && 'int' in s;
+  }
   if ('site' in e) {
     const s = env.scalar(e.site);
     return !!s && 'int' in s;
   }
   if (['+', '-', '*', '%', 'neg', 'abs', 'min', 'max', 'clamp'].includes(e.op)) return e.args.every((a) => isInt(a, env));
   if (e.op === 'if') return isInt(e.args[1], env) && isInt(e.args[2], env);
-  return ['count', 'floor', 'round'].includes(e.op);
+  return ['count', 'floor', 'round', 'shared'].includes(e.op);
 };
 
 const num = (v: V, op: string): number => {
@@ -62,6 +92,10 @@ export const FUNCTIONS: Record<string, [number, number]> = {
   clamp: [3, 3],
   /** hypot[x y] or hypot[x y z]: the length of a vector. */
   hypot: [2, 3],
+  /** sum[?ps E]: E summed over the node at the far end of each point of the rest ?ps, ?ps.x its x. */
+  sum: [2, 2],
+  /** shared[?ps ?qs]: how many links two rests of points have in common. */
+  shared: [2, 2],
 };
 export const BINARY = ['or', 'and', '==', '!=', '<', '<=', '>', '>=', '++', '+', '-', '*', '/', '%'];
 
@@ -85,6 +119,58 @@ function compileExpr(e: Expr): Compiled {
     };
   } else if ('type' in e) {
     f = () => interpret(e, NO_SITES);
+  } else if ('rest' in e) {
+    const r = e.rest;
+    f = () => {
+      throw new EvalError(`?${r} is a rest of points: sum[?${r} …], count[?${r}] or shared[?${r} …] read it`);
+    };
+  } else if ('restAttr' in e) {
+    const { restAttr: r, key } = e;
+    f = (env) => {
+      const n = current.get(r);
+      if (n === undefined) throw new EvalError(`?${r}.${key} is read within sum[?${r} …]`);
+      const v = env.attr?.(n, key);
+      if (!v) throw new EvalError(`a node at the far end of ?${r} has no ${key}`);
+      return toV(v);
+    };
+  } else if (e.op === 'sum') {
+    const [over, body] = e.args;
+    if (!('rest' in over)) throw new EvalError('sum[?ps E]: the first is a rest of points');
+    const r = over.rest;
+    const b = compileExpr(body);
+    const key = JSON.stringify(e);
+    f = (env) => {
+      // a sum not within another is the same wherever it is written: worked out once per occurrence
+      const top = current.size === 0;
+      if (top) {
+        const hit = sums.get(env)?.get(key);
+        if (hit !== undefined) return hit;
+      }
+      const outer = current.get(r);
+      let total = 0;
+      try {
+        for (const n of env.far?.(r) ?? []) {
+          current.set(r, n);
+          total += num(b(env), 'sum');
+        }
+      } finally {
+        if (outer === undefined) current.delete(r);
+        else current.set(r, outer);
+      }
+      if (top) {
+        let m = sums.get(env);
+        if (!m) sums.set(env, (m = new Map()));
+        m.set(key, total);
+      }
+      return total;
+    };
+  } else if (e.op === 'shared') {
+    const [a, b] = e.args;
+    if (!('rest' in a) || !('rest' in b)) throw new EvalError('shared[?ps ?qs] takes two rests of points');
+    f = (env) => env.shared?.(a.rest, b.rest) ?? 0;
+  } else if (e.op === 'count' && 'rest' in e.args[0]) {
+    const r = e.args[0].rest;
+    f = (env) => env.points?.(r) ?? 0;
   } else {
     const op = e.op;
     const a = e.args.map(compileExpr);
@@ -129,6 +215,7 @@ function interpret(e: Expr, env: Env): V {
     return toV(s);
   }
   if ('type' in e) throw new EvalError(`${e.type} is a type: count[?x ${e.type}] counts them`);
+  if ('rest' in e || 'restAttr' in e) return compileExpr(e)(env);
   const { op, args } = e;
   if (op === 'count') {
     const [a, t] = args;
@@ -206,18 +293,26 @@ export function evaluate(e: Expr, env: Env, kind: ScalarKind): Scalar {
 /** The kind an expression gives where nothing else says (no slot declares it). */
 export function kindOf(e: Expr): ScalarKind {
   if ('type' in e) return 'text';
+  if ('rest' in e || 'restAttr' in e) return 'float';
   if ('lit' in e) return 'int' in e.lit ? 'int' : 'float' in e.lit ? 'float' : 'text' in e.lit ? 'text' : 'bool';
   if ('site' in e) return 'float';
   if (['==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'].includes(e.op)) return 'bool';
   if (e.op === '++') return 'text';
   if (e.op === 'if') return kindOf(e.args[1]);
-  if (e.op === 'count' || e.op === 'floor' || e.op === 'round') return 'int';
+  if (e.op === 'count' || e.op === 'floor' || e.op === 'round' || e.op === 'shared') return 'int';
   return 'float';
 }
 
 /** Every site an expression reads. */
 export function sitesOf(e: Expr): number[] {
-  if ('lit' in e || 'type' in e) return [];
+  if ('lit' in e || 'type' in e || 'rest' in e || 'restAttr' in e) return [];
   if ('site' in e) return [e.site];
   return e.args.flatMap(sitesOf);
+}
+
+/** Whether an expression reads the nodes at the far ends of a rest's points (their attributes). */
+export function readsAcross(e: Expr | undefined): boolean {
+  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e) return false;
+  if ('restAttr' in e) return true;
+  return e.args.some(readsAcross);
 }

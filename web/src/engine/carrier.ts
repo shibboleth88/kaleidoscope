@@ -34,6 +34,12 @@ export interface PortGroup {
   key: Scalar;
   contract: Id;
   points: [Scalar, Port][];
+  /**
+   * In a pattern only (kaleidoscope's, PROVISIONAL; spec finding F28): the rest of the group's points, by name.
+   * A redex group with a rest meets a group holding its points and any more; the rest is what more there is. A
+   * reactum group with that rest puts those points back.
+   */
+  rest?: string;
 }
 
 export interface Node {
