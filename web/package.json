@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "bench": "vitest run --config /dev/null bench",
+    "profile": "esbuild bench/profile.ts --bundle --platform=node --format=esm --outfile=bench/.profile.mjs --log-level=warning && node --cpu-prof --cpu-prof-dir=bench/.profiles bench/.profile.mjs"
   },
   "devDependencies": {
     "@types/three": "^0.169.0",

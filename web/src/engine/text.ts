@@ -257,7 +257,8 @@ class Parser {
         args.push(this.value());
       }
       this.next();
-      if (args.length !== FUNCTIONS[t.v]) throw new ReadError(`${t.v} takes ${FUNCTIONS[t.v]} value${FUNCTIONS[t.v] > 1 ? 's' : ''}`);
+      const [lo, hi] = FUNCTIONS[t.v];
+      if (args.length < lo || args.length > hi) throw new ReadError(`${t.v} takes ${lo === hi ? lo : `${lo} or ${hi}`} value${hi > 1 ? 's' : ''}`);
       return { k: 'expr', op: t.v, args };
     }
     return this.atom();
@@ -317,6 +318,10 @@ function toExpr(v: Value, sites: Map<string, number> | null): Expr {
     }
     case 'expr':
       return { op: v.op, args: v.args.map((a) => toExpr(a, sites)) };
+    case 'term':
+      // a bare type name: what count[?x Type] counts
+      if (!v.attrs.length && v.body === null) return { type: v.head };
+      throw new ReadError(`${v.head}[…]: only a bare type name stands in an expression`);
     default:
       throw new ReadError('an expression is made of values, sites and operations');
   }
@@ -595,7 +600,8 @@ export function buildState(regions: Item[][], sig: Signature): { carrier: Carrie
 export const readState = (src: string, sig: Signature): Carrier => buildState(parseState(src), sig).carrier;
 
 export interface RuleOptions {
-  rate?: number;
+  /** A number, or an expression over the redex's sites, evaluated at each spot (as text). */
+  rate?: number | string;
 }
 
 /** A rule, `redex => reactum unless negative …`. */
@@ -616,6 +622,20 @@ export function buildRule(
   reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
   rhs.forEach((items, r) => reactum.region(items, r));
   const guard = ast.guard ? toExpr(ast.guard, reactum.readSites) : undefined;
+  let rate: number | undefined;
+  let rateExpr: Expr | undefined;
+  if (typeof opts.rate === 'number') rate = opts.rate;
+  else if (typeof opts.rate === 'string' && opts.rate.trim()) {
+    const n = Number(opts.rate);
+    if (Number.isFinite(n)) rate = n;
+    else {
+      try {
+        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites);
+      } catch (e) {
+        throw new ReadError(`rate: ${(e as Error).message}`);
+      }
+    }
+  }
 
   const outerNames: [Id, Id][] = [...outer.values()].map((x) => [x, sig.id('Link')]);
   const R = redex.carrier(lhs.length, outerNames);
@@ -665,7 +685,7 @@ export function buildRule(
 
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
-    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate: opts.rate, guard, computed: reactum.computed },
+    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr, guard, computed: reactum.computed },
     redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
     reactum: {
       nodes: reactum.source,

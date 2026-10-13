@@ -72,7 +72,8 @@ document.querySelector('#app')!.innerHTML = `
       <button id="reset" class="big" title="Start again from the initial state (R)">↺ reset</button>
       <button id="play" title="Play / pause (Space)">❚❚</button>
       <button id="step" title="One reaction (→); ← goes back">step ▸</button>
-      <label class="speed" title="Reactions per second"><input id="speed" type="range" min="0.2" max="8" step="0.1" value="1.2"><span></span></label>
+      <label class="speed" title="How fast it plays"><input id="speed" type="range" min="0.2" max="8" step="0.1" value="1.2"><span></span></label>
+      <button id="pace" class="ghost" title="Steps: every reaction takes the same while. Time: each waits as long as the time it took, so a busy system rushes and a quiet one dawdles."></button>
       <button class="mode" data-mode="world" title="Fill the screen">⤢</button>
     </header>
     <div class="system" id="system"></div>
@@ -228,9 +229,25 @@ $('#step').addEventListener('click', () => {
   world.advance(true);
 });
 const speed = $<HTMLInputElement>('#speed');
-const showSpeed = () => ($('.speed span').textContent = `${Number(speed.value).toFixed(1)}/s`);
+const showSpeed = () =>
+  ($('.speed span').textContent = world.pace === 'time' ? `${Number(speed.value).toFixed(1)} t/s` : `${Number(speed.value).toFixed(1)}/s`);
 speed.addEventListener('input', () => ((world.speed = Number(speed.value)), showSpeed()));
-showSpeed();
+/** Play by steps or by time: the world's pace, the timeline's axis, and the library's to remember. */
+function setPace(p: 'steps' | 'time') {
+  world.pace = p;
+  if (world.playing) world.setPlaying(true); // carry on, in the new manner
+  timeline.axis = p;
+  $('#pace').textContent = p === 'time' ? '⏱ by time' : '⏵ by steps';
+  $('#pace').classList.toggle('on', p === 'time');
+  showSpeed();
+  if (world.frame) timeline.set(world.frames, world.at, compiled.sig, typeColor);
+}
+$('#pace').addEventListener('click', () => {
+  lib.system.pace = world.pace === 'time' ? 'steps' : 'time';
+  saveShelf(shelf);
+  setPace(lib.system.pace);
+});
+setPace(lib.system.pace ?? 'steps');
 
 // ── the library's list ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -350,7 +367,7 @@ function renderEditor(fresh: boolean) {
     const isRule = selection.kind === 'rule';
     head.innerHTML = `
       <input class="name" value="${esc(se.name)}" spellcheck="false">
-      ${isRule ? `<label>rate <input class="rate" type="number" min="0" step="0.1" value="${(se as RuleEntry).rate}"></label>` : ''}
+      ${isRule ? `<label title="A number, or an expression over the redex's sites, worked out at each place it can fire: max[count[?x Yang] - 12 0]">rate <input class="rate" spellcheck="false" value="${esc(String((se as RuleEntry).rate))}"></label>` : ''}
       ${isRule ? `<label class="guard" title="Fires only where this holds, over the redex's sites: ?m >= 2, count[?x] < 10, …">where <input class="guard-in" spellcheck="false" placeholder="always" value="${esc(guardOf(se.text))}"></label>` : ''}
       ${isRule ? `<button class="toggle">${lib.system.rules.includes(se.id) ? 'in the system ●' : 'not in the system ○'}</button>` : `<button class="toggle">${lib.system.initial === se.id ? 'the initial state ★' : 'make initial ☆'}</button>`}
       <button class="ghost del" title="Delete">delete</button>`;
@@ -373,8 +390,9 @@ function renderEditor(fresh: boolean) {
         $('#lib-editor .problems').textContent = `where: ${(err as Error).message}`;
       }
     });
-    $('.rate', head)?.addEventListener('input', (ev) => {
-      (se as RuleEntry).rate = Number((ev.target as HTMLInputElement).value) || 0;
+    $('.rate', head)?.addEventListener('change', (ev) => {
+      const v = (ev.target as HTMLInputElement).value.trim();
+      (se as RuleEntry).rate = v === '' ? 1 : Number.isFinite(Number(v)) ? Number(v) : v;
       changed();
     });
     $('.toggle', head).addEventListener('click', () => {
@@ -396,7 +414,8 @@ function renderEditor(fresh: boolean) {
   const gi = $<HTMLInputElement>('.guard-in', head);
   if (gi && document.activeElement !== gi) gi.value = guardOf(se.text);
   // the editor reads the text itself, so what it shows is what is written, edited in place
-  const err = editor.open(selection.kind, se.text, compiled.sig);
+  const err = editor.open(selection.kind, se.text, compiled.sig, selection.kind === 'rule' ? String((se as RuleEntry).rate) : undefined);
+  $('.rate', head)?.classList.toggle('bad', compiled.rules.get(se.id) instanceof Error && /^rate:/.test((compiled.rules.get(se.id) as Error).message));
   const c = selection.kind === 'state' ? compiled.states.get(se.id) : compiled.rules.get(se.id);
   problems.textContent = err ?? (c instanceof Error ? c.message : '');
   if (fresh) preview.frame();
@@ -553,6 +572,7 @@ function renderShelf() {
 /** Work on another library: everything follows, and the world starts over. */
 function switchTo(next: Library) {
   lib = next;
+  setPace(lib.system.pace ?? 'steps');
   selection = lib.rules[0] ? { kind: 'rule', id: lib.rules[0].id } : { kind: 'none' };
   renderShelf();
   changed({ now: true });

@@ -29,6 +29,7 @@ import {
   sameScalar,
 } from './carrier';
 import type { Rule } from './rule';
+import { runPlan } from './plan';
 import { type Env, evaluate, holds } from './expr';
 import type { Signature } from './signature';
 
@@ -53,6 +54,10 @@ export interface MatchOptions {
   /** Redex nodes already decided (a negative's search, seeded with the occurrence it might block). */
   seed?: Map<Id, Id>;
   seedEdges?: Map<Id, Id>;
+  /** Only occurrences sending this redex node to this state node (incremental discovery's anchor). */
+  anchor?: { pattern: Id; state: Id };
+  /** An index of `g` already built. */
+  index?: Index;
 }
 
 interface Bound {
@@ -63,36 +68,99 @@ interface Bound {
   places: (Parent | undefined)[];
 }
 
+/** How much searching there has been (for profiling). */
+export const stats = { calls: 0, found: 0 };
+
 /** Every occurrence of the rule's redex in `g`, not blocked by its negatives. */
 export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOptions = {}): Occurrence[] {
-  const ix = new Index(g);
+  stats.calls++;
+  const ix = opts.index ?? Index.of(g);
   const found: Occurrence[] = [];
-  const limit = opts.limit ?? 10_000;
-  for (const occ of search(ix, rule.redex, sig, opts.seed, opts.seedEdges)) {
-    if (blocked(ix, rule, occ, sig)) continue;
-    if (!computable(ix, rule, occ)) continue;
+  const limit = opts.limit ?? Infinity;
+  let seed = opts.seed;
+  let places: (Parent | undefined)[] | undefined;
+  if (opts.anchor) {
+    // the anchor fixes its redex ancestors to the state node's, and its region's place to where they stand
+    seed = new Map(seed ?? []);
+    const P = patternIndex(rule.redex);
+    let pn = P.node.get(opts.anchor.pattern);
+    let sn = ix.node.get(opts.anchor.state);
+    while (pn && sn) {
+      seed.set(pn.id, sn.id);
+      if ('region' in pn.parent) {
+        places = rule.redex.outer.places.map(() => undefined);
+        places[pn.parent.region] = sn.parent;
+        break;
+      }
+      pn = P.node.get(pn.parent.node);
+      sn = 'node' in sn.parent ? ix.node.get(sn.parent.node) : undefined;
+    }
+    if (!pn || !sn) return [];
+  }
+  runPlan(
+    ix,
+    rule.redex,
+    sig,
+    (occ) => {
+      // the guard first: it is cheap, and a negative is a search
+      if (!computable(ix, rule, occ, sig)) return;
+      if (blocked(ix, rule, occ, sig)) return;
+      found.push({ ...occ, rule: rule.name });
+      stats.found++;
+      if (found.length >= limit) return false;
+    },
+    seed,
+    opts.seedEdges,
+    places,
+  );
+  return found;
+}
+
+/**
+ * The same, by the first matcher (a generator, uncompiled): kept as the reference the compiled one is tested
+ * against.
+ */
+export function discoverReference(g: Carrier, rule: Rule, sig: Signature): Occurrence[] {
+  const ix = Index.of(g);
+  const found: Occurrence[] = [];
+  for (const occ of search(ix, rule.redex, sig)) {
+    if (!computable(ix, rule, occ, sig)) continue;
+    if (blockedReference(ix, rule, occ, sig)) continue;
     found.push({ ...occ, rule: rule.name });
-    if (found.length >= limit) break;
   }
   return found;
 }
 
+function blockedReference(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
+  const seed = new Map(occ.nodes);
+  const seedEdges = new Map(occ.edges);
+  for (const ng of rule.negatives) if (!search(ix, ng, sig, seed, seedEdges).next().done) return true;
+  return false;
+}
+
 /** What an occurrence's sites hold, for expressions to read. */
-export function siteEnv(ix: Index, sites: Id[][]): Env {
+export function siteEnv(ix: Index, sites: Id[][], sig?: Signature): Env {
   return {
     scalar(i) {
       const roots = sites[i] ?? [];
       const n = roots.length === 1 ? ix.node.get(roots[0]) : undefined;
       return n && typeof n.payload === 'object' ? n.payload.scalar : null;
     },
-    count: (i) => (sites[i] ?? []).length,
+    // what a site holds is its roots: the members it captured, not what they hold in turn
+    count(i, type) {
+      const roots = sites[i] ?? [];
+      if (!type) return roots.length;
+      if (!sig?.has(type)) return 0;
+      const t = sig.id(type);
+      return roots.filter((r) => sig.sub(ix.node.get(r)!.type, t)).length;
+    },
   };
 }
 
 /** The guard holds here, and every computed value can be computed here. */
-function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>): boolean {
+function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
   if (!rule.guard && !rule.computed?.length) return true;
-  const env = siteEnv(ix, occ.sites);
+  const env = siteEnv(ix, occ.sites, sig);
   try {
     if (rule.guard && !holds(rule.guard, env)) return false;
     for (const c of rule.computed ?? []) evaluate(c.expr, env, c.kind);
@@ -107,10 +175,37 @@ function blocked(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Sign
   const seed = new Map(occ.nodes);
   const seedEdges = new Map(occ.edges);
   for (const ng of rule.negatives) {
-    const it = search(ix, ng, sig, seed, seedEdges);
-    if (!it.next().done) return true;
+    let hit = false;
+    runPlan(ix, ng, sig, () => ((hit = true), false), seed, seedEdges);
+    if (hit) return true;
   }
   return false;
+}
+
+/** What a search of a pattern needs that the pattern alone decides, worked out once per pattern. */
+interface Prepared {
+  /** Each region's roots, each with its subtree (parents first). */
+  roots: { nodes: Node[] }[][];
+  pointsOnPatternEdge: Map<Id, number>;
+  joinedEdges: Set<Id>;
+}
+const preparedCache = new WeakMap<Carrier, Prepared>();
+const indexCache = new WeakMap<Carrier, Index>();
+const patternIndex = (g: Carrier) => indexCache.get(g) ?? indexCache.set(g, new Index(g)).get(g)!;
+function prepared(pattern: Carrier): Prepared {
+  let p = preparedCache.get(pattern);
+  if (p) return p;
+  const P = new Index(pattern);
+  const roots = pattern.outer.places.map((_, i) => P.children({ region: i }).map((r) => ({ nodes: P.subtree(r.id).map((id) => P.node.get(id)!) })));
+  const pointsOnPatternEdge = new Map<Id, number>();
+  for (const n of pattern.nodes)
+    for (const grp of n.ports)
+      for (const [, pt] of grp.points)
+        if ('edge' in pt.target) pointsOnPatternEdge.set(pt.target.edge, (pointsOnPatternEdge.get(pt.target.edge) ?? 0) + 1);
+  const joinedEdges = new Set(pattern.names.filter((h): h is { edge: Id } => 'edge' in h).map((h) => h.edge));
+  p = { roots, pointsOnPatternEdge, joinedEdges };
+  preparedCache.set(pattern, p);
+  return p;
 }
 
 /** Every way `pattern` meets the state: its nodes, edges, sites, places and names. */
@@ -120,21 +215,25 @@ function* search(
   sig: Signature,
   seed?: Map<Id, Id>,
   seedEdges?: Map<Id, Id>,
+  places0?: (Parent | undefined)[],
 ): Generator<Omit<Occurrence, 'rule'>> {
-  const P = new Index(pattern);
+  const { roots: rootsOf, pointsOnPatternEdge, joinedEdges } = prepared(pattern);
   // parents before children, one region's roots at a time, each root followed by what it holds
   const order: Node[] = [];
   pattern.outer.places.forEach((_, i) => {
-    for (const root of P.children({ region: i })) for (const id of P.subtree(root.id)) order.push(P.node.get(id)!);
+    // roots holding a seeded node first: then links bound from it direct the rest
+    let roots = rootsOf[i];
+    if (seed?.size) roots = [...roots].sort((a, b) => Number(b.nodes.some((n) => seed.has(n.id))) - Number(a.nodes.some((n) => seed.has(n.id))));
+    for (const r of roots) for (const n of r.nodes) order.push(n);
   });
-  const pointsOnPatternEdge = new Map<Id, number>();
-  for (const n of pattern.nodes)
-    for (const grp of n.ports)
-      for (const [, p] of grp.points)
-        if ('edge' in p.target) pointsOnPatternEdge.set(p.target.edge, (pointsOnPatternEdge.get(p.target.edge) ?? 0) + 1);
-  const joinedEdges = new Set(pattern.names.filter((h): h is { edge: Id } => 'edge' in h).map((h) => h.edge));
 
-  const b: Bound = { nodes: new Map(), edges: new Map(), names: new Map(), nameHandles: new Map(), places: pattern.outer.places.map(() => undefined) };
+  const b: Bound = {
+    nodes: new Map(),
+    edges: new Map(),
+    names: new Map(),
+    nameHandles: new Map(),
+    places: places0 ? [...places0] : pattern.outer.places.map(() => undefined),
+  };
   const used = new Set<Id>();
   const usedEdges = new Map<Id, Id>(); // state edge → pattern edge
   const nameUses = new Map<string, number>(); // state handle key → how many pattern names stand on it
@@ -195,6 +294,19 @@ function* search(
       const n = ix.node.get(s);
       return n ? [n] : [];
     }
+    // link-directed: a point on a link already bound narrows the candidates to the nodes on that link
+    for (const grp of pn.ports)
+      for (const [, pt] of grp.points) {
+        const t = pt.target;
+        const h: Handle | undefined =
+          'edge' in t && b.edges.has(t.edge) ? { edge: b.edges.get(t.edge)! } : 'name' in t && b.nameHandles.has(t.name) ? b.nameHandles.get(t.name) : undefined;
+        if (h) {
+          const seen = new Set<Id>();
+          const out: Node[] = [];
+          for (const p of ix.pointsOn(h)) if (!seen.has(p.node)) seen.add(p.node), out.push(ix.node.get(p.node)!);
+          return out;
+        }
+      }
     if ('node' in pn.parent) return ix.children({ node: b.nodes.get(pn.parent.node)! });
     const place = b.places[pn.parent.region];
     return place ? ix.children(place) : ix.g.nodes;
@@ -283,9 +395,10 @@ function* search(
       for (const i of sites) {
         const key = pattern.siteKeys[i];
         if (!keyed(key)) continue;
-        const c = leftover.find((x) => !taken.has(x.id) && memberKey(x.member) === memberKey(key));
-        fixed.set(i, c ? [c.id] : []);
-        if (c) taken.add(c.id);
+        const c = ix.childAt(parent, memberKey(key));
+        const free = c && !taken.has(c.id) && !used.has(c.id) ? c : undefined;
+        fixed.set(i, free ? [free.id] : []);
+        if (free) taken.add(free.id);
       }
       const rest = leftover.filter((c) => !taken.has(c.id));
       const anon = sites.filter((i) => !keyed(pattern.siteKeys[i]));
@@ -316,6 +429,8 @@ function* search(
 
   /** What the sites hold reaches a closed redex edge only through an inner name joined to it. */
   function parameterLinksOk(sites: Id[][]): boolean {
+    // with no closed redex edge met, what the sites hold cannot reach one
+    if (usedEdges.size === 0) return true;
     const inParam = new Set<Id>();
     for (const roots of sites) for (const r of roots) for (const id of ix.subtree(r)) inParam.add(id);
     for (const id of inParam)

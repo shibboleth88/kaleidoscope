@@ -87,3 +87,13 @@ describe('Growth', () => {
     expect(fired.has('divide') && fired.has('eat') && fired.has('feed')).toBe(true);
   });
 });
+
+describe('if, clamp, hypot', () => {
+  it('work out', () => {
+    expect(fire('Cat[age = 3]', 'Cat[age = ?a] => Cat[age = if[?a > 2 ?a * 10 0]]')).toEqual(['Cat[age = 30]']);
+    expect(fire('Cat[age = 3]', 'Cat[age = ?a] => Cat[age = clamp[?a * 10 0 7]]')).toEqual(['Cat[age = 7]']);
+    expect(fire('Cell[mass = 1.0]', 'Cell[mass = ?m] => Cell[mass = hypot[3 4 * ?m]]')).toEqual(['Cell[mass = 5.0]']);
+    // only the branch taken is worked out
+    expect(fire('Cat[age = 0]', 'Cat[age = ?a] => Cat[age = if[?a == 0 1 10 / ?a]]')).toEqual(['Cat[age = 1]']);
+  });
+});

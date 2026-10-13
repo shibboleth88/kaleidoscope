@@ -29,6 +29,7 @@ import { compose } from './compose';
 import { type Occurrence, siteEnv } from './match';
 import { evaluate } from './expr';
 import type { Rule } from './rule';
+import type { Signature } from './signature';
 
 export interface Decomposition {
   context: Carrier;
@@ -42,7 +43,7 @@ const NAME_TYPE = 0;
 
 export function decompose(g: Carrier, rule: Rule, occ: Occurrence): Decomposition {
   const R = rule.redex;
-  const ix = new Index(g);
+  const ix = Index.of(g);
   const nmap = new Map(occ.nodes);
   const emap = new Map(occ.edges);
   const image = new Set(nmap.values());
@@ -195,7 +196,7 @@ export interface Reacted {
 }
 
 /** The occurrence replaced: `apply_spec`, as composition. */
-export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
+export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature): Reacted {
   const { context, parameter, implicit } = decompose(g, rule, occ);
   const ids = nextIds(g);
   let nextNode = ids.node;
@@ -213,7 +214,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
     inst = parameter;
     moved.push(...parameter.nodes.map((n) => n.id));
   } else {
-    const pix = new Index(parameter);
+    const pix = Index.of(parameter);
     const regionNodes = (j: number) => pix.children({ region: j }).flatMap((r) => pix.subtree(r.id));
     const nodes: Node[] = [];
     const edges: Edge[] = [];
@@ -277,7 +278,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
       edgesCreated.push(nextEdge++);
     }
   }
-  const ix = new Index(g);
+  const ix = Index.of(g);
   const redexType = new Map(rule.redex.nodes.map((n) => [n.id, n.type]));
   const keptRetype = new Map<Id, Id>();
   for (const [a, b] of rule.kept) {
@@ -287,7 +288,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
   const relabelled = relabel(rule.reactum, (x) => fn.get(x) ?? x, (x) => fe.get(x) ?? x);
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   // values computed from what the sites held
-  const env = siteEnv(ix, occ.sites);
+  const env = siteEnv(ix, occ.sites, sig);
   const computed = new Map((rule.computed ?? []).map((c) => [fn.get(c.node)!, evaluate(c.expr, env, c.kind)]));
   const freshReactum: Carrier = {
     ...relabelled,
@@ -301,7 +302,9 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
     names: [...relabelled.names, ...implicit.map(([z]) => ({ name: z }))],
   };
 
-  const state = compose(compose(inst, freshReactum), context);
+  // the pieces are this function's own, built formed: composed without checking them again (the tests compose
+  // every decomposition back, checked)
+  const state = compose(compose(inst, freshReactum, { trusted: true }), context, { trusted: true });
 
   const keptIds = new Set(keptTo.values());
   const removed = [...occ.nodes.map(([, s]) => s).filter((s) => !keptIds.has(s)), ...dropped];
@@ -309,7 +312,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
   const droppedSet = new Set(dropped);
   const edgesRemoved = [
     ...occ.edges.map(([, s]) => s).filter((s) => !keptEdgeIds.has(s)),
-    ...parameter.edges.filter((e) => new Index(parameter).pointsOn({ edge: e.id }).every((p) => droppedSet.has(p.node))).map((e) => e.id),
+    ...parameter.edges.filter((e) => Index.of(parameter).pointsOn({ edge: e.id }).every((p) => droppedSet.has(p.node))).map((e) => e.id),
   ];
   return {
     state,

@@ -14,7 +14,8 @@ export interface StateEntry {
 }
 
 export interface RuleEntry extends StateEntry {
-  rate: number;
+  /** A number, or an expression over the redex's sites (`max[count[?x Yang] - 12 0]`), evaluated at each spot. */
+  rate: number | string;
 }
 
 /** A type: its declaration, one line of text. */
@@ -27,7 +28,13 @@ export interface Library {
   types: TypeEntry[];
   states: StateEntry[];
   rules: RuleEntry[];
-  system: { initial: string; rules: string[]; seed: number };
+  system: {
+    initial: string;
+    rules: string[];
+    seed: number;
+    /** How the world plays: a reaction per tick, or reactions spaced by the time they take. */
+    pace?: 'steps' | 'time';
+  };
 }
 
 export interface Compiled {
@@ -288,8 +295,208 @@ export const lacOperon = (): Library => {
   };
 };
 
+/**
+ * Yin and yang: two channels of mutual creation and destruction, a harmonic oscillator. Equilibrium is 12 of each.
+ * Yang above it begets Yin, below it unmakes Yin; Yin above it unmakes Yang, below it begets Yang. So
+ *   Yin′ ∝ (Yang − 12)   and   Yang′ ∝ −(Yin − 12)
+ * as an electric field and its magnetic field: a quarter turn apart, each fastest through equilibrium (where the
+ * other is at its height) and still at its own height. The rates are expressions over the halves' counts; the
+ * world plays by time, so the rush and the lull are seen.
+ *
+ * A rule's rate is worked out at each place it can fire. Unmaking "a Yin" can fire at every Yin, so its rate is
+ * divided by how many there are: the channel as a whole runs at the rate the equation says.
+ */
+export const yinYang = (): Library => {
+  const rules: RuleEntry[] = [
+    {
+      name: 'yang begets yin',
+      text: '?d = Dark(?x) | ?l = Light(?y)\n  => ?d = Dark(?x | Yin) | ?l = Light(?y)',
+      rate: 'max[count[?y Yang] - 12 0] * 0.5',
+    },
+    {
+      name: 'yang unmakes yin',
+      text: '?d = Dark(Yin | ?x) | ?l = Light(?y)\n  => ?d = Dark(?x) | ?l = Light(?y)',
+      rate: 'max[12 - count[?y Yang] 0] * 0.5 / (count[?x Yin] + 1)',
+    },
+    {
+      name: 'yin unmakes yang',
+      text: '?d = Dark(?x) | ?l = Light(Yang | ?y)\n  => ?d = Dark(?x) | ?l = Light(?y)',
+      rate: 'max[count[?x Yin] - 12 0] * 0.5 / (count[?y Yang] + 1)',
+    },
+    {
+      name: 'yin begets yang',
+      text: '?d = Dark(?x) | ?l = Light(?y)\n  => ?d = Dark(?x) | ?l = Light(?y | Yang)',
+      rate: 'max[12 - count[?x Yin] 0] * 0.5',
+    },
+  ].map((r) => ({ ...r, id: uid() }));
+  const taiji: StateEntry = {
+    id: uid(),
+    name: 'taiji',
+    text: `Taiji(\n  Dark(${Array.from({ length: 20 }, () => 'Yin').join(' | ')})\n  Light(${Array.from({ length: 12 }, () => 'Yang').join(' | ')}))`,
+  };
+  return {
+    types: [
+      'Taiji {color: "#8a8fb8", container: true}',
+      'Dark {color: "#5a5fd6", container: true}',
+      'Light {color: "#ffd36e", container: true}',
+      'Yin {color: "#2b2d8e", shape: "sphere", size: 0.6}',
+      'Yang {color: "#fff4d6", shape: "sphere", size: 0.6}',
+    ].map((text) => ({ id: uid(), text })),
+    states: [taiji],
+    rules,
+    system: { initial: taiji.id, rules: rules.map((r) => r.id), seed: 3, pace: 'time' },
+  };
+};
+
+/**
+ * The C. elegans embryo, from the zygote to 28 cells: a port of wyrm (`~/code/wyrm`, its `embryo-mechanics.ys`).
+ *
+ * Cells have positions and radii (µm) inside a 25 × 15 × 15 µm eggshell, and each divides when its lineage
+ * class's period has passed since its birth (wyrm's measured periods, volume shares and axes). Contacts are
+ * nodes joining two cells' identity links (a cell has as many contacts as it touches, which a port of fixed arity
+ * cannot hold); daughters are joined by a Sister contact. Contacts form where cells come within reach and part
+ * where they drift apart. Mechanics is pairwise: each contact pushes its two cells apart where they overlap and
+ * draws them together where they are near, one reaction at a time (wyrm sums forces over neighbours per tick; a
+ * one-reaction-at-a-time engine relaxes contact by contact instead). P2 signals: AB's daughter touching it takes
+ * Notch (ABp), EMS touching it takes Wnt, and so divides into MS and E.
+ *
+ * As in wyrm, no rule reads a name: names are written, never read.
+ */
+export const embryo = (): Library => {
+  const S = 0.7937; // the cube root of a half: equal daughters
+  const A = ['name', 'founder', 'depth', 'pgen', 'born', 'x', 'y', 'z', 'r', 'signal', 'wnt', 'glp1', 'fate'];
+  const cell = (v: Record<string, string | number>, id: string, named?: string) =>
+    `${named ? `?${named} = ` : ''}Cell[id = ~${id} | ${A.map((k) => `${k} = ${v[k]}`).join(' | ')}]`;
+  const mother = (fixed: Record<string, string | number>) =>
+    cell({ name: '?n', pgen: '?p', born: '?b', x: '?x', y: '?y', z: '?z', r: '?r', signal: '?s', wnt: '?w', glp1: '?g', fate: '?f', ...fixed }, 'i', 'm');
+  const inEmbryo = (inner: string) => `?e = Embryo[t = ?t](${inner} | ?rest)`;
+  const division = (name: string, period: number, before: string, after: string[]): RuleEntry => ({
+    id: uid(),
+    name,
+    rate: 8,
+    text: `${inEmbryo(before)} where ?t >= ?b + ${period.toFixed(1)}
+  => ${inEmbryo([...after, 'Sister[a = ~i | b = ~d]'].join(' | '))}`,
+  });
+
+  // the germline: P_k gives a founder and P_k+1, unequally (wyrm's shares: the founder's part of the volume)
+  const stem = (k: number, period: number, share: number, founder: string, fname: string): RuleEntry => {
+    const cs = Math.cbrt(share).toFixed(4), cp = Math.cbrt(1 - share).toFixed(4);
+    const keep = { pgen: k, born: '?t', y: '?y', signal: 'false', wnt: 'false', glp1: 'false' };
+    return division(`P${k} divides`, period, mother({ founder: '"p"', depth: 0, pgen: k }), [
+      cell({ ...keep, name: `"${fname}"`, founder: `"${founder}"`, depth: 0, x: `?x - 0.5 * ?r * ${cp}`, z: k === 1 ? '?z - 2.0' : '?z', r: `?r * ${cs}`, fate: `"${fname}"` }, 'i', 'm'),
+      cell({ ...keep, name: `"P${k + 1}"`, founder: '"p"', depth: 0, pgen: k + 1, x: `?x + 0.5 * ?r * ${cs}`, z: '?z', r: `?r * ${cp}`, signal: k === 1 ? 'true' : 'false', fate: '"germline"' }, 'd'),
+    ]);
+  };
+
+  // a somatic division: two equal daughters along an axis, named by their side
+  const soma = (name: string, founder: string, depth: number, period: number, axis: 'x' | 'y', o: { tilt?: number; sides?: [string, string] } = {}) => {
+    const [s1, s2] = o.sides ?? (axis === 'x' ? ['a', 'p'] : ['l', 'r']);
+    const daughter = (sign: '-' | '+', side: string, id: string, named?: string) =>
+      cell(
+        {
+          name: `?n ++ "${side}"`, founder: `"${founder}"`, depth: depth + 1, pgen: '?p', born: '?t',
+          x: axis === 'x' ? `?x ${sign} 0.5 * ?r * ${S}` : '?x',
+          y: axis === 'y' ? `?y ${sign} 0.5 * ?r * ${S}` : '?y',
+          z: sign === '+' && o.tilt ? `?z + ${o.tilt.toFixed(1)}` : '?z',
+          r: `?r * ${S}`, signal: 'false', wnt: '?w', glp1: '?g', fate: '?f',
+        },
+        id,
+        named,
+      );
+    return division(name, period, mother({ founder: `"${founder}"`, depth }), [daughter('-', s1, 'i', 'm'), daughter('+', s2, 'd')]);
+  };
+
+  // EMS: with Wnt from P2, MS (anterior) and E; without it, two MS
+  const ems = (wnt: boolean): RuleEntry => {
+    const d = (sign: '-' | '+', nm: string, founder: string, fate: string, id: string, named?: string) =>
+      cell({ name: `"${nm}"`, founder: `"${founder}"`, depth: 0, pgen: '?p', born: '?t', x: `?x ${sign} 0.5 * ?r * ${S}`, y: '?y', z: '?z', r: `?r * ${S}`, signal: 'false', wnt: wnt ? 'true' : 'false', glp1: '?g', fate: `"${fate}"` }, id, named);
+    return division(wnt ? 'EMS divides (Wnt)' : 'EMS divides (no Wnt)', 14.3, mother({ founder: '"ems"', depth: 0, wnt: wnt ? 'true' : 'false' }), [
+      d('-', 'MS', 'ms', 'mesoderm', 'i', 'm'),
+      wnt ? d('+', 'E', 'e', 'endoderm', 'd') : d('+', 'MS', 'ms', 'mesoderm', 'd'),
+    ]);
+  };
+
+  const D = 'hypot[?ax - ?bx ?ay - ?by ?az - ?bz]';
+  const S0 = '(?ra + ?rb)';
+  const pair = (contact: boolean) =>
+    `${contact ? '?c = Contact[a = ~i | b = ~j] | ' : ''}?p = Cell[id = ~i | x = ?ax | y = ?ay | z = ?az | r = ?ra] | ?q = Cell[id = ~j | x = ?bx | y = ?by | z = ?bz | r = ?rb]`;
+  const moved = (f: string) =>
+    `?c = Contact[a = ~i | b = ~j] | ?p = Cell[id = ~i | x = ?ax + ${f} * (?ax - ?bx) | y = ?ay + ${f} * (?ay - ?by) | z = ?az + ${f} * (?az - ?bz) | r = ?ra]` +
+    ` | ?q = Cell[id = ~j | x = ?bx - ${f} * (?ax - ?bx) | y = ?by - ${f} * (?ay - ?by) | z = ?bz - ${f} * (?az - ?bz) | r = ?rb]`;
+  const still = '?p = Cell[id = ~i | x = ?ax | y = ?ay | z = ?az | r = ?ra] | ?q = Cell[id = ~j | x = ?bx | y = ?by | z = ?bz | r = ?rb]';
+  const signal = (name: string, who: string, then: string, flip: boolean): RuleEntry => {
+    const link = flip ? 'Contact[a = ~j | b = ~i]' : 'Contact[a = ~i | b = ~j]';
+    return { id: uid(), name, rate: 2, text: `?a = Cell[id = ~i | ${who}] | ?c = ${link} | ?g = Cell[id = ~j | signal = true]
+  => ?a = Cell[id = ~i | ${then}] | ?c = ${link} | ?g = Cell[id = ~j | signal = true]` };
+  };
+  const SH = '?x * ?x / (max[25 - ?r 1] * max[25 - ?r 1]) + ?y * ?y / (max[15 - ?r 1] * max[15 - ?r 1]) + ?z * ?z / (max[15 - ?r 1] * max[15 - ?r 1])';
+
+  const rules: RuleEntry[] = [
+    { id: uid(), name: 'clock', rate: 4, text: '?e = Embryo[t = ?t](?rest)\n  => ?e = Embryo[t = ?t + 0.25](?rest)' },
+    stem(0, 1.0, 0.6, 'ab', 'AB'),
+    stem(1, 14.6, 0.55, 'ems', 'EMS'),
+    stem(2, 17.5, 0.55, 'c', 'C'),
+    stem(3, 23.8, 0.5, 'd', 'D'),
+    soma('AB divides', 'ab', 0, 12.5, 'x', { tilt: 2 }),
+    soma('AB2 divide (left/right)', 'ab', 1, 12.7, 'y'),
+    soma('AB4 divide', 'ab', 2, 15.0, 'x'),
+    soma('AB8 divide', 'ab', 3, 16.6, 'x'),
+    ems(true),
+    ems(false),
+    soma('MS divides', 'ms', 0, 17.0, 'x'),
+    soma('MS2 divide', 'ms', 1, 21.3, 'x'),
+    soma('E divides', 'e', 0, 18.2, 'x'),
+    soma('C divides', 'c', 0, 18.3, 'x'),
+    soma('C2 divide', 'c', 1, 23.8, 'x'),
+    { id: uid(), name: 'push apart', rate: 3, text: `${pair(true)} where ${D} < ${S0}
+  => ${moved(`clamp[0.15 * (${S0} - ${D}) 0 0.6] / max[${D} 0.01]`)}` },
+    { id: uid(), name: 'hold together', rate: 3, text: `${pair(true)} where ${D} >= ${S0} and ${D} < 1.2 * ${S0}
+  => ${moved(`-clamp[0.05 * (${D} - ${S0}) 0 0.6] / max[${D} 0.01]`)}` },
+    {
+      id: uid(),
+      name: 'touch',
+      rate: 2,
+      text: `${pair(false)} where (?ax < ?bx or ?ax == ?bx and ?ay < ?by) and ${D} < ${S0}
+  => ${still} | Contact[a = ~i | b = ~j]
+  unless Contact[a = ~i | b = ~j]
+  unless Contact[a = ~j | b = ~i]`,
+    },
+    { id: uid(), name: 'part', rate: 2, text: `${pair(true)} where ${D} > 1.2 * ${S0}
+  => ${still}` },
+    { id: uid(), name: 'eggshell', rate: 3, text: `?p = Cell[x = ?x | y = ?y | z = ?z | r = ?r] where ${SH} > 1
+  => ?p = Cell[x = ?x / sqrt[${SH}] | y = ?y / sqrt[${SH}] | z = ?z / sqrt[${SH}] | r = ?r]` },
+    signal('Notch (ABp)', 'founder = "ab" | depth = 1 | glp1 = false | fate = ?f', 'founder = "ab" | depth = 1 | glp1 = true | fate = "ABp-type"', false),
+    signal('Notch (ABp) ·', 'founder = "ab" | depth = 1 | glp1 = false | fate = ?f', 'founder = "ab" | depth = 1 | glp1 = true | fate = "ABp-type"', true),
+    signal('Wnt (EMS)', 'founder = "ems" | wnt = false', 'founder = "ems" | wnt = true', false),
+    signal('Wnt (EMS) ·', 'founder = "ems" | wnt = false', 'founder = "ems" | wnt = true', true),
+    {
+      id: uid(),
+      name: 'ABa',
+      rate: 1,
+      text: '?e = Embryo[t = ?t](?a = Cell[founder = "ab" | depth = 1 | glp1 = false | fate = "AB" | born = ?b] | ?rest) where ?t > ?b + 8\n  => ?e = Embryo[t = ?t](?a = Cell[founder = "ab" | depth = 1 | glp1 = false | fate = "ABa-type" | born = ?b] | ?rest)',
+    },
+  ];
+  const zygote: StateEntry = {
+    id: uid(),
+    name: 'zygote',
+    text: `Embryo[t = 0.0](
+  Cell[name = "P0" | founder = "p" | depth = 0 | pgen = 0 | born = 0.0 | x = 0.0 | y = 0.0 | z = 0.0 | r = 14.0 | signal = false | wnt = false | glp1 = false | fate = "germline"])`,
+  };
+  return {
+    types: [
+      'Embryo[t :: Float] {color: "#8a8fb8", container: true, ellipsoid: [25, 15, 15], scale: 0.25}',
+      'Cell[id :: Link | name :: Text | founder :: Text | depth :: Int | pgen :: Int | born :: Float | x :: Float | y :: Float | z :: Float | r :: Float | signal :: Bool | wnt :: Bool | glp1 :: Bool | fate :: Text] {shape: "sphere", position: "x y z", radiusBy: "r", colorBy: "founder", label: "name", scale: 0.25, opacity: 0.55}',
+      'Contact[a :: Link | b :: Link] {color: "#ffffff", asLink: true}',
+      'Sister[a :: Link | b :: Link] <: Contact {color: "#ffd36e", asLink: true}',
+    ].map((text) => ({ id: uid(), text })),
+    states: [zygote],
+    rules,
+    system: { initial: zygote.id, rules: rules.map((r) => r.id), seed: 1, pace: 'time' },
+  };
+};
+
 /** The examples that come with it: always loaded fresh, never overwritten. */
-export const EXAMPLES: Record<string, () => Library> = { 'lac operon': lacOperon, Growth: growth, MAPK: mapk };
+export const EXAMPLES: Record<string, () => Library> = { 'embryo (wyrm)': embryo, 'yin yang': yinYang, 'lac operon': lacOperon, Growth: growth, MAPK: mapk };
 
 /**
  * The shelf: libraries saved by name, and the one being worked on. A saved one saves itself as it is edited;

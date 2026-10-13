@@ -26,6 +26,11 @@ export interface Rule {
    * coefficient: the random policy weighs each spot this rule meets by it. Defaults to 1.
    */
   rate?: number;
+  /**
+   * PROVISIONAL (G7 again): the rate as an expression over the redex's sites, evaluated at each spot. Where it is
+   * given it wins over `rate`; a spot whose rate is not positive does not fire.
+   */
+  rateExpr?: Expr;
   /** PROVISIONAL (spec part `rules.guard`, planned): the rule meets only where this holds, over its sites. */
   guard?: Expr;
   /** PROVISIONAL (operations answered in place): reactum scalar nodes whose value is computed from the sites. */

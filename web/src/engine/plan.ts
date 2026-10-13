@@ -1,0 +1,436 @@
+/**
+ * The matcher, compiled: each pattern turned once into a plan, and run without generators, closures or maps in its
+ * inner loop.
+ *
+ * A plan fixes the order the pattern's nodes are met in (parents before children; a seeded root first) and, for
+ * each node, where its candidates come from: its seed; the points on a link an earlier node bound
+ * (link-directed); its parent's members; its region's place; or, for a first root, every node. Keys (member, payload,
+ * port group, point) are worked out once. Bindings are arrays indexed by the pattern's nodes, edges and names, undone
+ * by popping stacks back to a mark.
+ *
+ * What it finds is what `Spec/Match.lean` says an occurrence is (see `match.ts`), and the tests hold it to that.
+ */
+
+import {
+  type Carrier,
+  type Handle,
+  type Id,
+  type Index,
+  type Node,
+  type Parent,
+  handleKey,
+  isAttr,
+  keyed,
+  memberKey,
+  parentKey,
+  scalarKey,
+} from './carrier';
+import type { Signature } from './signature';
+
+export interface Found {
+  nodes: [Id, Id][];
+  edges: [Id, Id][];
+  sites: Id[][];
+  places: Parent[];
+  names: [Id, Handle][];
+}
+
+const NONE = -1;
+const EDGE = 0, NAME = 1;
+
+interface PointPlan {
+  key: string;
+  contract: Id;
+  kind: number; // EDGE or NAME (binders refuse)
+  target: number; // index of the pattern edge or name
+}
+interface GroupPlan {
+  key: string;
+  contract: Id;
+  points: PointPlan[];
+}
+interface Step {
+  pn: Node;
+  /** The step of its parent, or NONE for a root. */
+  parent: number;
+  region: number;
+  member: string;
+  payload: string;
+  ports: GroupPlan[];
+  /** A point on a link some earlier step binds: candidates are the nodes on it. */
+  via: PointPlan | null;
+}
+interface Plan {
+  steps: Step[];
+  /** Pattern node id → step. */
+  stepOf: Map<Id, number>;
+  edgeIds: Id[];
+  edgeIndex: Map<Id, number>;
+  nameIds: Id[];
+  pointsOnEdge: number[];
+  joined: boolean[];
+  /** Each site: the step of its parent (NONE: a region), its region, and its member key (null: anonymous). */
+  sites: { parent: number; region: number; key: string | null; attr: boolean }[];
+  /** Each step: whether a site stands in it. */
+  holdsSite: boolean[];
+  regions: number;
+}
+
+const payloadKey = (n: Node) => (typeof n.payload === 'string' ? n.payload : `s${scalarKey(n.payload.scalar)}`);
+
+const planCache = new WeakMap<Carrier, Map<string, Plan>>();
+
+/** The plan for a pattern, with the roots holding `firstRoots` met first in each region. */
+function planFor(pattern: Carrier, seeded: Set<Id> | null): Plan {
+  let byOrder = planCache.get(pattern);
+  if (!byOrder) planCache.set(pattern, (byOrder = new Map()));
+  // which roots go first depends only on which of them hold a seeded node
+  const kids = new Map<string, Node[]>();
+  for (const n of pattern.nodes) {
+    const k = parentKey(n.parent);
+    (kids.get(k) ?? kids.set(k, []).get(k)!).push(n);
+  }
+  const subtree = (n: Node): Node[] => {
+    const out = [n];
+    for (let i = 0; i < out.length; i++) out.push(...(kids.get(parentKey({ node: out[i].id })) ?? []));
+    return out;
+  };
+  const regionRoots = pattern.outer.places.map((_, i) => kids.get(parentKey({ region: i })) ?? []);
+  const firsts = regionRoots.map((roots) => (seeded ? roots.findIndex((r) => subtree(r).some((n) => seeded.has(n.id))) : -1));
+  const cacheKey = firsts.join(',');
+  const cached = byOrder.get(cacheKey);
+  if (cached) return cached;
+
+  const order: { n: Node; region: number }[] = [];
+  regionRoots.forEach((roots, i) => {
+    const ordered = firsts[i] > 0 ? [roots[firsts[i]], ...roots.filter((_, j) => j !== firsts[i])] : roots;
+    for (const r of ordered) for (const n of subtree(r)) order.push({ n, region: i });
+  });
+
+  const edgeIds = pattern.edges.map((e) => e.id);
+  const edgeIndex = new Map(edgeIds.map((id, i) => [id, i]));
+  const nameIds = [...new Set(pattern.nodes.flatMap((n) => n.ports.flatMap((g) => g.points.flatMap(([, p]) => ('name' in p.target ? [p.target.name] : [])))))];
+  const nameIndex = new Map(nameIds.map((id, i) => [id, i]));
+  const pointsOnEdge = edgeIds.map(() => 0);
+  for (const n of pattern.nodes) for (const g of n.ports) for (const [, p] of g.points) if ('edge' in p.target) pointsOnEdge[edgeIndex.get(p.target.edge)!]++;
+  const joinedSet = new Set(pattern.names.filter((h): h is { edge: Id } => 'edge' in h).map((h) => h.edge));
+
+  const stepOf = new Map<Id, number>();
+  const bound = new Set<string>(); // `${kind}:${target}` bound by an earlier step
+  const steps: Step[] = order.map(({ n, region }, i) => {
+    stepOf.set(n.id, i);
+    const ports: GroupPlan[] = n.ports.map((g) => ({
+      key: scalarKey(g.key),
+      contract: g.contract,
+      points: g.points.map(([k, p]) => ({
+        key: scalarKey(k),
+        contract: p.contract,
+        kind: 'edge' in p.target ? EDGE : 'name' in p.target ? NAME : 2,
+        target: 'edge' in p.target ? edgeIndex.get(p.target.edge)! : 'name' in p.target ? nameIndex.get(p.target.name)! : NONE,
+      })),
+    }));
+    let via: PointPlan | null = null;
+    for (const g of ports) for (const p of g.points) if (!via && p.kind !== 2 && bound.has(`${p.kind}:${p.target}`)) via = p;
+    for (const g of ports) for (const p of g.points) if (p.kind !== 2) bound.add(`${p.kind}:${p.target}`);
+    return {
+      pn: n,
+      parent: 'node' in n.parent ? stepOf.get(n.parent.node)! : NONE,
+      region,
+      member: memberKey(n.member),
+      payload: payloadKey(n),
+      ports,
+      via,
+    };
+  });
+  const sites = pattern.sites.map((s, i) => {
+    const k = pattern.siteKeys[i];
+    return {
+      parent: 'node' in s ? stepOf.get(s.node)! : NONE,
+      region: 'region' in s ? s.region : NONE,
+      key: k && keyed(k) ? memberKey(k) : null,
+      attr: !!k && isAttr(k),
+    };
+  });
+  const holdsSite = steps.map((_, i) => sites.some((s) => s.parent === i));
+  const plan: Plan = {
+    steps,
+    stepOf,
+    edgeIds,
+    edgeIndex,
+    nameIds,
+    pointsOnEdge,
+    joined: edgeIds.map((id) => joinedSet.has(id)),
+    sites,
+    holdsSite,
+    regions: pattern.outer.places.length,
+  };
+  byOrder.set(cacheKey, plan);
+  return plan;
+}
+
+/**
+ * Every way `pattern` meets the state, each handed to `found` (return false to stop). `seed` fixes pattern nodes,
+ * `seedEdges` pattern edges, `places0` regions' places.
+ */
+export function runPlan(
+  ix: Index,
+  pattern: Carrier,
+  sig: Signature,
+  found: (f: Found) => boolean | void,
+  seed?: Map<Id, Id>,
+  seedEdges?: Map<Id, Id>,
+  places0?: (Parent | undefined)[],
+): void {
+  const plan = planFor(pattern, seed?.size ? new Set(seed.keys()) : null);
+  const { steps, edgeIds } = plan;
+  const S = steps.length;
+  const nodeOf = new Array<Id>(S).fill(NONE);
+  const edgeOf = new Array<Id>(edgeIds.length).fill(NONE);
+  const nameOf = new Array<Handle | null>(plan.nameIds.length).fill(null);
+  const nameKeyOf = new Array<string>(plan.nameIds.length).fill('');
+  const places = places0 ? [...places0] : new Array<Parent | undefined>(plan.regions).fill(undefined);
+  const placeSetBy = new Array<number>(plan.regions).fill(NONE);
+  const used = new Set<Id>();
+  const usedEdges = new Map<Id, number>(); // state edge → pattern edge index
+  const nameUses = new Map<string, number>();
+  const edgeStack: number[] = [];
+  const nameStack: number[] = [];
+  let stopped = false;
+
+  const seedFor = steps.map((st) => seed?.get(st.pn.id) ?? NONE);
+
+  const groupOf = (gn: Node, key: string) => {
+    for (const g of gn.ports) if (scalarKey(g.key) === key) return g;
+    return undefined;
+  };
+
+  /** Bind a step's points to `gn`'s; false (with what it bound undone by the caller) where they cannot. */
+  const bind = (st: Step, gn: Node): boolean => {
+    for (const pg of st.ports) {
+      const gg = groupOf(gn, pg.key);
+      if (!gg || gg.points.length !== pg.points.length || !sig.sub(gg.contract, pg.contract)) return false;
+      for (const pp of pg.points) {
+        let gp: (typeof gg.points)[number] | undefined;
+        for (const x of gg.points) if (scalarKey(x[0]) === pp.key) { gp = x; break; }
+        if (!gp || !sig.sub(gp[1].contract, pp.contract)) return false;
+        const h = gp[1].target;
+        if (pp.kind === EDGE) {
+          if (!('edge' in h)) return false;
+          const have = edgeOf[pp.target];
+          if (have !== NONE) {
+            if (h.edge !== have) return false;
+          } else {
+            if (usedEdges.has(h.edge) || nameUses.has(handleKey(h))) return false;
+            edgeOf[pp.target] = h.edge;
+            usedEdges.set(h.edge, pp.target);
+            edgeStack.push(pp.target);
+          }
+        } else if (pp.kind === NAME) {
+          const hk = handleKey(h);
+          const have = nameOf[pp.target];
+          if (have) {
+            if (nameKeyOf[pp.target] !== hk) return false;
+          } else {
+            if ('edge' in h && usedEdges.has(h.edge)) return false;
+            nameOf[pp.target] = h;
+            nameKeyOf[pp.target] = hk;
+            nameUses.set(hk, (nameUses.get(hk) ?? 0) + 1);
+            nameStack.push(pp.target);
+          }
+        } else return false; // binders: not yet
+      }
+    }
+    return true;
+  };
+
+  const undo = (edgeMark: number, nameMark: number) => {
+    while (edgeStack.length > edgeMark) {
+      const t = edgeStack.pop()!;
+      usedEdges.delete(edgeOf[t]);
+      edgeOf[t] = NONE;
+    }
+    while (nameStack.length > nameMark) {
+      const t = nameStack.pop()!;
+      const hk = nameKeyOf[t];
+      const c = nameUses.get(hk)! - 1;
+      if (c) nameUses.set(hk, c);
+      else nameUses.delete(hk);
+      nameOf[t] = null;
+      nameKeyOf[t] = '';
+    }
+  };
+
+  const candidates = (k: number, st: Step): readonly Node[] => {
+    const s = seedFor[k];
+    if (s !== NONE) {
+      const n = ix.node.get(s);
+      return n ? [n] : [];
+    }
+    if (st.via) {
+      const h: Handle | null = st.via.kind === EDGE ? (edgeOf[st.via.target] !== NONE ? { edge: edgeOf[st.via.target] } : null) : nameOf[st.via.target];
+      if (h) {
+        const pts = ix.pointsOn(h);
+        const out: Node[] = [];
+        for (const p of pts) {
+          const n = ix.node.get(p.node)!;
+          if (!out.includes(n)) out.push(n);
+        }
+        return out;
+      }
+    }
+    if (st.parent !== NONE) return ix.children({ node: nodeOf[st.parent] });
+    const place = places[st.region];
+    return place ? ix.children(place) : ix.g.nodes;
+  };
+
+  const assign = (k: number): void => {
+    if (k === S) return finish();
+    const st = steps[k];
+    for (const gn of candidates(k, st)) {
+      if (stopped) return;
+      if (used.has(gn.id)) continue;
+      if (!sig.sub(gn.type, st.pn.type) || payloadKey(gn) !== st.payload || memberKey(gn.member) !== st.member || gn.ports.length !== st.ports.length) continue;
+      if (st.parent !== NONE) {
+        if (!('node' in gn.parent) || gn.parent.node !== nodeOf[st.parent]) continue;
+      }
+      let placed = false;
+      if (st.parent === NONE) {
+        const place = places[st.region];
+        if (place) {
+          if (parentKey(place) !== parentKey(gn.parent)) continue;
+        } else {
+          places[st.region] = gn.parent;
+          placeSetBy[st.region] = k;
+          placed = true;
+        }
+      }
+      const em = edgeStack.length, nm = nameStack.length;
+      nodeOf[k] = gn.id;
+      used.add(gn.id);
+      if (bind(st, gn)) assign(k + 1);
+      undo(em, nm);
+      used.delete(gn.id);
+      nodeOf[k] = NONE;
+      if (placed) {
+        places[st.region] = undefined;
+        placeSetBy[st.region] = NONE;
+      }
+    }
+  };
+
+  const finish = (): void => {
+    if (seedEdges) for (const [pe, ge] of seedEdges) {
+      const i = plan.edgeIndex.get(pe);
+      if (i !== undefined && edgeOf[i] !== NONE && edgeOf[i] !== ge) return;
+    }
+    // the context stands outside the redex
+    for (const place of places) {
+      if (!place) return;
+      for (let cur: Parent = place; 'node' in cur; cur = ix.node.get(cur.node)!.parent) if (used.has(cur.node)) return;
+    }
+    // a closed edge holds exactly its points (and, joined to an inner name, what its sites hold)
+    for (let i = 0; i < edgeIds.length; i++) {
+      const ge = edgeOf[i];
+      if (ge === NONE) continue;
+      const pEdge = pattern.edges[i];
+      const gEdge = ix.edge.get(ge)!;
+      if (!sig.sub(gEdge.contract, pEdge.contract)) return;
+      const want = pEdge.value === null ? null : plan.stepOf.has(pEdge.value) ? nodeOf[plan.stepOf.get(pEdge.value)!] : pEdge.value;
+      if (gEdge.value !== want) return;
+      const n = ix.pointsOn({ edge: ge }).length;
+      const p = plan.pointsOnEdge[i];
+      if (plan.joined[i] ? n < p : n !== p) return;
+    }
+    // a matched node holding no site holds exactly what the pattern says
+    for (let k = 0; k < S; k++) {
+      if (plan.holdsSite[k]) continue;
+      for (const c of ix.children({ node: nodeOf[k] })) if (!used.has(c.id)) return;
+    }
+    siteChoices();
+  };
+
+  /** What the sites hold: worked out directly where each node holds at most one anonymous site, else every split. */
+  const siteChoices = (): void => {
+    const sites: Id[][] = plan.sites.map(() => []);
+    const taken = new Set<Id>();
+    // keyed sites: exactly what stands at the key
+    plan.sites.forEach((s, i) => {
+      if (s.key === null) return;
+      const at: Parent = s.parent !== NONE ? { node: nodeOf[s.parent] } : places[s.region]!;
+      const c = ix.childAt(at, s.key);
+      if (c && !used.has(c.id) && !taken.has(c.id)) {
+        sites[i] = [c.id];
+        taken.add(c.id);
+      }
+    });
+    // anonymous sites in nodes: what is left there (attributes never), split among them
+    const splits: { site: number[]; rest: Id[] }[] = [];
+    for (let k = 0; k < S; k++) {
+      if (!plan.holdsSite[k]) continue;
+      const anon: number[] = [];
+      plan.sites.forEach((s, i) => s.parent === k && s.key === null && anon.push(i));
+      const rest: Id[] = [];
+      for (const c of ix.children({ node: nodeOf[k] })) {
+        if (used.has(c.id) || taken.has(c.id)) continue;
+        if (isAttr(c.member)) return; // an attribute is never cut from its node, nor held by an anonymous site
+        rest.push(c.id);
+      }
+      if (!anon.length) {
+        if (rest.length) return;
+      } else if (anon.length === 1) sites[anon[0]] = rest;
+      else splits.push({ site: anon, rest });
+    }
+    if (!splits.length) return emit(sites);
+    // several anonymous sites in one node: every way to share out what is left
+    const go = (g: number): void => {
+      if (stopped) return;
+      if (g === splits.length) return emit(sites.map((x) => [...x]));
+      const { site, rest } = splits[g];
+      const bins = site.map(() => [] as Id[]);
+      const put = (i: number): void => {
+        if (stopped) return;
+        if (i === rest.length) {
+          site.forEach((si, j) => (sites[si] = bins[j]));
+          return go(g + 1);
+        }
+        for (const bin of bins) {
+          bin.push(rest[i]);
+          put(i + 1);
+          bin.pop();
+        }
+      };
+      put(0);
+    };
+    go(0);
+  };
+
+  const emit = (sites: Id[][]): void => {
+    if (!paramLinksOk(sites)) return;
+    const f: Found = {
+      nodes: steps.map((st, k) => [st.pn.id, nodeOf[k]] as [Id, Id]),
+      edges: edgeIds.flatMap((id, i) => (edgeOf[i] !== NONE ? [[id, edgeOf[i]] as [Id, Id]] : [])),
+      sites,
+      places: places.map((p) => p!),
+      names: plan.nameIds.flatMap((id, i) => (nameOf[i] ? [[id, nameOf[i]!] as [Id, Handle]] : [])),
+    };
+    if (found(f) === false) stopped = true;
+  };
+
+  /** What the sites hold reaches a closed redex edge only through an inner name joined to it. */
+  const paramLinksOk = (sites: Id[][]): boolean => {
+    if (usedEdges.size === 0) return true;
+    const inParam = new Set<Id>();
+    for (const roots of sites) for (const r of roots) for (const id of ix.subtree(r)) inParam.add(id);
+    for (const id of inParam)
+      for (const grp of ix.node.get(id)!.ports)
+        for (const [, p] of grp.points)
+          if ('edge' in p.target && usedEdges.has(p.target.edge) && !plan.joined[usedEdges.get(p.target.edge)!]) return false;
+    for (let i = 0; i < edgeIds.length; i++) {
+      if (!plan.joined[i] || edgeOf[i] === NONE) continue;
+      for (const pt of ix.pointsOn({ edge: edgeOf[i] })) if (!used.has(pt.node) && !inParam.has(pt.node)) return false;
+    }
+    return true;
+  };
+
+  assign(0);
+}

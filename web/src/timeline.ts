@@ -19,6 +19,8 @@ export class Timeline {
   private at = 0;
   private sig: Signature | null = null;
   private typeColor: (type: number) => string = () => '#888';
+  /** Along steps, or along simulated time. */
+  axis: 'steps' | 'time' = 'steps';
   onSeek: (i: number) => void = () => {};
   private hover: number | null = null;
 
@@ -52,10 +54,32 @@ export class Timeline {
     this.draw();
   }
 
+  /** Where along the axis frame `i` is, 0..1. */
+  private along(i: number): number {
+    const n = this.frames.length;
+    if (this.axis === 'time') {
+      const end = this.frames[n - 1]?.t || 1;
+      return this.frames[i].t / end;
+    }
+    return i / Math.max(1, n - 1);
+  }
+
   private indexAt(clientX: number) {
     const r = this.canvas.getBoundingClientRect();
     const n = this.frames.length;
-    return Math.max(0, Math.min(n - 1, Math.round(((clientX - r.left - 8) / Math.max(1, r.width - 16)) * Math.max(1, n - 1))));
+    const f = (clientX - r.left - 8) / Math.max(1, r.width - 16);
+    if (this.axis === 'time') {
+      // the last frame at or before that moment
+      const t = f * (this.frames[n - 1]?.t ?? 0);
+      let lo = 0, hi = n - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (this.frames[mid].t <= t) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
+    }
+    return Math.max(0, Math.min(n - 1, Math.round(f * Math.max(1, n - 1))));
   }
 
   private draw() {
@@ -72,7 +96,7 @@ export class Timeline {
     const n = this.frames.length;
     if (!n || !this.sig) return;
     const L = 8, R = w - 8, strip = 10, top = 6, bottom = h - strip - 6;
-    const x = (i: number) => L + ((R - L) * i) / Math.max(1, n - 1);
+    const x = (i: number) => L + (R - L) * this.along(i);
 
     // how many of each type, over the steps
     const types = new Set<number>();
@@ -80,22 +104,30 @@ export class Timeline {
     for (const f of this.frames) for (const [t, k] of f.counts) types.add(t), (max = Math.max(max, k));
     g.lineWidth = 1.5;
     for (const t of types) {
-      g.strokeStyle = this.typeColor(t);
-      g.globalAlpha = 0.85;
+      // lightened toward white, so a dark type still reads on the dark strip
+      g.strokeStyle = `color-mix(in srgb, ${this.typeColor(t)} 70%, white)`;
+      g.globalAlpha = 0.9;
       g.beginPath();
-      const stride = Math.max(1, Math.floor(n / (R - L)));
+      // at most two points a pixel: a long history is sampled, not drawn whole
+      const stride = Math.max(1, Math.floor(n / (2 * (R - L))));
+      let lastY = 0;
       for (let i = 0; i < n; i += stride) {
         const y = bottom - ((bottom - top) * (this.frames[i].counts.get(t) ?? 0)) / max;
         if (i === 0) g.moveTo(x(i), y);
-        else g.lineTo(x(i), y);
+        else {
+          if (this.axis === 'time') g.lineTo(x(i), lastY); // it held until now
+          g.lineTo(x(i), y);
+        }
+        lastY = y;
       }
       g.stroke();
     }
     g.globalAlpha = 1;
 
     // each reaction, a mark in its rule's colour
-    const bw = Math.max(1, (R - L) / Math.max(1, n - 1) - 1);
-    for (let i = 1; i < n; i++) {
+    const bw = this.axis === 'time' ? 1.5 : Math.max(1, (R - L) / Math.max(1, n - 1) - 1);
+    const markStride = Math.max(1, Math.floor(n / (R - L)));
+    for (let i = 1; i < n; i += markStride) {
       const tr = this.frames[i].transition;
       if (!tr) continue;
       g.fillStyle = ruleColor(tr.rule);

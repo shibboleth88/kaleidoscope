@@ -69,11 +69,14 @@ const disjoint = (a: number[], b: number[]) => {
 };
 
 /** `compose inside outside`, checked: each refusal says which check failed. */
-export function compose(inside: Carrier, outside: Carrier): Carrier {
-  const pi = formedProblems(inside);
-  if (pi.length) throw new Refusal('E-compose', `the inside is not formed: ${pi[0]}`);
-  const po = formedProblems(outside);
-  if (po.length) throw new Refusal('E-compose', `the outside is not formed: ${po[0]}`);
+export function compose(inside: Carrier, outside: Carrier, opts: { trusted?: boolean } = {}): Carrier {
+  // `trusted`: both parts built by the caller as formed (a reaction's pieces); the faces and identities are still checked
+  if (!opts.trusted) {
+    const pi = formedProblems(inside);
+    if (pi.length) throw new Refusal('E-compose', `the inside is not formed: ${pi[0]}`);
+    const po = formedProblems(outside);
+    if (po.length) throw new Refusal('E-compose', `the outside is not formed: ${po[0]}`);
+  }
   if (!sameFace(inside.outer, outside.inner)) throw new Refusal('E-compose', 'the faces differ');
   if (!disjoint(inside.nodes.map((n) => n.id), outside.nodes.map((n) => n.id)))
     throw new Refusal('E-compose', 'node identities collide');

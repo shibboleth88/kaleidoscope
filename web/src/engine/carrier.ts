@@ -73,16 +73,31 @@ export interface Carrier {
 
 // ── keys: canonical strings, so identities and scalars can index maps ──────────────────────────────────────
 
-export const scalarKey = (s: Scalar): string =>
-  'int' in s ? `i${s.int}` : 'text' in s ? `t${JSON.stringify(s.text)}` : 'bool' in s ? `b${s.bool}` : `f${s.float}`;
+// keys are asked for constantly while matching: each scalar's and member's, worked out once
+const scalarKeys = new WeakMap<Scalar, string>();
+const memberKeys = new WeakMap<Member, string>();
+
+export const scalarKey = (s: Scalar): string => {
+  let k = scalarKeys.get(s);
+  if (k === undefined) {
+    k = 'int' in s ? `i${s.int}` : 'text' in s ? `t${JSON.stringify(s.text)}` : 'bool' in s ? `b${s.bool}` : `f${s.float}`;
+    scalarKeys.set(s, k);
+  }
+  return k;
+};
 
 export const parentKey = (p: Parent): string => ('node' in p ? `n${p.node}` : `r${p.region}`);
 
 export const handleKey = (h: Handle): string => ('edge' in h ? `e${h.edge}` : 'name' in h ? `x${h.name}` : `b${h.binder}`);
 
 export const memberKey = (m: Member): string => {
-  const k = 'attr' in m ? m.attr : m.held;
-  return `${'attr' in m ? 'a' : 'h'}${k === null ? '_' : scalarKey(k)}`;
+  let key = memberKeys.get(m);
+  if (key === undefined) {
+    const k = 'attr' in m ? m.attr : m.held;
+    key = `${'attr' in m ? 'a' : 'h'}${k === null ? '_' : scalarKey(k)}`;
+    memberKeys.set(m, key);
+  }
+  return key;
 };
 
 export const isAttr = (m: Member): boolean => 'attr' in m;
@@ -117,7 +132,16 @@ export interface PointRef {
   point: Scalar;
 }
 
+const indexes = new WeakMap<Carrier, Index>();
+
 export class Index {
+  /** The index of a carrier, built once: a carrier is never changed once made, so its index can be shared. */
+  static of(g: Carrier): Index {
+    let ix = indexes.get(g);
+    if (!ix) indexes.set(g, (ix = new Index(g)));
+    return ix;
+  }
+
   readonly node = new Map<Id, Node>();
   readonly edge = new Map<Id, Edge>();
   readonly kids = new Map<string, Node[]>();
@@ -140,6 +164,19 @@ export class Index {
 
   children(p: Parent): Node[] {
     return this.kids.get(parentKey(p)) ?? [];
+  }
+
+  private keyedKids = new Map<string, Map<string, Node>>();
+  /** The child standing at a key (a member key), if one does; each place's keyed children mapped once. */
+  childAt(p: Parent, member: string): Node | undefined {
+    const pk = parentKey(p);
+    let m = this.keyedKids.get(pk);
+    if (!m) {
+      m = new Map();
+      for (const c of this.children(p)) if (keyed(c.member)) m.set(memberKey(c.member), c);
+      this.keyedKids.set(pk, m);
+    }
+    return m.get(member);
   }
 
   pointsOn(h: Handle): PointRef[] {

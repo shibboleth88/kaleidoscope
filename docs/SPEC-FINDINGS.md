@@ -279,3 +279,165 @@ modelling guide:
 
 Both are about the *place* the redex reaches into, which is where negatives are cheap: the occurrence fixes the
 place, and the negative only asks what else stands there.
+
+---
+
+## Found building rates as expressions (yin and yang)
+
+### F22. A rate is per spot (mass action), and a channel rate has to be divided back out
+
+**Came up:** "Yang unmakes a Yin, at a rate set by how far Yang is below equilibrium". The redex picks one Yin, so
+the rule has a spot at *every* Yin, and the channel's total rate is the per-spot rate times the number of Yins.
+The equation wanted the channel to run at k·(12 − Yang), so the rate had to be written
+`max[12 - count[?y Yang] 0] * 0.5 / (count[?x Yin] + 1)`.
+
+**Kaleidoscope:** a rate expression is evaluated at each spot, and the spot is weighted by it: mass action, the
+same as a numeric rate (F13, F14). The division is the author's.
+
+**Question:** both meanings are wanted. Mass action is right for "each Yin decays at rate r". A channel rate is
+right for "one Yin is unmade at rate f(state)". Should G7 offer both, for example `rate` (per spot) and
+`flux` (per rule, shared among its spots)?
+
+### F23. A typed count (provisional), and what a site's count counts
+
+**Came up:** every rate here counts Yin or Yang. `count[?x Yang]` counts the roots a site holds whose type is
+`≤ Yang`, and `count[?x]` counts all of them. This answers the need in F20.
+
+**Question:** roots or every node within? Kaleidoscope counts roots (a place's members), which is cheap and local.
+A deep count is sometimes wanted ("molecules anywhere in this cell"). And is `count` a library operation, a kernel
+primitive, or a form of the guard part?
+
+### F24. Global quantities are reachable only through a place that holds them
+
+**Came up:** the yin–yang equations are about system-wide counts. A rule can only read what its redex reaches, so
+the system needs a place that holds everything (the Taiji's two halves), and every rule's redex reaches it. This is
+the spec's locality (`discover_local`: what is beside the state and not asked about costs nothing) showing up as a
+modelling rule: whatever you want to read, you must reach.
+
+**Question:** none for the kernel. A modelling-guide entry: to make a rate depend on a population, put the
+population in a place and reach the place.
+
+### F25. A trace has no times
+
+**Came up:** playing by time, where each reaction waits as long as the Gillespie time it took, needs every step's
+time. The policy draws it, and `Trace`/`Commit` (`Spec/Step.lean`) do not record it, so a replayed trace cannot be
+played by time.
+
+**Kaleidoscope:** each frame keeps its time `t`, beside the state.
+
+**Question:** when `composites.time` lands, does a commit carry its time (or the clock's value after it), so a
+trace replays in time?
+
+---
+
+## Found making it fast
+
+### F26. Discovery across commits: what an occurrence depends on
+
+**Came up:** a crowded cell (240 molecules) spent 80 ms a step rediscovering every rule. `discover_local` states a
+cost law within one state ("what is beside the state and never asked about costs nothing"). Nothing says what
+can be *kept* from one commit's discovery to the next, and that is where the time goes. Kaleidoscope's
+incremental discovery (`engine/incremental.ts`) is 5–14× faster on crowded systems. It is checked against full
+discovery at every step of every example, and rests on two claims the spec could state and prove:
+
+1. An occurrence of a rule with one region, no site at a root, and no negative adding beside the match depends
+   only on the nodes it meets and on what they hold. A commit whose changes (with everything linked to them) stand
+   outside the upward closure of those nodes leaves it an occurrence.
+2. If additionally nothing reads the rule's sites (no guard, rate or computed value, no negative) and each node holds
+   at most one anonymous site, a change among what such a node's site holds leaves it an occurrence: only its site
+   contents differ, and they are determined by its node map (refound when it fires).
+
+New occurrences after a commit all meet a changed node or its parent, so searching anchored there (link-directed,
+from the anchor's ancestors) finds them all.
+
+**Question:** state these as laws of the reaction axis (an incremental `discover` alongside `discover_local`), so
+every implementation can rely on them.
+
+### F27. Matching must be link-directed
+
+**Came up:** `dissociate` (`~b :: Link | MEK[e = ~b] | pERK[s = ~b]`) tried every MEK against every sibling for
+its partner: 3.5 ms to find nothing. Once a link is bound, the partner is one of the few points on it. Following the
+link cut it to 0.3 ms.
+
+**Spec:** `Plan.lean` already plans "one matcher, keyed and link-directed" (`reaction.impl`). This confirms the
+plan on a real system, and adds that the anchor should seed its ancestors and its region's place, so an
+anchored search costs what stands near the anchor.
+
+---
+
+## Found porting wyrm (the C. elegans embryo)
+
+### F28. A relation of any arity needs a rest of points
+
+**Came up:** a cell touches some number of others, from 0 to about 8. wyrm (spec1) holds them as a port family
+matched with a rest: `contacts: {Var[e] | Rest(as: ra)}`. In the carrier, a port group's points are listed and a
+match meets them exactly (`PortGroup.Narrowed`: `Along` over the points), so a pattern cannot say "one of its
+contacts is e, whatever the others are".
+
+**Kaleidoscope:** contacts are reified, as nodes (`Contact[a, b]`) joining two cells' identity links. That works
+and draws well (a contact is a curve), but every rule about a contact meets three nodes instead of two, and a
+symmetric relation needs two rules (F30).
+
+**Question:** a site for points, a "rest" in a port group (`contacts = (~e | ?more)`), as sites are a rest for
+members? It is the link graph's counterpart of the place graph's anonymous site.
+
+### F29. Mechanics wants sums over neighbours, or rounds
+
+**Came up:** wyrm moves each cell by the sum of its contact forces, once per tick (pool deposits, then a draw).
+One reaction at a time cannot sum. Kaleidoscope relaxes contact by contact instead, moving both cells along the
+line between them (Gauss–Seidel on the same energy).
+
+**Question:** two routes the spec could take. A fold over a node's links in an expression
+(`sum[contacts ~e (?x - ?bx)]`), or the scheduling axis's rounds (`Scheduling.choose`), which already take every
+independent occurrence at once. Rounds refuse where occurrences overlap, though, and every contact of a cell
+overlaps at the cell, so a round alone does not give a synchronous sweep. Accumulators (wyrm's pools) may be the
+missing piece.
+
+### F30. A symmetric relation, written twice
+
+**Came up:** "Notch: an AB daughter in contact with the signalling cell". A Contact's ends are `a` and `b`, so the
+rule is written once for the cell at `a` and once for it at `b`. The same happens for Wnt, and for "unless a
+contact already joins them" (two negatives).
+
+**Question:** an unordered port group (points with no keys, matched as a multiset) would make a symmetric relation
+one rule. This is the same multiset the place graph has for anonymous members.
+
+### F31. Conditionals in expressions
+
+**Came up:** wyrm's rules use `If` throughout (periods by lineage class, the force law by distance). Kaleidoscope
+added `if[c a b]`, which works out only the branch taken, along with `clamp` and `hypot`. v004 has
+`if c then a else b` as sugar for a call that unquotes a branch (§9). The two agree on laziness, which matters
+(`if[?a == 0 1 10 / ?a]`).
+
+### F32. "No rule reads a name"
+
+**Came up:** wyrm's discipline is that names (`ABalp`) are readouts, written at each division and never matched.
+In kaleidoscope's port, names are attributes that rules write (`name = ?n ++ "a"`) and no redex mentions. The
+discipline holds, but nothing enforces it.
+
+**Question:** a write-only attribute (an "annotation") that matching ignores, so the discipline is checked rather
+than kept by convention? It would also make annotated nodes match plain patterns without implicit sites (F1).
+
+### F33. What profiling a stress test taught the matcher (the embryo, 13.5× faster)
+
+The wyrm embryo (28 cells, about 450 nodes, 30 rules, 6,000 reactions) took 270 s at first and 20 s after. Each
+change is a claim about what a reaction can and cannot affect, and so a candidate law for the spec (F26):
+
+1. **Only a change of links reaches along links.** A node that moved, or changed an attribute, does not change its
+   link-neighbours' occurrences. Only a node whose ports changed (or that was created or removed) does.
+   639 → 372 searches per reaction.
+2. **A site no expression reads absorbs change.** Even in a guarded rule (divisions read `?t` and `?b`, not
+   `?rest`), a node's one anonymous site that nothing reads lets what it holds change without disturbing the
+   occurrence. This is per site, not per rule.
+3. **A search from a node's parent covers it.** An occurrence meeting a changed node below the redex's root also
+   meets that node's parent, so where the parent is searched from, the child need not be. 372 → 32 searches per
+   reaction.
+4. **Literal attributes first.** A redex node with `founder = "ab"` cannot meet a cell whose founder differs, and
+   checking that costs nothing next to a search.
+5. **Seed first, then follow links.** An anchored search should assign the anchored root first. Link-directed
+   candidates (F27) then reach everything else through the anchor's links, instead of trying every sibling.
+6. **Guards before negatives.** A guard is arithmetic; a negative is a search.
+
+The rest is the same per-search cost spread thin (site bookkeeping, garbage). A Lean implementation's
+`reaction.impl` would want 1–3 as lemmas, since they are what make discovery cost what changed rather than what
+is there.

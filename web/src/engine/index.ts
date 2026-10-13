@@ -7,3 +7,4 @@ export * from './rule';
 export * from './signature';
 export * from './text';
 export * from './expr';
+export * from './incremental';

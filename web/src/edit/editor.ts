@@ -65,6 +65,8 @@ export class Editor {
   private palette: HTMLElement;
   private inspector: HTMLElement;
   private hint: HTMLElement;
+  /** A rule's rate, as written: shown under the reactum where it is an expression. */
+  private rate: string | undefined;
   /** What was last written, so the text box echoing it back does not re-read it. */
   private lastText = '';
 
@@ -96,8 +98,9 @@ export class Editor {
   // ── what is open ───────────────────────────────────────────────────────────────────────────────────────
 
   /** Open a state or a rule from its text. Returns the reader's complaint, if any. */
-  open(kind: 'state' | 'rule', text: string, sig: Signature): string | null {
+  open(kind: 'state' | 'rule', text: string, sig: Signature, rate?: string): string | null {
     this.sig = sig;
+    this.rate = rate;
     if (text === this.lastText && this.doc?.kind === kind) return this.build();
     this.lastText = text;
     try {
@@ -215,7 +218,10 @@ export class Editor {
           key: 'L', carrier: r.redex, offset: new THREE.Vector3(-w, 0, 0), title: 'redex', names: b.redex.names, quietSites: quiet(b.redex), siteNames: siteNames(b.redex),
           subtitle: this.doc?.kind === 'rule' && this.doc.ast.guard ? `where ${valueText(this.doc.ast.guard)}` : undefined,
         },
-        { key: 'R', carrier: r.reactum, offset: new THREE.Vector3(w, 0, 0), title: 'reactum', names: b.reactum.names, quietSites: quiet(b.reactum), siteNames: siteNames(b.reactum), formulas: b.reactum.formulas },
+        {
+          key: 'R', carrier: r.reactum, offset: new THREE.Vector3(w, 0, 0), title: 'reactum', names: b.reactum.names, quietSites: quiet(b.reactum), siteNames: siteNames(b.reactum), formulas: b.reactum.formulas,
+          subtitle: this.rate && !Number.isFinite(Number(this.rate)) ? `rate ${this.rate}` : undefined,
+        },
       ];
       // each unless below the redex: the redex as a ghost, and in red what it adds; then one to start another
       const redexIds = new Set(r.redex.nodes.map((n) => n.id));

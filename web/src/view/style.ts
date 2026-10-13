@@ -6,6 +6,14 @@
  *   size: number             sizeBy: '<attr>'   (scales with that numeric attribute)
  *   colorBy: '<attr>'        (hue follows that numeric attribute, 0..1 → around the wheel)
  *   container: boolean       (drawn as a translucent place others stand in)
+ *   position: "x y z"        (placed by those attributes, in its place's frame, rather than by the layout)
+ *   scale: number            (world units per unit of position, radius and ellipsoid; default 0.15)
+ *   radiusBy: '<attr>'       (its radius is that attribute, times scale)
+ *   ellipsoid: [a, b, c]     (a place of fixed shape: those semi-axes, times scale)
+ *   colorBy: '<attr>'        (numeric: hue around the wheel; text: a hue of its own for each value)
+ *   asLink: boolean          (drawn as a curve between the things its ports join, not as a body)
+ *   label: '<attr>'          (named by that attribute alone)
+ *   opacity: number          (0..1: see-through, so what is inside or behind shows)
  * Anything unsaid is derived: the hue from the type's root supertype (so subtypes are kin), the shape from its name.
  */
 
@@ -23,6 +31,17 @@ export interface Visual {
   container: boolean | undefined;
   /** Whether the type chose its shape (a container then keeps it; otherwise it is a sphere). */
   shaped: boolean;
+  /** Where its attributes place it, in its place's frame. */
+  pos?: THREE.Vector3;
+  /** Its radius, from an attribute, in world units. */
+  radius?: number;
+  /** A place of fixed shape: semi-axes in world units. */
+  ellipsoid?: THREE.Vector3;
+  asLink: boolean;
+  /** How opaque it is (a style's `opacity`): crowds of things drawn see-through so what joins them shows. */
+  opacity: number;
+  /** What names it, where an attribute does. */
+  label?: string;
 }
 
 const hash = (s: string) => {
@@ -30,6 +49,8 @@ const hash = (s: string) => {
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
   return h >>> 0;
 };
+
+const toText = (s: Scalar) => ('int' in s ? s.int : 'float' in s ? s.float : 'text' in s ? s.text : s.bool);
 
 const num = (s: Scalar | undefined): number | null =>
   s === undefined ? null : 'int' in s ? s.int : 'float' in s ? s.float : 'bool' in s ? (s.bool ? 1 : 0) : null;
@@ -51,8 +72,11 @@ export function visualOf(sig: Signature, type: number, attrs: Map<string, Scalar
   const depth = t === root ? 0 : 1 + (hash(t.name) % 3);
   const color = typeof st.color === 'string' ? new THREE.Color(st.color) : new THREE.Color().setHSL((h % 360) / 360, 0.62, 0.58 - depth * 0.07);
   if (typeof st.colorBy === 'string') {
-    const v = num(attrs.get(st.colorBy));
+    const a = attrs.get(st.colorBy);
+    const v = num(a);
     if (v !== null) color.setHSL(((v % 1) + 1) % 1, 0.7, 0.56);
+    // text: hues spread by the golden angle, so a few values land far apart
+    else if (a && 'text' in a) color.setHSL(((hash(a.text) % 997) * 0.618034) % 1, 0.65, 0.6);
   }
   let size = typeof st.size === 'number' ? st.size : 1;
   if (typeof st.sizeBy === 'string') {
@@ -61,7 +85,28 @@ export function visualOf(sig: Signature, type: number, attrs: Map<string, Scalar
   }
   const shaped = (SHAPES as readonly string[]).includes(st.shape as string);
   const shape = shaped ? (st.shape as Shape) : SHAPES[hash(t.name) % 6];
-  return { color, shape, size, container: typeof st.container === 'boolean' ? st.container : undefined, shaped };
+  const scale = typeof st.scale === 'number' ? st.scale : 0.15;
+  let pos: THREE.Vector3 | undefined;
+  if (typeof st.position === 'string') {
+    const xyz = st.position.split(/\s+/).map((k) => num(attrs.get(k)));
+    if (xyz.length === 3 && xyz.every((v) => v !== null)) pos = new THREE.Vector3(...(xyz as number[])).multiplyScalar(scale);
+  }
+  const rv = typeof st.radiusBy === 'string' ? num(attrs.get(st.radiusBy)) : null;
+  const ell = Array.isArray(st.ellipsoid) && st.ellipsoid.length === 3 ? new THREE.Vector3(...(st.ellipsoid as number[])).multiplyScalar(scale) : undefined;
+  const lab = typeof st.label === 'string' ? attrs.get(st.label) : undefined;
+  return {
+    color,
+    shape,
+    size,
+    container: typeof st.container === 'boolean' ? st.container : undefined,
+    shaped,
+    pos,
+    radius: rv !== null ? Math.abs(rv) * scale : undefined,
+    ellipsoid: ell,
+    asLink: st.asLink === true,
+    opacity: typeof st.opacity === 'number' ? Math.min(1, Math.max(0.05, st.opacity)) : 0.95,
+    label: lab ? ('text' in lab ? lab.text : `${toText(lab)}`) : undefined,
+  };
 }
 
 const geoCache = new Map<string, THREE.BufferGeometry>();

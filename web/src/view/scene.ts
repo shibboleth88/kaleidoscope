@@ -16,7 +16,8 @@ import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRe
 import { type Carrier, type Handle, type Id, Index, type Scalar, isAttr, memberScalar } from '../engine/carrier';
 import type { Signature } from '../engine/signature';
 import type { Transition } from '../engine/react';
-import { type Visual, geometry, visualOf } from './style';
+import { type Shape, type Visual, geometry, visualOf } from './style';
+import { Instances } from './instances';
 
 export interface Slot {
   key: string;
@@ -62,6 +63,18 @@ interface Body {
   flash: number;
   ports: { key: string; dir: THREE.Vector3; handle: string }[];
   container: boolean;
+  /** A leaf is drawn as an instance of its shape; a place has a mesh of its own. */
+  inst?: Shape;
+  /** Where its attributes place it (its place's frame), if they do: it glides there, the layout aside. */
+  target?: THREE.Vector3;
+  /** Its radius, if an attribute gives it. */
+  fixedR?: number;
+  /** A place of fixed shape, if it is one. */
+  ellipsoid?: THREE.Vector3;
+  /** Drawn as a curve between what its ports join. */
+  asLink?: boolean;
+  spin: number;
+  alpha: number;
   tint?: 'ghost' | 'forbid';
   /** Regions are pinned where their slot puts them. */
   pin?: THREE.Vector3;
@@ -98,11 +111,16 @@ export class BigraphView {
   private links: THREE.LineSegments;
   private linkGeo = new THREE.BufferGeometry();
   /** Ports are rings on a body's surface, facing out; a link comes in through the middle. */
+  private instances: Instances;
   private portMeshes: THREE.InstancedMesh;
   private portCores: THREE.InstancedMesh;
   /** A hyperedge's meeting point: where its spokes join. */
   private hubs: THREE.InstancedMesh;
-  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean; any: boolean }[] = [];
+  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean; any: boolean; carried: boolean }[] = [];
+  /** Nodes drawn as links: each, and the handles its ports are on. */
+  private asLinks: { key: string; handles: string[] }[] = [];
+  /** The points on each handle, but those of nodes drawn as links. */
+  private handlePoints = new Map<string, string[]>();
   private slots: Slot[] = [];
   private raf = 0;
   private last = performance.now();
@@ -154,6 +172,7 @@ export class BigraphView {
     );
     this.links.frustumCulled = false;
     this.scene.add(this.links);
+    this.instances = new Instances(this.scene);
     this.portMeshes = new THREE.InstancedMesh(new THREE.TorusGeometry(0.2, 0.05, 8, 28), new THREE.MeshBasicMaterial({ color: 0xffffff }), 2048);
     this.portCores = new THREE.InstancedMesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff }), 2048);
     this.hubs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.16, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }), 512);
@@ -369,14 +388,19 @@ export class BigraphView {
       }
       const held = ix.children({ node: n.id }).some((c) => !isAttr(c.member));
       const vis = visualOf(this.sig, n.type, attrs);
+      b.target = vis.pos;
+      b.fixedR = vis.radius;
+      b.ellipsoid = vis.ellipsoid;
+      b.asLink = vis.asLink;
       b.tint = slot.tint?.get(n.id);
       if (b.tint === 'forbid') vis.color.lerp(FORBID, 0.7);
       const container = vis.container ?? (held || b.container || this.sig.get(n.type).ports.length === 0 && held);
       this.dress(b, vis, container);
       const k = memberScalar(n.member);
       const keyWord = k && 'text' in k ? `${k.text}: ` : '';
-      b.name = `${keyWord}${this.sig.name(n.type)}${words.length ? ` ${words.join(' ')}` : ''}`;
-      this.setLabel(b, `${b.tint === 'forbid' ? '⊘ ' : ''}${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
+      b.name = vis.label ?? `${keyWord}${this.sig.name(n.type)}${words.length ? ` ${words.join(' ')}` : ''}`;
+      if (vis.label !== undefined || vis.asLink) this.setLabel(b, vis.asLink ? '' : vis.label!, container ? 'place' : 'node');
+      else this.setLabel(b, `${b.tint === 'forbid' ? '⊘ ' : ''}${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
       b.ports = n.ports.flatMap((grp, gi) =>
         grp.points.map(([pt], pi) => ({
           key: `${JSON.stringify(grp.key)}/${JSON.stringify(pt)}`,
@@ -434,6 +458,8 @@ export class BigraphView {
       group: new THREE.Group(),
       labelText: '',
       name: '',
+      spin: Math.random() * Math.PI * 2,
+      alpha: 1,
       flash: 0,
       ports: [],
       container: false,
@@ -448,9 +474,16 @@ export class BigraphView {
     const same = b.visual && b.visual.shape === vis.shape && b.visual.shaped === vis.shaped && b.visual.color.equals(vis.color) && b.container === container;
     b.visual = vis;
     b.container = container;
-    if (same && b.mesh) return;
-    if (b.mesh) b.group.remove(b.mesh);
-    if (b.shell) b.group.remove(b.shell);
+    if (same && (b.mesh || b.inst)) return;
+    if (b.mesh) b.group.remove(b.mesh), (b.mesh = undefined);
+    if (b.shell) b.group.remove(b.shell), (b.shell = undefined);
+    b.inst = undefined;
+    if (vis.asLink) return;
+    if (!container) {
+      // a leaf: an instance of its shape, drawn with all the others
+      b.inst = vis.shape;
+      return;
+    }
     const geo = geometry(container && !vis.shaped ? 'sphere' : vis.shape);
     const mat = new THREE.MeshStandardMaterial({
       color: vis.color,
@@ -515,18 +548,28 @@ export class BigraphView {
 
   private rebuildEdges() {
     this.edges = [];
+    this.asLinks = [];
+    this.handlePoints = new Map();
     for (const slot of this.slots) {
       const g = slot.carrier;
       const on = new Map<string, string[]>();
+      const carried = new Set<string>();
       for (const b of this.bodies.values()) {
         if (!b.key.startsWith(`${slot.key}:`) || b.dying) continue;
+        if (b.asLink) {
+          this.asLinks.push({ key: b.key, handles: b.ports.map((p) => p.handle) });
+          for (const p of b.ports) carried.add(p.handle);
+          continue;
+        }
         for (const p of b.ports) (on.get(p.handle) ?? on.set(p.handle, []).get(p.handle)!).push(`${b.key}|${p.key}`);
       }
       for (const [h, points] of on) {
         const isName = h.includes(':x');
-        const any = isName && !this.bodies.has(h);
-        if (isName && !any) points.push(`${h}|anchor`);
-        this.edges.push({ slot: slot.key, points, key: h, free: any || points.length < 2, name: isName, any });
+        const any = isName && !this.bodies.has(h) && !carried.has(h);
+        if (isName && !any && this.bodies.has(h)) points.push(`${h}|anchor`);
+        this.handlePoints.set(h, points);
+        const c = carried.has(h);
+        this.edges.push({ slot: slot.key, points, key: h, free: !c && (any || points.length < 2), name: isName, any, carried: c });
       }
       void g;
     }
@@ -644,6 +687,12 @@ export class BigraphView {
         b.rTarget = 1;
         return b.rTarget;
       }
+      if (b.asLink) return (b.rTarget = 0.01);
+      if (b.ellipsoid) {
+        for (const c of cs) radius(c);
+        return (b.rTarget = Math.max(b.ellipsoid.x, b.ellipsoid.y, b.ellipsoid.z));
+      }
+      if (b.fixedR !== undefined && !cs.length) return (b.rTarget = b.fixedR);
       if (!cs.length) b.rTarget = b.container ? Math.max(base * 1.6, 1.6) : base;
       else {
         const vol = cs.reduce((a, c) => a + Math.pow(radius(c) + GAP, 3), 0);
@@ -659,31 +708,67 @@ export class BigraphView {
       b.flash = Math.max(0, b.flash - dt * 1.5);
     }
 
-    // forces, in each parent's frame
+    // forces, in each parent's frame: no allocation per pair; a crowded place looks only at near neighbours
     const k = this.heat;
     for (const [pk, cs] of kids) {
       const p = this.bodies.get(pk);
       if (!p) continue;
       const room = p.kind === 'region' ? Infinity : p.r;
-      for (let i = 0; i < cs.length; i++) {
-        const a = cs[i];
-        const f = new THREE.Vector3();
+      const n = cs.length;
+      const fx = new Float64Array(n), fy = new Float64Array(n), fz = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = cs[i].local;
         // gentle pull to the centre; held inside the parent
-        f.addScaledVector(a.local, -1.2);
-        const d = a.local.length();
-        const over = d + a.r - (room - 0.25);
-        if (over > 0 && d > 1e-6) f.addScaledVector(a.local, (-over * 30) / d);
-        for (let j = 0; j < cs.length; j++) {
-          if (i === j) continue;
-          const b = cs[j];
-          const v = a.local.clone().sub(b.local);
-          let dist = v.length();
-          if (dist < 1e-4) v.randomDirection(), (dist = 1e-4);
-          const want = a.r + b.r + GAP;
-          if (dist < want) f.addScaledVector(v, ((want - dist) * 40) / dist);
-          else f.addScaledVector(v, 0.8 / (dist * dist));
+        fx[i] = -1.2 * a.x;
+        fy[i] = -1.2 * a.y;
+        fz[i] = -1.2 * a.z;
+        const d = Math.hypot(a.x, a.y, a.z);
+        const over = d + cs[i].r - (room - 0.25);
+        if (over > 0 && d > 1e-6) {
+          const s = (-over * 30) / d;
+          fx[i] += a.x * s;
+          fy[i] += a.y * s;
+          fz[i] += a.z * s;
         }
-        a.vel.addScaledVector(f, dt * k);
+      }
+      const pair = (i: number, j: number, far: boolean) => {
+        const a = cs[i], b = cs[j];
+        let dx = a.local.x - b.local.x, dy = a.local.y - b.local.y, dz = a.local.z - b.local.z;
+        let dist = Math.hypot(dx, dy, dz);
+        if (dist < 1e-4) (dx = Math.random() - 0.5), (dy = Math.random() - 0.5), (dz = Math.random() - 0.5), (dist = Math.hypot(dx, dy, dz));
+        const want = a.r + b.r + GAP;
+        let s = 0;
+        if (dist < want) s = ((want - dist) * 40) / dist;
+        else if (far) s = 0.8 / (dist * dist * dist);
+        else return;
+        fx[i] += dx * s, fy[i] += dy * s, fz[i] += dz * s;
+        fx[j] -= dx * s, fy[j] -= dy * s, fz[j] -= dz * s;
+      };
+      if (n <= 64) {
+        for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pair(i, j, true);
+      } else {
+        // a grid of cells the size of the largest reach: each pair near enough to touch is in neighbouring cells
+        let rmax = 0;
+        for (const c of cs) rmax = Math.max(rmax, c.r);
+        const size = 2 * rmax + GAP;
+        const grid = new Map<string, number[]>();
+        const cell = (v: THREE.Vector3) => [Math.floor(v.x / size), Math.floor(v.y / size), Math.floor(v.z / size)];
+        cs.forEach((c, i) => {
+          const key = cell(c.local).join(',');
+          (grid.get(key) ?? grid.set(key, []).get(key)!).push(i);
+        });
+        cs.forEach((c, i) => {
+          const [x, y, z] = cell(c.local);
+          for (let ox = -1; ox <= 1; ox++)
+            for (let oy = -1; oy <= 1; oy++)
+              for (let oz = -1; oz <= 1; oz++) for (const j of grid.get(`${x + ox},${y + oy},${z + oz}`) ?? []) if (j > i) pair(i, j, false);
+        });
+      }
+      for (let i = 0; i < n; i++) {
+        const v = cs[i].vel;
+        v.x += fx[i] * dt * k;
+        v.y += fy[i] * dt * k;
+        v.z += fz[i] * dt * k;
       }
     }
     // links pull their ends together, a little
@@ -706,6 +791,11 @@ export class BigraphView {
 
     // integrate, then place in the world, parents first
     for (const b of this.bodies.values()) {
+      if (b.target) {
+        b.vel.set(0, 0, 0);
+        b.local.lerp(b.target, Math.min(1, dt * 5));
+        continue;
+      }
       b.vel.multiplyScalar(Math.pow(0.04, dt));
       b.local.addScaledVector(b.vel, dt);
     }
@@ -742,15 +832,25 @@ export class BigraphView {
       }
       b.group.position.copy(b.world);
       const s = Math.max(1e-3, b.r * b.grow);
-      if (b.mesh) b.mesh.scale.setScalar(s);
-      if (b.shell) b.shell.scale.setScalar(s * 1.002);
+      if (b.ellipsoid) {
+        // a place of fixed shape: its own semi-axes
+        b.mesh?.scale.copy(b.ellipsoid).multiplyScalar(b.grow);
+        b.shell?.scale.copy(b.ellipsoid).multiplyScalar(b.grow * 1.002);
+      } else {
+        if (b.mesh) b.mesh.scale.setScalar(s);
+        if (b.shell) b.shell.scale.setScalar(s * 1.002);
+      }
       if (b.mesh) {
-        b.mesh.rotation.y += dt * 0.25;
+        if (!b.ellipsoid) b.mesh.rotation.y += dt * 0.25;
         const m = b.mesh.material as THREE.MeshStandardMaterial;
         if ('emissiveIntensity' in m) m.emissiveIntensity = (b.container ? 0.05 : 0.22) + b.flash * 1.4;
         m.opacity = (b.mesh.userData.base ?? m.opacity) * seen(b);
       }
       if (b.shell) (b.shell.material as THREE.LineBasicMaterial).opacity = (b.kind === 'site' ? 0.8 : 0.28) * seen(b);
+      if (b.inst) {
+        b.spin += dt * 0.25;
+        b.alpha = (b.visual?.opacity ?? 0.95) * seen(b);
+      }
       if (b.label && b.kind === 'region') {
         let low = 0;
         for (const c of kids.get(b.key) ?? []) low = Math.min(low, c.local.y - c.r);
@@ -762,10 +862,22 @@ export class BigraphView {
         const d = depth.get(b.key);
         const leafFocus = d === 0 && !b.container;
         const shown = (d !== undefined && d >= 1 && d <= 2) || leafFocus ? 1 : 0;
+        b.label.visible = shown > 0 && b.grow > 0.02;
         b.label.element.style.opacity = `${b.grow * shown}`;
       }
     };
     for (const b of this.bodies.values()) put(b);
+
+    // the leaves, as instances of their shapes
+    this.instances.begin();
+    const tint = new THREE.Color();
+    for (const b of this.bodies.values()) {
+      if (!b.inst || !b.visual) continue;
+      const mark = this.marks.get(b.key);
+      const glow = 0.22 + b.flash * 1.4 + (mark === 1 ? 0.9 : mark === 2 ? 0.6 : 0);
+      this.instances.add(b.inst, b.key, b.world, b.spin, Math.max(1e-3, b.r * b.grow), tint.copy(b.visual.color), b.alpha, glow);
+    }
+    this.instances.end();
 
     // the dead, once faded, go
     for (const [key, b] of this.bodies)
@@ -840,9 +952,10 @@ export class BigraphView {
     for (const e of this.edges) {
       const ends: { p: THREE.Vector3; n: THREE.Vector3; ref: string }[] = [];
       for (const ref of e.points) if (this.portWorld(ref, a, n)) ends.push({ p: a.clone(), n: n.clone(), ref });
-      const linked = !e.free && ends.length >= 2;
+      const linked = e.carried || (!e.free && ends.length >= 2);
       for (const end of ends) {
-        if (end.ref.endsWith('|anchor') || rings >= 2048) continue;
+        // a port only nodes drawn as links ride on is plumbing: no ring
+        if (end.ref.endsWith('|anchor') || rings >= 2048 || (e.carried && e.points.length === 1)) continue;
         const v = Math.max(0.08, seenOf(end.ref));
         q.setFromUnitVectors(z, end.n);
         m.compose(end.p, q, one);
@@ -853,7 +966,7 @@ export class BigraphView {
           this.portCores.setMatrixAt(cores++, m);
         }
       }
-      if (!linked) continue;
+      if (!linked || e.carried) continue;
       const lit = tmp.copy(BOUND).multiplyScalar(Math.max(0.06, Math.max(...e.points.map(seenOf)))).toArray();
       if (ends.length === 2) {
         // a bond: out of each ring, round, and into the other
@@ -875,6 +988,26 @@ export class BigraphView {
           this.hubs.setMatrixAt(hubs++, m.makeTranslation(hub.x, hub.y, hub.z));
         }
       }
+    }
+    // a node drawn as a link: a curve from one thing it joins to the other, in its own colour
+    for (const l of this.asLinks) {
+      const lb = this.bodies.get(l.key);
+      if (!lb || lb.dying || !lb.visual) continue;
+      const ends: { p: THREE.Vector3; n: THREE.Vector3 }[] = [];
+      const joined = l.handles.map((h) => this.bodies.get((this.handlePoints.get(h)?.[0] ?? '').split('|')[0])).filter((x): x is Body => !!x && !x.dying);
+      if (joined.length !== 2) continue;
+      // centre to centre, bowed a little: what touches what, drawn through see-through bodies
+      for (const [me, other] of [[joined[0], joined[1]], [joined[1], joined[0]]]) {
+        const dir = other.world.clone().sub(me.world);
+        if (dir.lengthSq() < 1e-8) dir.set(1, 0, 0);
+        dir.normalize().add(new THREE.Vector3(0, 0.25, 0)).normalize();
+        ends.push({ p: me.world.clone(), n: dir });
+      }
+      const v = Math.max(0.06, lb.grow * Math.min(...l.handles.map((h) => seenOf(this.handlePoints.get(h)?.[0] ?? ''))));
+      const rgb = tmp.copy(lb.visual.color).multiplyScalar(v).toArray();
+      const [x, y] = ends;
+      const k = Math.max(0.2, x.p.distanceTo(y.p) * 0.3);
+      curve(x.p, x.p.clone().addScaledVector(x.n, k), y.p.clone().addScaledVector(y.n, k), y.p, rgb);
     }
     for (const [im, count] of [[this.portMeshes, rings], [this.portCores, cores], [this.hubs, hubs]] as const) {
       im.count = count;
@@ -899,7 +1032,10 @@ export class BigraphView {
     const meshes = [...this.bodies.values()]
       .filter((b) => b.mesh && !b.dying && b.kind !== 'region' && (this.seenBy.get(b.key) ?? 1) > 0.2 && !skip(b.key))
       .map((b) => b.mesh!);
-    const hit = this.ray(clientX, clientY).intersectObjects(meshes, false)[0];
+    const ray = this.ray(clientX, clientY);
+    const hit = ray.intersectObjects(meshes, false)[0];
+    const leaf = this.instances.raycast(ray, (k) => skip(k) || !!this.bodies.get(k)?.dying || (this.seenBy.get(k) ?? 1) <= 0.2)[0];
+    if (leaf && (!hit || leaf.distance < hit.distance)) return leaf.key;
     return hit ? (hit.object.userData.key as string) : null;
   }
 

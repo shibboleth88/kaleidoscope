@@ -9,7 +9,7 @@
 
 import type { Scalar } from './carrier';
 
-export type Expr = { lit: Scalar } | { site: number } | { op: string; args: Expr[] };
+export type Expr = { lit: Scalar } | { site: number } | { type: string } | { op: string; args: Expr[] };
 
 export class EvalError extends Error {}
 
@@ -17,8 +17,8 @@ export class EvalError extends Error {}
 export interface Env {
   /** The scalar a site holds, if it holds exactly one. */
   scalar(site: number): Scalar | null;
-  /** How many things a site holds. */
-  count(site: number): number;
+  /** How many things a site holds; of a type (or a subtype of it), if one is given. */
+  count(site: number, type?: string): number;
 }
 
 export const NO_SITES: Env = {
@@ -37,11 +37,13 @@ const toV = (s: Scalar): V => ('int' in s ? s.int : 'float' in s ? s.float : 'te
 /** Whether a value is a whole number held as such (an Int), so arithmetic on Ints stays whole. */
 const isInt = (e: Expr, env: Env): boolean => {
   if ('lit' in e) return 'int' in e.lit;
+  if ('type' in e) return false;
   if ('site' in e) {
     const s = env.scalar(e.site);
     return !!s && 'int' in s;
   }
-  if (['+', '-', '*', '%', 'neg', 'abs', 'min', 'max'].includes(e.op)) return e.args.every((a) => isInt(a, env));
+  if (['+', '-', '*', '%', 'neg', 'abs', 'min', 'max', 'clamp'].includes(e.op)) return e.args.every((a) => isInt(a, env));
+  if (e.op === 'if') return isInt(e.args[1], env) && isInt(e.args[2], env);
   return ['count', 'floor', 'round'].includes(e.op);
 };
 
@@ -51,22 +53,90 @@ const num = (v: V, op: string): number => {
   throw new EvalError(`${op} takes numbers, not "${v}"`);
 };
 
-export const FUNCTIONS: Record<string, number> = { min: 2, max: 2, abs: 1, sqrt: 1, floor: 1, round: 1, exp: 1, log: 1, count: 1 };
+/** Each function and how many values it takes (count: a site, and perhaps a type). */
+export const FUNCTIONS: Record<string, [number, number]> = {
+  min: [2, 2], max: [2, 2], abs: [1, 1], sqrt: [1, 1], floor: [1, 1], round: [1, 1], exp: [1, 1], log: [1, 1], count: [1, 2],
+  /** if[c a b]: a where c holds, else b (only the one taken is worked out). */
+  if: [3, 3],
+  /** clamp[v lo hi]. */
+  clamp: [3, 3],
+  /** hypot[x y] or hypot[x y z]: the length of a vector. */
+  hypot: [2, 3],
+};
 export const BINARY = ['or', 'and', '==', '!=', '<', '<=', '>', '>=', '++', '+', '-', '*', '/', '%'];
 
+/** An expression compiled: a closure per node of it, built once (expressions are evaluated constantly). */
+type Compiled = (env: Env) => V;
+const compiledCache = new WeakMap<Expr, Compiled>();
+
+function compileExpr(e: Expr): Compiled {
+  const hit = compiledCache.get(e);
+  if (hit) return hit;
+  let f: Compiled;
+  if ('lit' in e) {
+    const v = toV(e.lit);
+    f = () => v;
+  } else if ('site' in e) {
+    const i = e.site;
+    f = (env) => {
+      const s = env.scalar(i);
+      if (!s) throw new EvalError('a site in an expression must hold one value');
+      return toV(s);
+    };
+  } else if ('type' in e) {
+    f = () => interpret(e, NO_SITES);
+  } else {
+    const op = e.op;
+    const a = e.args.map(compileExpr);
+    const n2 = (x: V, y: V, o: (p: number, q: number) => V): V => o(num(x, op), num(y, op));
+    switch (op) {
+      case '+': f = (env) => n2(a[0](env), a[1](env), (p, q) => p + q); break;
+      case '-': f = (env) => n2(a[0](env), a[1](env), (p, q) => p - q); break;
+      case '*': f = (env) => n2(a[0](env), a[1](env), (p, q) => p * q); break;
+      case '<': f = (env) => n2(a[0](env), a[1](env), (p, q) => p < q); break;
+      case '<=': f = (env) => n2(a[0](env), a[1](env), (p, q) => p <= q); break;
+      case '>': f = (env) => n2(a[0](env), a[1](env), (p, q) => p > q); break;
+      case '>=': f = (env) => n2(a[0](env), a[1](env), (p, q) => p >= q); break;
+      case 'and': f = (env) => Boolean(a[0](env)) && Boolean(a[1](env)); break;
+      case 'or': f = (env) => Boolean(a[0](env)) || Boolean(a[1](env)); break;
+      case 'not': f = (env) => !a[0](env); break;
+      case 'neg': f = (env) => -num(a[0](env), op); break;
+      case 'if': f = (env) => (a[0](env) ? a[1](env) : a[2](env)); break;
+      case 'hypot':
+        f = a.length === 3 ? (env) => Math.hypot(num(a[0](env), op), num(a[1](env), op), num(a[2](env), op)) : (env) => Math.hypot(num(a[0](env), op), num(a[1](env), op));
+        break;
+      case 'sqrt': f = (env) => Math.sqrt(num(a[0](env), op)); break;
+      case 'max': f = (env) => Math.max(num(a[0](env), op), num(a[1](env), op)); break;
+      case 'min': f = (env) => Math.min(num(a[0](env), op), num(a[1](env), op)); break;
+      case 'clamp': f = (env) => Math.min(Math.max(num(a[0](env), op), num(a[1](env), op)), num(a[2](env), op)); break;
+      // the rest (division's whole-number rule, count, text) as written below
+      default: f = (env) => interpret(e, env);
+    }
+  }
+  compiledCache.set(e, f);
+  return f;
+}
+
 function value(e: Expr, env: Env): V {
+  return compileExpr(e)(env);
+}
+
+function interpret(e: Expr, env: Env): V {
   if ('lit' in e) return toV(e.lit);
   if ('site' in e) {
     const s = env.scalar(e.site);
     if (!s) throw new EvalError('a site in an expression must hold one value');
     return toV(s);
   }
+  if ('type' in e) throw new EvalError(`${e.type} is a type: count[?x ${e.type}] counts them`);
   const { op, args } = e;
   if (op === 'count') {
-    const a = args[0];
-    if (!a || !('site' in a)) throw new EvalError('count takes a site: count[?x]');
-    return env.count(a.site);
+    const [a, t] = args;
+    if (!a || !('site' in a)) throw new EvalError('count takes a site: count[?x], or count[?x Type]');
+    if (t && !('type' in t)) throw new EvalError('count[?x Type]: the second is a type');
+    return env.count(a.site, t && 'type' in t ? t.type : undefined);
   }
+  if (op === 'if') return value(args[0], env) ? value(args[1], env) : value(args[2], env);
   const vs = args.map((a) => value(a, env));
   const [a, b] = vs;
   switch (op) {
@@ -100,6 +170,8 @@ function value(e: Expr, env: Env): V {
     case 'floor': return Math.floor(num(a, op));
     case 'round': return Math.round(num(a, op));
     case 'exp': return Math.exp(num(a, op));
+    case 'clamp': return Math.min(Math.max(num(a, op), num(b, op)), num(vs[2], op));
+    case 'hypot': return Math.hypot(...vs.map((v) => num(v, op)));
     case 'log': return Math.log(num(a, op));
   }
   throw new EvalError(`no operation ${op}`);
@@ -133,17 +205,19 @@ export function evaluate(e: Expr, env: Env, kind: ScalarKind): Scalar {
 
 /** The kind an expression gives where nothing else says (no slot declares it). */
 export function kindOf(e: Expr): ScalarKind {
+  if ('type' in e) return 'text';
   if ('lit' in e) return 'int' in e.lit ? 'int' : 'float' in e.lit ? 'float' : 'text' in e.lit ? 'text' : 'bool';
   if ('site' in e) return 'float';
   if (['==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'].includes(e.op)) return 'bool';
   if (e.op === '++') return 'text';
+  if (e.op === 'if') return kindOf(e.args[1]);
   if (e.op === 'count' || e.op === 'floor' || e.op === 'round') return 'int';
   return 'float';
 }
 
 /** Every site an expression reads. */
 export function sitesOf(e: Expr): number[] {
-  if ('lit' in e) return [];
+  if ('lit' in e || 'type' in e) return [];
   if ('site' in e) return [e.site];
   return e.args.flatMap(sitesOf);
 }
