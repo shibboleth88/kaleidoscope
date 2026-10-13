@@ -8,7 +8,7 @@
  */
 
 import './style.css';
-import type { Rule } from './engine';
+import { type Rule, parseRule, parseValue, ruleText, valueText } from './engine';
 import { SHAPES } from './view/style';
 import {
   type Compiled,
@@ -351,12 +351,27 @@ function renderEditor(fresh: boolean) {
     head.innerHTML = `
       <input class="name" value="${esc(se.name)}" spellcheck="false">
       ${isRule ? `<label>rate <input class="rate" type="number" min="0" step="0.1" value="${(se as RuleEntry).rate}"></label>` : ''}
+      ${isRule ? `<label class="guard" title="Fires only where this holds, over the redex's sites: ?m >= 2, count[?x] < 10, …">where <input class="guard-in" spellcheck="false" placeholder="always" value="${esc(guardOf(se.text))}"></label>` : ''}
       ${isRule ? `<button class="toggle">${lib.system.rules.includes(se.id) ? 'in the system ●' : 'not in the system ○'}</button>` : `<button class="toggle">${lib.system.initial === se.id ? 'the initial state ★' : 'make initial ☆'}</button>`}
       <button class="ghost del" title="Delete">delete</button>`;
     textarea.value = se.text;
     $('.name', head).addEventListener('input', (ev) => {
       se.name = (ev.target as HTMLInputElement).value;
       changed();
+    });
+    $('.guard-in', head)?.addEventListener('change', (ev) => {
+      const input = ev.target as HTMLInputElement;
+      try {
+        const ast = parseRule(se.text);
+        ast.guard = input.value.trim() ? parseValue(input.value) : null;
+        se.text = ruleText(ast);
+        textarea.value = se.text;
+        input.classList.remove('bad');
+        changed();
+      } catch (err) {
+        input.classList.add('bad');
+        $('#lib-editor .problems').textContent = `where: ${(err as Error).message}`;
+      }
     });
     $('.rate', head)?.addEventListener('input', (ev) => {
       (se as RuleEntry).rate = Number((ev.target as HTMLInputElement).value) || 0;
@@ -378,6 +393,8 @@ function renderEditor(fresh: boolean) {
       renderEditor(true);
     });
   }
+  const gi = $<HTMLInputElement>('.guard-in', head);
+  if (gi && document.activeElement !== gi) gi.value = guardOf(se.text);
   // the editor reads the text itself, so what it shows is what is written, edited in place
   const err = editor.open(selection.kind, se.text, compiled.sig);
   const c = selection.kind === 'state' ? compiled.states.get(se.id) : compiled.rules.get(se.id);
@@ -482,6 +499,16 @@ function renderTypeForm(t: TypeEntry, fresh: boolean) {
       renderTypeForm(t, true);
     }),
   );
+}
+
+/** A rule's guard, as written (empty where it has none, or does not read). */
+function guardOf(text: string): string {
+  try {
+    const g = parseRule(text).guard;
+    return g ? valueText(g) : '';
+  } catch {
+    return '';
+  }
 }
 
 /** A type renamed: everything written in its name follows. */

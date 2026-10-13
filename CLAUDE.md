@@ -7,3 +7,7 @@ A 3-D bigraphical reactive system editor, in the browser (TypeScript, Vite, thre
 checked by composing every occurrence's decomposition back to its state. Anything not in the spec is marked
 PROVISIONAL (rates, the one-at-a-time policy) or as a kaleidoscope convention (`engine/text.ts` header).
 The Python package (`kaleidoscope/`) is the earlier MAPK prototype; its rules live on in `web/src/systems/mapk.ts`.
+
+**Spec findings:** anything the editor reveals about the spec — a gap, an ambiguity, a provisional extension, a
+modelling rule learned the hard way — goes in `docs/SPEC-FINDINGS.md` (stable F-numbers, append only). It is the
+input to the spec effort in `../chrysalis`.

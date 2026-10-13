@@ -156,3 +156,6 @@ label.file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .type-form .slot button { padding: 1px 7px; }
 .type-form input[type='color'] { width: 36px; height: 22px; padding: 0; border: none; background: none; }
 #lib-editor[data-kind='type'] textarea { height: 64px; }
+.editor-head .guard-in { width: 170px; font-family: var(--mono); font-size: 12px; }
+.editor-head .guard-in.bad { border-color: var(--bad); }
+.label.region small { display: block; text-align: center; color: var(--accent); font-family: var(--mono); letter-spacing: 0; text-transform: none; font-size: 11px; margin-top: 3px; }

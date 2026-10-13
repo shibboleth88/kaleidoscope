@@ -219,3 +219,67 @@ export function setAttr(t: Term, key: string, v: Value | null) {
 export function attrValue(t: Term, key: string): Value | null {
   return portValue(t, key);
 }
+
+// ── negatives: unless ──────────────────────────────────────────────────────────────────────────────────────
+
+/** Where an addition to a negative goes: inside a redex node (the negative names it), inside what the negative
+ * already adds, or at the top. */
+export type NegTarget = { redex: MemberItem } | { term: Term } | 'top';
+
+/**
+ * Add to negative `k`, or (null) to a new one. A redex node is reached by name: it is named in the redex if it is
+ * not yet, and the negative holds a reference to it whose body is what it adds there. Returns the negative's index.
+ */
+export function addToNegative(ast: RuleAst, k: number | null, at: NegTarget, item: MemberItem): number {
+  if (k === null) {
+    ast.negs.push(ast.lhs.map(() => []));
+    k = ast.negs.length - 1;
+  }
+  const neg = ast.negs[k];
+  if (at === 'top') neg[0].push(item);
+  else if ('term' in at) (at.term.body ??= []).push(item);
+  else {
+    const r = at.redex;
+    if (r.value.k !== 'term') return k;
+    r.named ??= fresh(ast, 'k');
+    let ref: MemberItem | undefined = neg.flat().find((x): x is MemberItem => x.k === 'member' && x.named === r.named);
+    if (!ref) {
+      ref = { k: 'member', key: null, named: r.named, value: { k: 'term', head: r.value.head, attrs: [], body: [], at: 0 } };
+      neg[0].push(ref);
+    }
+    if (ref.value.k === 'term') (ref.value.body ??= []).push(item);
+  }
+  return k;
+}
+
+/** Take something out of negative `k`; a negative left adding nothing goes, as does a reference holding nothing. */
+export function dropFromNegative(ast: RuleAst, k: number, item: Item) {
+  const neg = ast.negs[k];
+  if (!neg) return;
+  drop(neg, item);
+  const redexNames = new Set([...walk(ast.lhs)].map(({ item: x }) => x.named).filter(Boolean));
+  for (const region of neg)
+    for (let i = region.length - 1; i >= 0; i--) {
+      const x = region[i];
+      if (x.k === 'member' && x.named && redexNames.has(x.named) && x.value.k === 'term' && !x.value.attrs.length && !x.value.body?.length)
+        region.splice(i, 1);
+    }
+  if (neg.every((r) => r.length === 0)) ast.negs.splice(k, 1);
+}
+
+/**
+ * Name a redex port's link, so a negative can refer to it: its name if it has one, else a fresh one, written on
+ * the redex node and on its kept counterpart in the reactum (whose unwritten port meant the same link).
+ */
+export function nameRedexPort(ast: RuleAst, redex: MemberItem, port: string): string | null {
+  if (redex.value.k !== 'term') return null;
+  const v = portValue(redex.value, port);
+  if (v?.k === 'link') return v.name;
+  if (v?.k === 'free') return null; // a free port is on a closed edge of its own: nothing else is on it
+  const name = fresh(ast, 'l');
+  setPort(redex.value, port, { k: 'link', name });
+  if (redex.named)
+    for (const { item } of walk(ast.rhs))
+      if (item.named === redex.named && item.value.k === 'term' && !portValue(item.value, port)) setPort(item.value, port, { k: 'link', name });
+  return name;
+}

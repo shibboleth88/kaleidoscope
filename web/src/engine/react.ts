@@ -26,7 +26,8 @@ import {
   relabel,
 } from './carrier';
 import { compose } from './compose';
-import type { Occurrence } from './match';
+import { type Occurrence, siteEnv } from './match';
+import { evaluate } from './expr';
 import type { Rule } from './rule';
 
 export interface Decomposition {
@@ -285,11 +286,18 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence): Reacted {
   }
   const relabelled = relabel(rule.reactum, (x) => fn.get(x) ?? x, (x) => fe.get(x) ?? x);
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
+  // values computed from what the sites held
+  const env = siteEnv(ix, occ.sites);
+  const computed = new Map((rule.computed ?? []).map((c) => [fn.get(c.node)!, evaluate(c.expr, env, c.kind)]));
   const freshReactum: Carrier = {
     ...relabelled,
     inner: extend(relabelled.inner),
     outer: extend(relabelled.outer),
-    nodes: relabelled.nodes.map((n) => ({ ...n, type: keptRetype.get(n.id) ?? n.type })),
+    nodes: relabelled.nodes.map((n) => ({
+      ...n,
+      type: keptRetype.get(n.id) ?? n.type,
+      ...(computed.has(n.id) ? { payload: { scalar: computed.get(n.id)! } } : {}),
+    })),
     names: [...relabelled.names, ...implicit.map(([z]) => ({ name: z }))],
   };
 

@@ -29,6 +29,7 @@ import {
   sameScalar,
 } from './carrier';
 import type { Rule } from './rule';
+import { type Env, evaluate, holds } from './expr';
 import type { Signature } from './signature';
 
 /** One place a rule meets the state. */
@@ -69,10 +70,36 @@ export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOpti
   const limit = opts.limit ?? 10_000;
   for (const occ of search(ix, rule.redex, sig, opts.seed, opts.seedEdges)) {
     if (blocked(ix, rule, occ, sig)) continue;
+    if (!computable(ix, rule, occ)) continue;
     found.push({ ...occ, rule: rule.name });
     if (found.length >= limit) break;
   }
   return found;
+}
+
+/** What an occurrence's sites hold, for expressions to read. */
+export function siteEnv(ix: Index, sites: Id[][]): Env {
+  return {
+    scalar(i) {
+      const roots = sites[i] ?? [];
+      const n = roots.length === 1 ? ix.node.get(roots[0]) : undefined;
+      return n && typeof n.payload === 'object' ? n.payload.scalar : null;
+    },
+    count: (i) => (sites[i] ?? []).length,
+  };
+}
+
+/** The guard holds here, and every computed value can be computed here. */
+function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>): boolean {
+  if (!rule.guard && !rule.computed?.length) return true;
+  const env = siteEnv(ix, occ.sites);
+  try {
+    if (rule.guard && !holds(rule.guard, env)) return false;
+    for (const c of rule.computed ?? []) evaluate(c.expr, env, c.kind);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function blocked(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {

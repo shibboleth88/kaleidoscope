@@ -217,8 +217,79 @@ export const empty = (): Library => {
   return { types: [], states: [start], rules: [], system: { initial: start.id, rules: [], seed: 7 } };
 };
 
+/**
+ * Growth: cells in a dish eat, grow, and divide. Mass is an attribute the cells are drawn by; food arrives while
+ * there is room; a cell heavy enough splits in two, each half the mass. Guards and computed values throughout.
+ */
+export const growth = (): Library => {
+  const rules: RuleEntry[] = [
+    { name: 'eat', rate: 1.0, text: '?c = Cell[mass = ?m] | Food\n  => ?c = Cell[mass = ?m + 0.4]' },
+    { name: 'divide', rate: 0.8, text: 'Cell[mass = ?m] where ?m >= 2\n  => Cell[mass = ?m / 2] | Cell[mass = ?m / 2]' },
+    { name: 'starve', rate: 0.05, text: '?c = Cell[mass = ?m] where ?m > 0.5\n  => ?c = Cell[mass = ?m - 0.25]' },
+    { name: 'die', rate: 0.5, text: 'Cell[mass = ?m] where ?m <= 0.5\n  => ()' },
+    { name: 'feed', rate: 1.5, text: '?d = Dish(?x) where count[?x] < 40\n  => ?d = Dish(?x | Food)' },
+  ].map((r) => ({ ...r, id: uid() }));
+  const dish: StateEntry = { id: uid(), name: 'dish', text: 'Dish(\n  Cell[mass = 1.0]\n  Food\n  Food\n  Food)' };
+  return {
+    types: [
+      'Dish {color: "#2c5f74", container: true}',
+      'Cell[mass :: Float] {color: "#7be0a0", shape: "sphere", sizeBy: "mass"}',
+      'Food {color: "#ffd36e", shape: "tetrahedron", size: 0.45}',
+    ].map((text) => ({ id: uid(), text })),
+    states: [dish],
+    rules,
+    system: { initial: dish.id, rules: rules.map((r) => r.id), seed: 11 },
+  };
+};
+
+/**
+ * The lac operon: a gene that is read only when it is needed. `unless` does the work twice:
+ * - the gene is transcribed UNLESS a repressor sits on its operator;
+ * - a repressor binds the operator UNLESS one already does.
+ * Lactose that enters the cell takes repressors (a link), and pulls one off the operator; the gene turns on, makes
+ * mRNA, then the enzyme LacZ, which digests the lactose. With the lactose gone, the repressors come free again and
+ * the gene goes quiet: induction, then repression, on the timeline.
+ */
+export const lacOperon = (): Library => {
+  const rules: RuleEntry[] = [
+    { name: 'transcribe', rate: 1.5, text: '?o = Operon(?x)\n  => ?o = Operon(?x) | mRNA\n  unless ?o = Operon(Repressor)' },
+    { name: 'translate', rate: 1.0, text: '?m = mRNA\n  => ?m = mRNA | LacZ' },
+    { name: 'mRNA decays', rate: 0.5, text: 'mRNA\n  => ()' },
+    { name: 'LacZ decays', rate: 0.08, text: 'LacZ\n  => ()' },
+    { name: 'repress', rate: 2.0, text: '?o = Operon(?x) | ?p = Repressor[l = !]\n  => ?o = Operon(?x | ?p = Repressor[l = !])\n  unless ?o = Operon(Repressor)' },
+    { name: 'leak', rate: 0.03, text: '?o = Operon(?p = Repressor | ?x)\n  => ?o = Operon(?x) | ?p = Repressor' },
+    { name: 'import', rate: 0.8, text: 'Lactose | ?c = Cell(?x)\n  => ?c = Cell(?x | Lactose)' },
+    { name: 'induce', rate: 1.5, text: '?p = Repressor[l = !] | ?s = Lactose[r = !]\n  => ?p = Repressor[l = ~b] | ?s = Lactose[r = ~b]' },
+    { name: 'derepress', rate: 1.0, text: '?o = Operon(?p = Repressor[l = !] | ?x) | ?s = Lactose[r = !]\n  => ?o = Operon(?x) | ?p = Repressor[l = ~b] | ?s = Lactose[r = ~b]' },
+    { name: 'let go', rate: 0.3, text: '~b :: Link | ?p = Repressor[l = ~b] | ?s = Lactose[r = ~b]\n  => ?p = Repressor[l = !] | ?s = Lactose[r = !]' },
+    { name: 'digest', rate: 1.2, text: '?z = LacZ | Lactose[r = !]\n  => ?z = LacZ | Glucose' },
+    { name: 'burn', rate: 0.5, text: 'Glucose\n  => ()' },
+    { name: 'lactose arrives', rate: 0.06, text: '?m = Medium(?x) where count[?x] < 6\n  => ?m = Medium(?x | Lactose | Lactose | Lactose | Lactose)' },
+  ].map((r) => ({ ...r, id: uid() }));
+  const medium: StateEntry = {
+    id: uid(),
+    name: 'medium',
+    text: `Medium(\n  Cell(Operon(Repressor) | Repressor)\n${Array.from({ length: 12 }, () => '  Lactose').join('\n')})`,
+  };
+  return {
+    types: [
+      'Medium {color: "#1d3b57", container: true}',
+      'Cell {color: "#2f6d55", container: true}',
+      'Operon {color: "#8e5bd1", container: true}',
+      'Repressor[l :: Link] {color: "#ff5e7a", shape: "octahedron", size: 1.1}',
+      'Lactose[r :: Link] {color: "#f4f1e8", shape: "tetrahedron", size: 0.55}',
+      'mRNA {color: "#5ec8ff", shape: "torus", size: 0.8}',
+      'LacZ {color: "#ffb347", shape: "dodecahedron"}',
+      'Glucose {color: "#ffd36e", shape: "sphere", size: 0.4}',
+    ].map((text) => ({ id: uid(), text })),
+    states: [medium],
+    rules,
+    system: { initial: medium.id, rules: rules.map((r) => r.id), seed: 5 },
+  };
+};
+
 /** The examples that come with it: always loaded fresh, never overwritten. */
-export const EXAMPLES: Record<string, () => Library> = { MAPK: mapk };
+export const EXAMPLES: Record<string, () => Library> = { 'lac operon': lacOperon, Growth: growth, MAPK: mapk };
 
 /**
  * The shelf: libraries saved by name, and the one being worked on. A saved one saves itself as it is edited;

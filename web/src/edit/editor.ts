@@ -26,16 +26,25 @@ import {
   buildState,
   parseRule,
   parseState,
+  parseValue,
   readState,
   ruleText,
   stateText,
   valueText,
 } from '../engine/text';
-import type { BigraphView } from '../view/scene';
+import type { BigraphView, Slot } from '../view/scene';
 import * as ops from './ops';
 
 type Doc = { kind: 'state'; regions: Item[][] } | { kind: 'rule'; ast: RuleAst };
-type Built = { kind: 'state'; carrier: Carrier; sources: Sources } | { kind: 'rule'; rule: Rule; redex: Sources; reactum: Sources };
+type Built =
+  | { kind: 'state'; carrier: Carrier; sources: Sources }
+  | { kind: 'rule'; rule: Rule; redex: Sources; reactum: Sources; negatives: Sources[] };
+
+/** Where a drop lands: as `ops.Target`, or within an unless — at a redex node it names, or at its top. */
+type Drop = ops.Target | { negRedex: MemberItem } | { negTop: true };
+
+/** An unless's slot (`N0`, `N1`, …), or the one that starts a new unless (`U`). */
+const negOf = (slot: string): number | 'new' | null => (slot === 'U' ? 'new' : /^N(\d+)$/.test(slot) ? Number(slot.slice(1)) : null);
 
 type Drag =
   | { kind: 'new'; type: string; ghost: HTMLElement }
@@ -180,7 +189,7 @@ export class Editor {
         this.built = { kind: 'state', carrier, sources };
       } else {
         const r = buildRule('edit', doc.ast, this.sig);
-        this.built = { kind: 'rule', rule: r.rule, redex: r.redex, reactum: r.reactum };
+        this.built = { kind: 'rule', rule: r.rule, redex: r.redex, reactum: r.reactum, negatives: r.negatives };
       }
     } catch (e) {
       err = (e as Error).message; // keep showing the last that built
@@ -201,10 +210,42 @@ export class Editor {
       const w = 4 + 2.2 * Math.max(r.redex.nodes.length, r.reactum.nodes.length) ** 0.5;
       const quiet = (src: Sources) => new Set(src.sites.flatMap((it, i) => (it === null ? [i] : [])));
       const siteNames = (src: Sources) => src.sites.map((it, i) => (it?.value.k === 'site' ? it.value.name : `${i}`));
-      this.view.show([
-        { key: 'L', carrier: r.redex, offset: new THREE.Vector3(-w, 0, 0), title: 'redex', names: b.redex.names, quietSites: quiet(b.redex), siteNames: siteNames(b.redex) },
-        { key: 'R', carrier: r.reactum, offset: new THREE.Vector3(w, 0, 0), title: 'reactum', names: b.reactum.names, quietSites: quiet(b.reactum), siteNames: siteNames(b.reactum) },
-      ]);
+      const sides: Slot[] = [
+        {
+          key: 'L', carrier: r.redex, offset: new THREE.Vector3(-w, 0, 0), title: 'redex', names: b.redex.names, quietSites: quiet(b.redex), siteNames: siteNames(b.redex),
+          subtitle: this.doc?.kind === 'rule' && this.doc.ast.guard ? `where ${valueText(this.doc.ast.guard)}` : undefined,
+        },
+        { key: 'R', carrier: r.reactum, offset: new THREE.Vector3(w, 0, 0), title: 'reactum', names: b.reactum.names, quietSites: quiet(b.reactum), siteNames: siteNames(b.reactum), formulas: b.reactum.formulas },
+      ];
+      // each unless below the redex: the redex as a ghost, and in red what it adds; then one to start another
+      const redexIds = new Set(r.redex.nodes.map((n) => n.id));
+      const h = 7 + 2.6 * Math.sqrt(r.redex.nodes.length);
+      const redexSites = new Set(r.redex.sites.map((_, i) => i));
+      const negSlots = r.negatives.map((ng, k) => ({
+        key: `N${k}`,
+        carrier: ng,
+        offset: new THREE.Vector3(-w, -(k + 1) * h, 0),
+        title: 'unless',
+        names: new Map([...b.redex.names, ...b.negatives[k].names]),
+        quietSites: new Set([...redexSites, ...b.negatives[k].sites.flatMap((it, i) => (it === null ? [i] : []))]),
+        tint: new Map(ng.nodes.map((n) => [n.id, redexIds.has(n.id) ? ('ghost' as const) : ('forbid' as const)])),
+      }));
+      this.view.show(
+        [
+          ...sides,
+          ...negSlots,
+          {
+            key: 'U',
+            carrier: r.redex,
+            offset: new THREE.Vector3(-w, -(r.negatives.length + 1) * h, 0),
+            title: '+ unless',
+            subtitle: 'drop what must not be there',
+            names: b.redex.names,
+            quietSites: redexSites,
+            tint: new Map(r.redex.nodes.map((n) => [n.id, 'ghost' as const])),
+          },
+        ],
+      );
       // what is one thing on both sides: kept nodes, and each site and its uses
       this.view.setPairs([
         ...r.kept.map(([a, c]) => [`L:n${a}`, `R:n${c}`] as [string, string]),
@@ -229,13 +270,16 @@ export class Editor {
   // ── what the bodies are ────────────────────────────────────────────────────────────────────────────────
 
   private sideOf(slot: string): ops.Side {
-    return slot === 'S' ? 'state' : slot === 'L' ? 'redex' : 'reactum';
+    // an unless reads as a redex does: what it leaves unwritten is anything
+    return slot === 'S' ? 'state' : slot === 'L' || negOf(slot) !== null ? 'redex' : 'reactum';
   }
 
   private regionsOf(slot: string): Item[][] | null {
     const d = this.doc;
     if (!d) return null;
     if (d.kind === 'state') return slot === 'S' ? d.regions : null;
+    const k = negOf(slot);
+    if (typeof k === 'number') return d.ast.negs[k] ?? null;
     return slot === 'L' ? d.ast.lhs : slot === 'R' ? d.ast.rhs : null;
   }
 
@@ -243,32 +287,46 @@ export class Editor {
     const b = this.built;
     if (!b) return null;
     if (b.kind === 'state') return slot === 'S' ? b.sources : null;
+    const k = negOf(slot);
+    if (k === 'new') return b.redex;
+    if (typeof k === 'number') return b.negatives[k] ?? null;
     return slot === 'L' ? b.redex : slot === 'R' ? b.reactum : null;
   }
 
-  /** The item a body was read from. */
-  private itemOf(key: string): { slot: string; item: MemberItem; site: boolean; id: Id } | null {
+  /**
+   * The item a body was read from. In an unless, a node it repeats of the redex is the redex's (`refer`): what is
+   * dropped on it goes into the unless, at that node.
+   */
+  private itemOf(key: string): { slot: string; item: MemberItem; site: boolean; id: Id; refer: boolean } | null {
     const m = /^(\w+):([ns])(\d+)$/.exec(key);
     if (!m) return null;
-    const src = this.sourcesOf(m[1]);
     const id = Number(m[3]);
+    const b = this.built;
+    if (m[2] === 'n' && negOf(m[1]) !== null && b?.kind === 'rule') {
+      const own = this.sourcesOf(m[1])?.nodes.get(id);
+      if (own && m[1] !== 'U') return { slot: m[1], item: own, site: false, id, refer: false };
+      const r = b.redex.nodes.get(id);
+      return r ? { slot: m[1], item: r, site: false, id, refer: true } : null;
+    }
+    const src = this.sourcesOf(m[1]);
     const item = m[2] === 'n' ? src?.nodes.get(id) : src?.sites[id];
-    return item ? { slot: m[1], item, site: m[2] === 's', id } : null;
+    return item ? { slot: m[1], item, site: m[2] === 's', id, refer: false } : null;
   }
 
   /** Where a drop at a screen point lands. */
-  private targetAt(x: number, y: number, skip: (k: string) => boolean): { slot: string; target: ops.Target; key: string | null } | null {
+  private targetAt(x: number, y: number, skip: (k: string) => boolean): { slot: string; target: Drop; key: string | null } | null {
     let key = this.view.pick(x, y, (k) => skip(k) || /:s\d+$/.test(k) || /:x\d+$/.test(k));
     while (key) {
       const it = this.itemOf(key);
       if (it && it.item.value.k === 'term' && this.sig.has(it.item.value.head) && this.sig.get(this.sig.id(it.item.value.head)).kind === 'composite')
-        return { slot: it.slot, target: { term: it.item.value }, key };
+        return { slot: it.slot, target: it.refer ? { negRedex: it.item } : { term: it.item.value }, key };
       key = null;
     }
     // empty space: where we stand, or the top of the nearest side
     const f = this.view.focused;
     const fi = f ? this.itemOf(f) : null;
     const slot = this.view.slotAt(x, y);
+    if (slot && negOf(slot) !== null) return { slot, target: { negTop: true }, key: null };
     if (fi && fi.item.value.k === 'term' && (!slot || fi.slot === slot)) return { slot: fi.slot, target: { term: fi.item.value }, key: f };
     const regions = slot ? this.regionsOf(slot) : null;
     return regions && slot ? { slot, target: { region: regions[0] }, key: null } : null;
@@ -292,7 +350,7 @@ export class Editor {
       (this.built?.kind === 'rule' ? `<span class="chip site new" data-site="" title="Drag into the redex: a hole that matches whatever is there">◌ site</span>${sites}` : '');
     this.hint.textContent =
       this.built?.kind === 'rule'
-        ? 'drag types in · drag redex → reactum to keep · port → port to link · click a port to free it · dbl-click to go inside'
+        ? 'drag types in · redex → reactum keeps · onto a ghost below: unless · port → port links · click a port: free · dbl-click: inside'
         : this.built
           ? 'drag types in · drag to move · port → port to link · click a port to free it · dbl-click to go inside'
           : '';
@@ -401,6 +459,9 @@ export class Editor {
     if (!t) return;
     const doc = this.doc!;
     const side = this.sideOf(t.slot);
+    const neg = negOf(t.slot);
+    if (neg !== null && doc.kind === 'rule') return this.dropInUnless(d, t, neg, doc.ast);
+    if ('negRedex' in t.target || 'negTop' in t.target) return;
     if (d.kind === 'new') {
       ops.add(t.target, ops.newTerm(this.sig, d.type, side));
     } else if (d.kind === 'site') {
@@ -424,6 +485,23 @@ export class Editor {
     this.commit();
   };
 
+  /** A drop into an unless: a new thing that must not be there, or one moved within it. */
+  private dropInUnless(d: Drag, t: { slot: string; target: Drop }, neg: number | 'new', ast: RuleAst) {
+    const at: ops.NegTarget = 'negRedex' in t.target ? { redex: t.target.negRedex } : 'term' in t.target ? { term: t.target.term } : 'top';
+    if (d.kind === 'new') ops.addToNegative(ast, neg === 'new' ? null : neg, at, ops.newTerm(this.sig, d.type, 'redex'));
+    else if (d.kind === 'move') {
+      const from = this.itemOf(d.key)!;
+      if (from.slot !== t.slot || from.refer || neg === 'new' || at === 'top' || 'redex' in at) {
+        if (from.slot === t.slot && !from.refer && typeof neg === 'number') {
+          // within an unless, onto a node it repeats of the redex or to its top: out and back in
+          ops.dropFromNegative(ast, neg, from.item);
+          ops.addToNegative(ast, ast.negs[neg] ? neg : null, at, from.item);
+        } else return this.say('an unless only adds: drag types from the palette into it');
+      } else if (!ops.move(ast.negs[neg], from.item, { term: at.term })) return;
+    } else return this.say('an unless says what must not be there: drag types into it');
+    this.commit();
+  }
+
   private say(msg: string) {
     this.hint.textContent = msg;
     this.hint.classList.add('warn');
@@ -446,6 +524,19 @@ export class Editor {
     const pa = this.portOf(a), pb = this.portOf(b);
     if (!pa || !pb || !this.doc) return;
     if (pa.slot !== pb.slot) return this.say('a link joins ports on one side');
+    if (negOf(pa.slot) !== null && this.doc.kind === 'rule') {
+      const ra = this.itemOf(a.body)!.refer, rb = this.itemOf(b.body)!.refer;
+      if (negOf(pa.slot) === 'new') return this.say('add something to the unless first, then link to it');
+      if (ra && rb) return this.say("those ports are the redex's: link them in the redex");
+      if (ra || rb) {
+        // the redex's port's link, named, and the unless's thing put on it
+        const [red, own] = ra ? [a, pb] : [b, pa];
+        const name = ops.nameRedexPort(this.doc.ast, this.itemOf(red.body)!.item, (ra ? pa : pb).port);
+        if (!name) return this.say("that port is free: a link of its own, with nothing else on it");
+        ops.setPort(own.t, own.port, { k: 'link', name });
+      } else ops.link(this.doc.ast, 'reactum', pa, pb); // within the unless: a link of its own, open
+      return this.commit();
+    }
     const doc = this.doc.kind === 'state' ? this.doc.regions : this.doc.ast;
     ops.link(doc, this.sideOf(pa.slot), pa, pb);
     this.commit();
@@ -454,6 +545,7 @@ export class Editor {
   private freePort(a: { body: string; port: string }) {
     const pa = this.portOf(a);
     if (!pa) return;
+    if (this.itemOf(a.body)?.refer) return this.say("that port is the redex's: change it in the redex");
     ops.unlink(pa.t, pa.port, this.sideOf(pa.slot));
     this.commit();
   }
@@ -554,7 +646,14 @@ export class Editor {
   private parseValue(s: string, kind: string): Value | null {
     s = s.trim();
     if (s === '') return null;
-    if (s.startsWith('?')) return { k: 'site', name: s.slice(1) };
+    // anything with an operator, a site or a function in it: an expression, as the text reads it
+    if (/[?+*/%<>=()[\]-]|\b(and|or|not)\b/.test(s) && !/^".*"$/.test(s)) {
+      try {
+        return parseValue(s);
+      } catch {
+        /* not an expression after all: as text */
+      }
+    }
     if (kind === 'int' && /^-?\d+$/.test(s)) return { k: 'lit', v: { int: Number(s) } };
     if (kind === 'float' && !Number.isNaN(Number(s))) return { k: 'lit', v: { float: Number(s) } };
     if (kind === 'bool') return { k: 'lit', v: { bool: s === 'true' } };
@@ -565,7 +664,11 @@ export class Editor {
     const it = this.selected ? this.itemOf(this.selected) : null;
     const d = this.doc;
     if (!it || !d) return;
-    if (d.kind === 'state') ops.drop(d.regions, it.item);
+    const neg = negOf(it.slot);
+    if (neg !== null && d.kind === 'rule') {
+      if (it.refer || neg === 'new') return this.say("that is the redex's: delete it in the redex");
+      ops.dropFromNegative(d.ast, neg, it.item);
+    } else if (d.kind === 'state') ops.drop(d.regions, it.item);
     else if (it.slot === 'L') ops.dropFromRedex(d.ast, it.item);
     else ops.drop(d.ast.rhs, it.item);
     this.select(null);

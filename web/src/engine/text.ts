@@ -38,6 +38,7 @@ import {
   memberScalar,
 } from './carrier';
 import type { Rule } from './rule';
+import { type Expr, FUNCTIONS, NO_SITES, type ScalarKind, evaluate, kindOf } from './expr';
 import type { Signature } from './signature';
 
 // ── tokens ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -66,8 +67,17 @@ function lex(src: string): Tok[] {
     else {
       const at = i;
       const push = (tok: Tok) => (out.push(tok), (nl = false));
-      if (src.startsWith('||', i) || src.startsWith('=>', i) || src.startsWith('::', i)) push({ t: 'sym', v: src.slice(i, (i += 2)), nl, at });
-      else if ('()[]|=!'.includes(c)) push({ t: 'sym', v: c, nl, at }), i++;
+      const two = src.slice(i, i + 2);
+      const prev = out[out.length - 1];
+      const afterValue = !!prev && (['id', 'num', 'str', 'site', 'link'].includes(prev.t) || (prev.t === 'sym' && (prev.v === ')' || prev.v === ']')));
+      if (['||', '=>', '::', '==', '!=', '<=', '>=', '++'].includes(two)) push({ t: 'sym', v: two, nl, at }), (i += 2);
+      else if (c === '-' && /[0-9]/.test(src[i + 1] ?? '') && !afterValue) {
+        const m = /-\d+(\.\d+)?([eE][-+]?\d+)?/y;
+        m.lastIndex = i;
+        const r = m.exec(src)!;
+        push({ t: 'num', v: Number(r[0]), float: r[1] !== undefined || r[2] !== undefined, nl, at });
+        i = m.lastIndex;
+      } else if ('()[]|=!+-*/%<>'.includes(c)) push({ t: 'sym', v: c, nl, at }), i++;
       else if (c === '~' || c === '?') {
         ident.lastIndex = i + 1;
         const m = ident.exec(src);
@@ -87,8 +97,8 @@ function lex(src: string): Tok[] {
         if (src[i] !== '"') throw new ReadError(`an unclosed string at ${at}`);
         i++;
         push({ t: 'str', v: s, nl, at });
-      } else if (/[-0-9]/.test(c)) {
-        const m = /-?\d+(\.\d+)?([eE][-+]?\d+)?/y;
+      } else if (/[0-9]/.test(c)) {
+        const m = /\d+(\.\d+)?([eE][-+]?\d+)?/y;
         m.lastIndex = i;
         const r = m.exec(src);
         if (!r) throw new ReadError(`unexpected ${c} at ${i}`);
@@ -115,7 +125,9 @@ export type Value =
   | { k: 'lit'; v: Scalar }
   | { k: 'site'; name: string }
   | { k: 'link'; name: string }
-  | { k: 'free' };
+  | { k: 'free' }
+  /** An expression: an operator (or a function) applied to values. */
+  | { k: 'expr'; op: string; args: Value[] };
 export type Item =
   | { k: 'member'; key: Key | null; named: string | null; value: Value }
   | { k: 'edge'; name: string; type: string };
@@ -124,6 +136,8 @@ export type Term = Extract<Value, { k: 'term' }>;
 /** A rule as written: its sides, each a list of regions. */
 export interface RuleAst {
   lhs: Item[][];
+  /** `where …`: the rule meets only where this holds. */
+  guard?: Value | null;
   rhs: Item[][];
   negs: Item[][][];
 }
@@ -147,7 +161,7 @@ class Parser {
   }
   atEnd() {
     const t = this.peek();
-    return t.t === 'eof' || (t.t === 'id' && t.v === 'unless') || (t.t === 'sym' && ['=>', '||', ')', ']'].includes(t.v));
+    return t.t === 'eof' || (t.t === 'id' && (t.v === 'unless' || t.v === 'where')) || (t.t === 'sym' && ['=>', '||', ')', ']'].includes(t.v));
   }
 
   /** Items separated by `|` or line breaks, up to a closer. */
@@ -199,7 +213,57 @@ class Parser {
     return { k: 'member', key: null, named: null, value: this.value() };
   }
 
-  value(): Value {
+  /** A value, perhaps an expression: operators bind by precedence, and never across a line break. */
+  value(min = 0): Value {
+    let lhs = this.primary();
+    for (;;) {
+      const t = this.peek();
+      if (t.nl) break;
+      const op = t.t === 'sym' || (t.t === 'id' && (t.v === 'and' || t.v === 'or')) ? (t as { v: string }).v : null;
+      const bp = op ? BP[op] : undefined;
+      if (bp === undefined || bp < min) break;
+      this.next();
+      lhs = { k: 'expr', op: op!, args: [lhs, this.value(bp + 1)] };
+    }
+    return lhs;
+  }
+
+  primary(): Value {
+    const t = this.peek();
+    if (t.t === 'sym' && t.v === '(') {
+      this.next();
+      const v = this.value();
+      this.expect(')');
+      return v;
+    }
+    if (t.t === 'sym' && t.v === '-') {
+      this.next();
+      return { k: 'expr', op: 'neg', args: [this.value(7)] };
+    }
+    if (t.t === 'id' && t.v === 'not') {
+      this.next();
+      return { k: 'expr', op: 'not', args: [this.value(7)] };
+    }
+    if (t.t === 'id' && t.v in FUNCTIONS && this.isSym('[', 1)) {
+      this.next();
+      this.next();
+      const args: Value[] = [];
+      while (!this.isSym(']')) {
+        if (this.isSym('|')) {
+          this.next();
+          continue;
+        }
+        if (this.peek().t === 'eof') throw new ReadError(`an unclosed ${t.v}[`);
+        args.push(this.value());
+      }
+      this.next();
+      if (args.length !== FUNCTIONS[t.v]) throw new ReadError(`${t.v} takes ${FUNCTIONS[t.v]} value${FUNCTIONS[t.v] > 1 ? 's' : ''}`);
+      return { k: 'expr', op: t.v, args };
+    }
+    return this.atom();
+  }
+
+  atom(): Value {
     const t = this.next();
     if (t.t === 'site') return { k: 'site', name: t.v };
     if (t.t === 'link') return { k: 'link', name: t.v };
@@ -224,6 +288,9 @@ class Parser {
   }
 }
 
+/** How tightly each operator binds. */
+const BP: Record<string, number> = { or: 1, and: 2, '==': 3, '!=': 3, '<': 3, '<=': 3, '>': 3, '>=': 3, '++': 4, '+': 5, '-': 5, '*': 6, '/': 6, '%': 6 };
+
 // ── building carriers ──────────────────────────────────────────────────────────────────────────────────────
 
 type Mode = 'state' | 'redex' | 'reactum' | 'negative';
@@ -232,6 +299,27 @@ interface Ids {
   node: number;
   edge: number;
   name: number;
+}
+
+const KIND_TYPE: Record<ScalarKind, string> = { int: 'Int', float: 'Float', text: 'Text', bool: 'Bool' };
+const ZERO: Record<ScalarKind, Scalar> = { int: { int: 0 }, float: { float: 0 }, text: { text: '' }, bool: { bool: false } };
+
+/** An expression as the engine evaluates it: sites by their index in the redex. */
+function toExpr(v: Value, sites: Map<string, number> | null): Expr {
+  switch (v.k) {
+    case 'lit':
+      return { lit: v.v };
+    case 'site': {
+      if (!sites) throw new ReadError(`?${v.name}: a site is read only in a reactum or a guard`);
+      const i = sites.get(v.name);
+      if (i === undefined) throw new ReadError(`?${v.name} is no site of the redex`);
+      return { site: i };
+    }
+    case 'expr':
+      return { op: v.op, args: v.args.map((a) => toExpr(a, sites)) };
+    default:
+      throw new ReadError('an expression is made of values, sites and operations');
+  }
 }
 
 const literalType = (s: Scalar) => ('int' in s ? 'Int' : 'float' in s ? 'Float' : 'text' in s ? 'Text' : 'Bool');
@@ -246,6 +334,10 @@ class Builder {
   edgeNames = new Map<string, Id>();
   /** The item each node was read from: so an edit to the node is an edit to the text. */
   source = new Map<Id, MemberItem>();
+  /** In a reactum: the redex's sites, by name, which expressions read. */
+  readSites: Map<string, number> | null = null;
+  /** In a reactum: the scalar nodes whose values are computed. */
+  computed: { node: Id; expr: Expr; kind: ScalarKind }[] = [];
   /** The item each site was read from (null for an unwritten attribute's). */
   siteSource: (MemberItem | null)[] = [];
   constructor(
@@ -280,9 +372,18 @@ class Builder {
     return { edge: id };
   }
 
+  /** In a negative: the names it adds to the redex's (a port it leaves unwritten, a link of its own). */
+  negOuter = new Map<string, Id>();
+
   link(name: string, contract: Id): Handle {
     if (this.edgeNames.has(name)) return { edge: this.edgeNames.get(name)! };
-    if (this.mode === 'state' || this.mode === 'negative') return { edge: this.closedEdge(name, this.sig.name(contract)) };
+    if (this.mode === 'state') return { edge: this.closedEdge(name, this.sig.name(contract)) };
+    if (this.mode === 'negative') {
+      // the redex's name, or one of its own: open, like a redex's
+      if (this.outer.has(name)) return { name: this.outer.get(name)! };
+      if (!this.negOuter.has(name)) this.negOuter.set(name, this.ids.name++);
+      return { name: this.negOuter.get(name)! };
+    }
     if (this.mode === 'redex') {
       if (!this.outer.has(name)) this.outer.set(name, this.ids.name++);
       return { name: this.outer.get(name)! };
@@ -302,6 +403,32 @@ class Builder {
       return;
     }
     if (v.k === 'link' || v.k === 'free') throw new ReadError(`a link stands only at a port`);
+    if (v.k === 'expr') {
+      const kinds: ScalarKind[] = ['int', 'float', 'text', 'bool'];
+      const slotKind = slotType !== null && (kinds as string[]).includes(this.sig.get(slotType).kind) ? (this.sig.get(slotType).kind as ScalarKind) : null;
+      if (this.mode === 'reactum') {
+        // a value computed from what the redex's sites hold, when the rule fires
+        const expr = toExpr(v, this.readSites ?? new Map());
+        const kind = slotKind ?? kindOf(expr);
+        const type = slotType ?? this.sig.id(KIND_TYPE[kind]);
+        this.source.set(this.ids.node, it);
+        this.computed.push({ node: this.ids.node, expr, kind });
+        this.nodes.push({ id: this.ids.node++, type, parent, member, payload: { scalar: ZERO[kind] }, ports: [] });
+        return;
+      }
+      // elsewhere a constant, folded as it is read
+      const expr = toExpr(v, null);
+      const kind = slotKind ?? kindOf(expr);
+      let lit: Scalar;
+      try {
+        lit = evaluate(expr, NO_SITES, kind);
+      } catch (e) {
+        throw new ReadError((e as Error).message);
+      }
+      this.source.set(this.ids.node, it);
+      this.nodes.push({ id: this.ids.node++, type: slotType ?? this.sig.id(KIND_TYPE[kind]), parent, member, payload: { scalar: lit }, ports: [] });
+      return;
+    }
     if (v.k === 'lit') {
       const type = slotType ?? this.sig.id(literalType(v.v));
       this.source.set(this.ids.node, it);
@@ -316,7 +443,12 @@ class Builder {
     // in a negative, a node the redex names is the redex's: what is written inside it extends it
     if (named && this.refer.has(named)) {
       const id = this.refer.get(named)!;
-      for (const it of v.attrs) if (it.k === 'member' && !decl.ports.some((p) => it.key && 'text' in it.key && it.key.text === p.key)) this.member(it, { node: id }, true, this.attrType(decl.attrs, it.key));
+      for (const it of v.attrs) {
+        if (it.k !== 'member') continue;
+        if (decl.ports.some((p) => it.key && 'text' in it.key && it.key.text === p.key))
+          throw new ReadError(`an unless only adds: ?${named}'s ports are the redex's (name the link there, ~l, and use it here)`);
+        this.member(it, { node: id }, true, this.attrType(decl.attrs, it.key));
+      }
       for (const it of v.body ?? []) if (it.k === 'member') this.member(it, { node: id }, false, null);
       return;
     }
@@ -349,7 +481,7 @@ class Builder {
       for (let j = 0; j < p.arity; j++) {
         let target: Handle;
         if (w?.k === 'link') target = this.link(p.arity > 1 ? `${w.name}` : w.name, p.contract);
-        else if (w?.k === 'free' || (!w && this.mode !== 'redex' && !(this.mode === 'reactum' && named))) target = this.freeEdge(p.contract);
+        else if (w?.k === 'free' || (!w && this.mode !== 'redex' && this.mode !== 'negative' && !(this.mode === 'reactum' && named))) target = this.freeEdge(p.contract);
         else if (!w) target = this.link(named ? `_${named}_${p.key}` : `_${id}_${p.key}`, p.contract);
         else throw new ReadError(`port ${p.key} of ${v.head} takes a link`);
         points.push([{ int: j }, { contract: p.contract, target }]);
@@ -361,7 +493,7 @@ class Builder {
     // an attribute left unwritten: in a redex, whatever it is (a site at its key); on a kept node in the
     // reactum, what it was (that same site)
     const keptHere = this.mode === 'reactum' && named !== null;
-    if (this.mode === 'redex' || keptHere)
+    if (this.mode === 'redex' || this.mode === 'negative' || keptHere)
       for (const a of decl.attrs)
         if (!attrItems.some((it) => it.key && 'text' in it.key && it.key.text === a.key))
           this.sites.push({ parent: { node: id }, key: { attr: { text: a.key } }, name: `_${named ?? id}_${a.key}` }),
@@ -416,9 +548,22 @@ export function parseState(src: string): Item[][] {
   return regions;
 }
 
+/** One value as written: a literal, a site, an expression (what an inspector's field holds). */
+export function parseValue(src: string): Value {
+  const p = new Parser(lex(src));
+  const v = p.value();
+  if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
+  return v;
+}
+
 export function parseRule(src: string): RuleAst {
   const p = new Parser(lex(src));
   const lhs = sideOf(p);
+  let guard: Value | null = null;
+  if (p.peek().t === 'id' && (p.peek() as { v: string }).v === 'where') {
+    p.next();
+    guard = p.value();
+  }
   p.expect('=>');
   const rhs = sideOf(p);
   const negs: Item[][][] = [];
@@ -427,7 +572,7 @@ export function parseRule(src: string): RuleAst {
     negs.push(sideOf(p));
   }
   if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
-  return { lhs, rhs, negs };
+  return { lhs, guard, rhs, negs };
 }
 
 /** Where a carrier's nodes and sites were written. */
@@ -436,6 +581,8 @@ export interface Sources {
   sites: (MemberItem | null)[];
   /** Each outer name, as written (`_…` for a port left unwritten: any link). */
   names: Map<Id, string>;
+  /** Each computed value, as written. */
+  formulas?: Map<Id, string>;
 }
 
 /** A ground state: every link an edge. */
@@ -452,7 +599,12 @@ export interface RuleOptions {
 }
 
 /** A rule, `redex => reactum unless negative …`. */
-export function buildRule(name: string, ast: RuleAst, sig: Signature, opts: RuleOptions = {}): { rule: Rule; redex: Sources; reactum: Sources } {
+export function buildRule(
+  name: string,
+  ast: RuleAst,
+  sig: Signature,
+  opts: RuleOptions = {},
+): { rule: Rule; redex: Sources; reactum: Sources; negatives: Sources[] } {
   const { lhs, rhs, negs } = ast;
   const ids: Ids = { node: 0, edge: 0, name: 0 };
   const outer = new Map<string, Id>();
@@ -461,7 +613,9 @@ export function buildRule(name: string, ast: RuleAst, sig: Signature, opts: Rule
   const redex = new Builder(sig, 'redex', ids, outer);
   lhs.forEach((items, r) => redex.region(items, r));
   const reactum = new Builder(sig, 'reactum', ids, outer);
+  reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
   rhs.forEach((items, r) => reactum.region(items, r));
+  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites) : undefined;
 
   const outerNames: [Id, Id][] = [...outer.values()].map((x) => [x, sig.id('Link')]);
   const R = redex.carrier(lhs.length, outerNames);
@@ -489,19 +643,37 @@ export function buildRule(name: string, ast: RuleAst, sig: Signature, opts: Rule
     if (a !== undefined) keptEdges.push([a, b]);
   }
 
-  // a negative extends the redex: the redex's nodes, edges and sites, and what it adds
+  // a negative extends the redex: the redex's nodes, edges, sites and names, and what it adds. PROVISIONAL: the
+  // spec has a negative keep the redex's faces exactly; here it may add sites and names of its own, so what it
+  // adds can leave attributes and ports unwritten (anything there), as a redex can.
+  const negSources: Sources[] = [];
   const negatives = negs.map((regions) => {
     const nb = new Builder(sig, 'negative', ids, outer, redex.named, new Set(redex.sites.map((s) => s.name)));
     nb.edgeNames = new Map(redex.edgeNames);
     regions.forEach((items, r) => nb.region(items, r));
-    return { ...R, nodes: [...R.nodes, ...nb.nodes], edges: [...R.edges, ...nb.edges] };
+    negSources.push({ nodes: nb.source, sites: [...R.sites.map(() => null), ...nb.siteSource], names: new Map([...nb.negOuter].map(([n, x]) => [x, n])) });
+    return {
+      ...R,
+      inner: { ...R.inner, places: [...R.inner.places, ...nb.sites.map(() => sig.id('Place'))] },
+      outer: { ...R.outer, names: [...R.outer.names, ...[...nb.negOuter.values()].map((x) => [x, sig.id('Link')] as [Id, Id])] },
+      nodes: [...R.nodes, ...nb.nodes],
+      edges: [...R.edges, ...nb.edges],
+      sites: [...R.sites, ...nb.sites.map((x) => x.parent)],
+      siteKeys: [...R.siteKeys, ...nb.sites.map((x) => x.key)],
+    };
   });
 
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
-    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate: opts.rate },
+    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate: opts.rate, guard, computed: reactum.computed },
     redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
-    reactum: { nodes: reactum.source, sites: reactum.siteSource, names: nameOf },
+    reactum: {
+      nodes: reactum.source,
+      sites: reactum.siteSource,
+      names: nameOf,
+      formulas: new Map(reactum.computed.map((c) => [c.node, valueText(reactum.source.get(c.node)!.value)])),
+    },
+    negatives: negSources,
   };
 }
 
@@ -522,9 +694,21 @@ export function valueText(v: Value): string {
     case 'link': return `~${v.name}`;
     case 'free': return '!';
     case 'lit': return litOut(v.v);
+    case 'expr':
+      return exprText(v, 0);
     case 'term':
       return `${v.head}${v.attrs.length ? `[${v.attrs.map(itemText).join(' | ')}]` : ''}${v.body !== null ? `(${v.body.map(itemText).join(' | ')})` : ''}`;
   }
+}
+
+function exprText(v: Value, outer: number): string {
+  if (v.k !== 'expr') return valueText(v);
+  if (v.op in FUNCTIONS) return `${v.op}[${v.args.map((a) => exprText(a, 0)).join(' ')}]`;
+  if (v.op === 'neg') return `-${exprText(v.args[0], 7)}`;
+  if (v.op === 'not') return `not ${exprText(v.args[0], 7)}`;
+  const bp = BP[v.op];
+  const text = `${exprText(v.args[0], bp)} ${v.op} ${exprText(v.args[1], bp + 1)}`;
+  return bp < outer ? `(${text})` : text;
 }
 
 export function itemText(it: Item): string {
@@ -541,7 +725,7 @@ export const stateText = (regions: Item[][]) => sideText(regions);
 
 export function ruleText(ast: RuleAst): string {
   const one = (side: Item[][]) => side.map((items) => items.map(itemText).join(' | ') || '()').join(' || ');
-  return `${one(ast.lhs)}\n  => ${one(ast.rhs)}${ast.negs.map((n) => `\n  unless ${one(n)}`).join('')}`;
+  return `${one(ast.lhs)}${ast.guard ? ` where ${valueText(ast.guard)}` : ''}\n  => ${one(ast.rhs)}${ast.negs.map((n) => `\n  unless ${one(n)}`).join('')}`;
 }
 
 // ── printing ───────────────────────────────────────────────────────────────────────────────────────────────

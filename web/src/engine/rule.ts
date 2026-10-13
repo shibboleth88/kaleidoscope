@@ -9,7 +9,9 @@
  */
 
 import { type Carrier, type Id, formedProblems, keyed, sameFace } from './carrier';
+
 import type { Signature } from './signature';
+import type { Expr, ScalarKind } from './expr';
 
 export interface Rule {
   name: string;
@@ -24,6 +26,10 @@ export interface Rule {
    * coefficient: the random policy weighs each spot this rule meets by it. Defaults to 1.
    */
   rate?: number;
+  /** PROVISIONAL (spec part `rules.guard`, planned): the rule meets only where this holds, over its sites. */
+  guard?: Expr;
+  /** PROVISIONAL (operations answered in place): reactum scalar nodes whose value is computed from the sites. */
+  computed?: { node: Id; expr: Expr; kind: ScalarKind }[];
 }
 
 const nodup = (xs: number[]) => new Set(xs).size === xs.length;
@@ -56,7 +62,16 @@ export function ruleProblems(r: Rule): string[] {
       out.push(`kept edge ${a}→${b}: not a redex edge and a reactum edge of one contract`);
   r.negatives.forEach((ng, k) => {
     for (const p of formedProblems(ng)) out.push(`negative ${k}: ${p}`);
-    if (!sameFace(ng.outer, r.redex.outer) || !sameFace(ng.inner, r.redex.inner)) out.push(`negative ${k}: its faces are not the redex's`);
+    // PROVISIONAL: the spec asks the redex's faces exactly; here a negative may add sites and names after them
+    const prefix = <T>(a: T[], b: T[]) => a.length <= b.length && a.every((x, i) => JSON.stringify(x) === JSON.stringify(b[i]));
+    if (
+      JSON.stringify(ng.outer.places) !== JSON.stringify(r.redex.outer.places) ||
+      !prefix(r.redex.outer.names, ng.outer.names) ||
+      !prefix(r.redex.inner.places, ng.inner.places) ||
+      !prefix(r.redex.sites, ng.sites) ||
+      !prefix(r.redex.siteKeys, ng.siteKeys)
+    )
+      out.push(`negative ${k}: its faces do not extend the redex's`);
     const nn = new Map(ng.nodes.map((n) => [n.id, JSON.stringify(n)]));
     if (!r.redex.nodes.every((n) => nn.get(n.id) === JSON.stringify(n))) out.push(`negative ${k}: does not extend the redex's nodes`);
     const ne = new Map(ng.edges.map((e) => [e.id, JSON.stringify(e)]));
@@ -91,6 +106,10 @@ export function matcherProblems(r: Rule): string[] {
   const used = new Set(r.redex.nodes.flatMap((n) => n.ports.flatMap((g) => g.points.map(([, p]) => p.target))).filter((h) => 'name' in h).map((h) => (h as { name: Id }).name));
   for (const [x] of r.redex.outer.names) if (!used.has(x)) out.push(`redex outer name ${x} has no point in the redex`);
   if ([r.redex, r.reactum, ...r.negatives].some((g) => g.nodes.some((n) => n.payload === 'binder'))) out.push('binders are not supported yet');
+  // an unless adding nothing is the redex itself: it would block every occurrence, and the rule could never fire
+  r.negatives.forEach((ng, k) => {
+    if (ng.nodes.length === r.redex.nodes.length && ng.edges.length === r.redex.edges.length) out.push(`unless ${k + 1} adds nothing, so the rule could never fire`);
+  });
   return out;
 }
 

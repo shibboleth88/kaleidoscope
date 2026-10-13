@@ -58,3 +58,27 @@ describe('edits to the tree', () => {
     expect(ruleText(r)).toBe('?k1 = MEK[e = !] | ERK[s = ! | name = ?n]\n  => ?k1 = MEK[e = ~b1] | pERK[s = ~b1 | name = ?n]');
   });
 });
+
+describe('editing an unless', () => {
+  it('adds at a redex node, naming it, and lets an emptied clause go', () => {
+    const r = parseRule('Nucleus(?x) => Nucleus(?x | ERK)');
+    const nucleus = term(r.lhs, 'Nucleus');
+    const k = ops.addToNegative(r, null, { redex: nucleus }, ops.newTerm(sig, 'MEK', 'redex'));
+    expect(ruleText(r)).toBe('?k1 = Nucleus(?x)\n  => Nucleus(?x | ERK)\n  unless ?k1 = Nucleus(MEK)');
+    ops.addToNegative(r, k, { redex: nucleus }, ops.newTerm(sig, 'pERK', 'redex'));
+    expect(ruleText(r)).toBe('?k1 = Nucleus(?x)\n  => Nucleus(?x | ERK)\n  unless ?k1 = Nucleus(MEK | pERK)');
+    const mek = [...ops.walk(r.negs[0])].find((w) => w.item.value.k === 'term' && w.item.value.head === 'MEK')!.item;
+    const perk = [...ops.walk(r.negs[0])].find((w) => w.item.value.k === 'term' && w.item.value.head === 'pERK')!.item;
+    ops.dropFromNegative(r, 0, mek);
+    ops.dropFromNegative(r, 0, perk);
+    expect(r.negs).toEqual([]);
+    expect(checkRule(readRule('r', ruleText(r), sig))).toEqual([]);
+  });
+
+  it("names a redex port's link for an unless, on its kept counterpart too", () => {
+    const r = parseRule('?m = MEK => ?m = MEK | ERK');
+    const name = ops.nameRedexPort(r, term(r.lhs, 'MEK'), 'e');
+    expect(ruleText(r)).toBe(`?m = MEK[e = ~${name}]\n  => ?m = MEK[e = ~${name}] | ERK`);
+    expect(ops.nameRedexPort(parseRule('MEK[e = !] => ()'), term(parseRule('MEK[e = !] => ()').lhs, 'MEK'), 'e')).toBeNull();
+  });
+});

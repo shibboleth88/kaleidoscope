@@ -30,6 +30,12 @@ export interface Slot {
   quietSites?: Set<number>;
   /** Sites as written. */
   siteNames?: string[];
+  /** Values computed when a rule fires, as written (shown in place of a value). */
+  formulas?: Map<Id, string>;
+  /** Shown beneath the title (a rule's guard). */
+  subtitle?: string;
+  /** Nodes drawn as a ghost (what an unless repeats of the redex) or as forbidden (what it adds). */
+  tint?: Map<Id, 'ghost' | 'forbid'>;
 }
 
 type Kind = 'node' | 'site' | 'region' | 'name';
@@ -56,6 +62,7 @@ interface Body {
   flash: number;
   ports: { key: string; dir: THREE.Vector3; handle: string }[];
   container: boolean;
+  tint?: 'ghost' | 'forbid';
   /** Regions are pinned where their slot puts them. */
   pin?: THREE.Vector3;
 }
@@ -77,6 +84,8 @@ const FREE = new THREE.Color(0x56607a);
 const BOUND = new THREE.Color(0x7ff6ff);
 /** A port a redex leaves unwritten: any link at all. */
 const ANY = new THREE.Color(0xffd36e);
+/** What an unless adds: if this is there, the rule does not fire. */
+const FORBID = new THREE.Color(0xff3d6a);
 const GAP = 0.35;
 
 export class BigraphView {
@@ -323,7 +332,7 @@ export class BigraphView {
       const pin = slot.offset.clone().add(new THREE.Vector3((r - (regions - 1) / 2) * 16, 0, 0));
       const b = this.bodies.get(key) ?? this.make(key, 'region', null, pin);
       b.pin = pin;
-      b.labelText = r === 0 && slot.title ? slot.title : '';
+      b.labelText = r === 0 && slot.title ? `${slot.title}${slot.subtitle ? `<br><small>${slot.subtitle.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)}</small>` : ''}` : '';
       this.setLabel(b, b.labelText, 'region');
     });
 
@@ -348,18 +357,26 @@ export class BigraphView {
       for (const c of ix.children({ node: n.id })) {
         if (!isAttr(c.member) || typeof c.payload !== 'object') continue;
         const k = memberScalar(c.member);
-        if (k && 'text' in k) attrs.set(k.text, c.payload.scalar);
+        const f = slot.formulas?.get(c.id);
+        // a value not computed yet does not size or colour its node
+        if (k && 'text' in k && !f) attrs.set(k.text, c.payload.scalar);
         const v = c.payload.scalar;
+        if (f) {
+          words.push(`${k && 'text' in k ? `${k.text} = ` : ''}${f}`);
+          continue;
+        }
         words.push('text' in v ? v.text : 'float' in v ? v.float.toFixed(2) : `${'int' in v ? v.int : v.bool}`);
       }
       const held = ix.children({ node: n.id }).some((c) => !isAttr(c.member));
       const vis = visualOf(this.sig, n.type, attrs);
+      b.tint = slot.tint?.get(n.id);
+      if (b.tint === 'forbid') vis.color.lerp(FORBID, 0.7);
       const container = vis.container ?? (held || b.container || this.sig.get(n.type).ports.length === 0 && held);
       this.dress(b, vis, container);
       const k = memberScalar(n.member);
       const keyWord = k && 'text' in k ? `${k.text}: ` : '';
       b.name = `${keyWord}${this.sig.name(n.type)}${words.length ? ` ${words.join(' ')}` : ''}`;
-      this.setLabel(b, `${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
+      this.setLabel(b, `${b.tint === 'forbid' ? '⊘ ' : ''}${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
       b.ports = n.ports.flatMap((grp, gi) =>
         grp.points.map(([pt], pi) => ({
           key: `${JSON.stringify(grp.key)}/${JSON.stringify(pt)}`,
@@ -428,7 +445,7 @@ export class BigraphView {
   }
 
   private dress(b: Body, vis: Visual, container: boolean) {
-    const same = b.visual && b.visual.shape === vis.shape && b.visual.color.equals(vis.color) && b.container === container;
+    const same = b.visual && b.visual.shape === vis.shape && b.visual.shaped === vis.shaped && b.visual.color.equals(vis.color) && b.container === container;
     b.visual = vis;
     b.container = container;
     if (same && b.mesh) return;
@@ -706,8 +723,9 @@ export class BigraphView {
       const d = depth.get(b.key);
       const leaf = this.focus ? !this.bodies.get(this.focus)?.container : false;
       const v = d === undefined ? (above.has(b.key) ? 0.25 : leaf ? 0.12 : 0.05) : d === 0 && this.focus && !leaf ? 0.45 : 1;
-      this.seenBy.set(b.key, v);
-      return v;
+      const t = b.tint === 'ghost' ? v * 0.28 : v;
+      this.seenBy.set(b.key, t);
+      return t;
     };
 
     const placed = new Set<string>();
@@ -892,7 +910,7 @@ export class BigraphView {
     let best: { body: string; port: string } | null = null;
     let bestD = px;
     for (const b of this.bodies.values()) {
-      if (b.dying || (this.seenBy.get(b.key) ?? 1) < 0.5) continue;
+      if (b.dying || (this.seenBy.get(b.key) ?? 1) < 0.25) continue;
       for (const p of b.ports) {
         this.portWorld(`${b.key}|${p.key}`, v);
         v.project(this.camera);
@@ -971,6 +989,11 @@ export class BigraphView {
   /** Arcs between bodies that are one thing on two sides (a kept node, a site and its uses). */
   setPairs(pairs: [string, string][]) {
     this.pairs = pairs;
+  }
+
+  /** The slots shown now. */
+  currentSlots(): Slot[] {
+    return this.slots;
   }
 
   /** The body keys of a slot's node ids. */
