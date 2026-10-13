@@ -110,15 +110,23 @@ function lex(src: string): Tok[] {
 // ── the syntax tree ────────────────────────────────────────────────────────────────────────────────────────
 
 type Key = Scalar;
-type Value =
+export type Value =
   | { k: 'term'; head: string; attrs: Item[]; body: Item[] | null; at: number }
   | { k: 'lit'; v: Scalar }
   | { k: 'site'; name: string }
   | { k: 'link'; name: string }
   | { k: 'free' };
-type Item =
+export type Item =
   | { k: 'member'; key: Key | null; named: string | null; value: Value }
   | { k: 'edge'; name: string; type: string };
+export type MemberItem = Extract<Item, { k: 'member' }>;
+export type Term = Extract<Value, { k: 'term' }>;
+/** A rule as written: its sides, each a list of regions. */
+export interface RuleAst {
+  lhs: Item[][];
+  rhs: Item[][];
+  negs: Item[][][];
+}
 
 class Parser {
   private i = 0;
@@ -236,6 +244,10 @@ class Builder {
   named = new Map<string, Id>();
   /** Closed edges by name. */
   edgeNames = new Map<string, Id>();
+  /** The item each node was read from: so an edit to the node is an edit to the text. */
+  source = new Map<Id, MemberItem>();
+  /** The item each site was read from (null for an unwritten attribute's). */
+  siteSource: (MemberItem | null)[] = [];
   constructor(
     readonly sig: Signature,
     readonly mode: Mode,
@@ -286,18 +298,20 @@ class Builder {
     if (v.k === 'site') {
       if (this.mode === 'negative' && this.referSites.has(v.name)) return;
       this.sites.push({ parent, key: it.key === null ? ANON : member, name: v.name });
+      this.siteSource.push(it);
       return;
     }
     if (v.k === 'link' || v.k === 'free') throw new ReadError(`a link stands only at a port`);
     if (v.k === 'lit') {
       const type = slotType ?? this.sig.id(literalType(v.v));
+      this.source.set(this.ids.node, it);
       this.nodes.push({ id: this.ids.node++, type, parent, member, payload: { scalar: v.v }, ports: [] });
       return;
     }
-    this.term(v, parent, member, it.named);
+    this.term(v, parent, member, it.named, it);
   }
 
-  term(v: Extract<Value, { k: 'term' }>, parent: Parent, member: Member, named: string | null) {
+  term(v: Term, parent: Parent, member: Member, named: string | null, item: MemberItem) {
     const decl = this.sig.get(this.sig.id(v.head));
     // in a negative, a node the redex names is the redex's: what is written inside it extends it
     if (named && this.refer.has(named)) {
@@ -310,10 +324,12 @@ class Builder {
     if (decl.kind !== 'composite' && decl.kind !== 'place') {
       const lit = v.body?.[0];
       if (!lit || lit.k !== 'member' || lit.value.k !== 'lit') throw new ReadError(`${v.head} holds a scalar`);
+      this.source.set(this.ids.node, item);
       this.nodes.push({ id: this.ids.node++, type: decl.id, parent, member, payload: { scalar: lit.value.v }, ports: [] });
       return;
     }
     const id = this.ids.node++;
+    this.source.set(id, item);
     if (named) {
       if (this.named.has(named)) throw new ReadError(`?${named} is named twice`);
       this.named.set(named, id);
@@ -348,7 +364,8 @@ class Builder {
     if (this.mode === 'redex' || keptHere)
       for (const a of decl.attrs)
         if (!attrItems.some((it) => it.key && 'text' in it.key && it.key.text === a.key))
-          this.sites.push({ parent: { node: id }, key: { attr: { text: a.key } }, name: `_${named ?? id}_${a.key}` });
+          this.sites.push({ parent: { node: id }, key: { attr: { text: a.key } }, name: `_${named ?? id}_${a.key}` }),
+            this.siteSource.push(null);
     for (const it of v.body ?? []) {
       if (it.k !== 'member') throw new ReadError('an edge is declared at a side\'s top level');
       this.member(it, { node: id }, false, null);
@@ -392,25 +409,15 @@ function sideOf(p: Parser): Item[][] {
   return regions;
 }
 
-/** A ground state: every link an edge. */
-export function readState(src: string, sig: Signature): Carrier {
+export function parseState(src: string): Item[][] {
   const p = new Parser(lex(src));
   const regions = sideOf(p);
   if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
-  const b = new Builder(sig, 'state', { node: 0, edge: 0, name: 0 }, new Map());
-  regions.forEach((items, r) => b.region(items, r));
-  return b.carrier(regions.length, []);
+  return regions;
 }
 
-export interface RuleOptions {
-  rate?: number;
-}
-
-/** A rule, `redex => reactum unless negative …`. */
-export function readRule(name: string, src: string, sig: Signature, opts: RuleOptions = {}): Rule {
+export function parseRule(src: string): RuleAst {
   const p = new Parser(lex(src));
-  const ids: Ids = { node: 0, edge: 0, name: 0 };
-  const outer = new Map<string, Id>();
   const lhs = sideOf(p);
   p.expect('=>');
   const rhs = sideOf(p);
@@ -420,6 +427,35 @@ export function readRule(name: string, src: string, sig: Signature, opts: RuleOp
     negs.push(sideOf(p));
   }
   if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
+  return { lhs, rhs, negs };
+}
+
+/** Where a carrier's nodes and sites were written. */
+export interface Sources {
+  nodes: Map<Id, MemberItem>;
+  sites: (MemberItem | null)[];
+  /** Each outer name, as written (`_…` for a port left unwritten: any link). */
+  names: Map<Id, string>;
+}
+
+/** A ground state: every link an edge. */
+export function buildState(regions: Item[][], sig: Signature): { carrier: Carrier; sources: Sources } {
+  const b = new Builder(sig, 'state', { node: 0, edge: 0, name: 0 }, new Map());
+  regions.forEach((items, r) => b.region(items, r));
+  return { carrier: b.carrier(regions.length, []), sources: { nodes: b.source, sites: b.siteSource, names: new Map() } };
+}
+
+export const readState = (src: string, sig: Signature): Carrier => buildState(parseState(src), sig).carrier;
+
+export interface RuleOptions {
+  rate?: number;
+}
+
+/** A rule, `redex => reactum unless negative …`. */
+export function buildRule(name: string, ast: RuleAst, sig: Signature, opts: RuleOptions = {}): { rule: Rule; redex: Sources; reactum: Sources } {
+  const { lhs, rhs, negs } = ast;
+  const ids: Ids = { node: 0, edge: 0, name: 0 };
+  const outer = new Map<string, Id>();
   if (lhs.length !== rhs.length) throw new ReadError('redex and reactum have different numbers of regions');
 
   const redex = new Builder(sig, 'redex', ids, outer);
@@ -461,7 +497,51 @@ export function readRule(name: string, src: string, sig: Signature, opts: RuleOp
     return { ...R, nodes: [...R.nodes, ...nb.nodes], edges: [...R.edges, ...nb.edges] };
   });
 
-  return { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate: opts.rate };
+  const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
+  return {
+    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate: opts.rate },
+    redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
+    reactum: { nodes: reactum.source, sites: reactum.siteSource, names: nameOf },
+  };
+}
+
+export const readRule = (name: string, src: string, sig: Signature, opts: RuleOptions = {}): Rule =>
+  buildRule(name, parseRule(src), sig, opts).rule;
+
+// ── writing the tree back ──────────────────────────────────────────────────────────────────────────────────
+
+const keyOut = (k: Scalar): string =>
+  'text' in k ? (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k.text) && !['true', 'false', 'unless'].includes(k.text) ? k.text : JSON.stringify(k.text)) : 'int' in k ? `${k.int}` : JSON.stringify(k);
+
+const litOut = (s: Scalar): string =>
+  'int' in s ? `${s.int}` : 'float' in s ? (Number.isInteger(s.float) ? s.float.toFixed(1) : `${s.float}`) : 'text' in s ? JSON.stringify(s.text) : `${s.bool}`;
+
+export function valueText(v: Value): string {
+  switch (v.k) {
+    case 'site': return `?${v.name}`;
+    case 'link': return `~${v.name}`;
+    case 'free': return '!';
+    case 'lit': return litOut(v.v);
+    case 'term':
+      return `${v.head}${v.attrs.length ? `[${v.attrs.map(itemText).join(' | ')}]` : ''}${v.body !== null ? `(${v.body.map(itemText).join(' | ')})` : ''}`;
+  }
+}
+
+export function itemText(it: Item): string {
+  if (it.k === 'edge') return `~${it.name} :: ${it.type}`;
+  return `${it.key ? `${keyOut(it.key)} = ` : ''}${it.named ? `?${it.named} = ` : ''}${valueText(it.value)}`;
+}
+
+/** A side written out: regions by `||`, a region's items a line each. */
+export function sideText(regions: Item[][], indent = ''): string {
+  return regions.map((items) => items.map(itemText).join(`\n${indent}`) || '()').join(`\n${indent}|| `);
+}
+
+export const stateText = (regions: Item[][]) => sideText(regions);
+
+export function ruleText(ast: RuleAst): string {
+  const one = (side: Item[][]) => side.map((items) => items.map(itemText).join(' | ') || '()').join(' || ');
+  return `${one(ast.lhs)}\n  => ${one(ast.rhs)}${ast.negs.map((n) => `\n  unless ${one(n)}`).join('')}`;
 }
 
 // ── printing ───────────────────────────────────────────────────────────────────────────────────────────────

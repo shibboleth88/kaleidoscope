@@ -173,3 +173,21 @@ describe('links', () => {
     ).toEqual(['Box(Atom[b = ~e0] | Atom[b = ~e1] | Ion[b = ~e0]) | Box(Atom[b = ~e2] | Atom[b = ~e1] | Ion[b = ~e2]) | Ion[b = ~e1]']);
   });
 });
+
+describe('the tree written back', () => {
+  it('reads back as what it was', async () => {
+    const { parseRule, parseState, ruleText, stateText } = await import('../src/engine');
+    const { mapk } = await import('../src/library');
+    const { sig: msig } = await import('../src/systems/mapk');
+    const lib = mapk();
+    for (const r of lib.rules) {
+      const text = ruleText(parseRule(r.text));
+      expect(print(readRule('a', text, msig).redex, msig)).toBe(print(readRule('a', r.text, msig).redex, msig));
+      expect(print(readRule('a', text, msig).reactum, msig)).toBe(print(readRule('a', r.text, msig).reactum, msig));
+      expect(ruleText(parseRule(text))).toBe(text);
+    }
+    const st = stateText(parseState(lib.states[0].text));
+    expect(print(readState(st, msig), msig)).toBe(print(readState(lib.states[0].text, msig), msig));
+    expect(ruleText(parseRule('A || B => B || A unless Star'))).toBe('A || B\n  => B || A\n  unless Star');
+  });
+});

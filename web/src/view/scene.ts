@@ -24,6 +24,12 @@ export interface Slot {
   /** Where its regions are centred. */
   offset: THREE.Vector3;
   title?: string;
+  /** Outer names as written; a name beginning `_` is a port left unwritten (any link), drawn as such. */
+  names?: Map<Id, string>;
+  /** Sites drawn faintly and unlabelled (an attribute left unwritten). */
+  quietSites?: Set<number>;
+  /** Sites as written. */
+  siteNames?: string[];
 }
 
 type Kind = 'node' | 'site' | 'region' | 'name';
@@ -45,6 +51,8 @@ interface Body {
   shell?: THREE.LineSegments;
   label?: CSS2DObject;
   labelText: string;
+  /** What the breadcrumbs call it. */
+  name: string;
   flash: number;
   ports: { key: string; dir: THREE.Vector3; handle: string }[];
   container: boolean;
@@ -67,6 +75,8 @@ const PORT_DIRS = (() => {
 const LEAF = 0.9;
 const FREE = new THREE.Color(0x56607a);
 const BOUND = new THREE.Color(0x7ff6ff);
+/** A port a redex leaves unwritten: any link at all. */
+const ANY = new THREE.Color(0xffd36e);
 const GAP = 0.35;
 
 export class BigraphView {
@@ -78,8 +88,12 @@ export class BigraphView {
   private bodies = new Map<string, Body>();
   private links: THREE.LineSegments;
   private linkGeo = new THREE.BufferGeometry();
+  /** Ports are rings on a body's surface, facing out; a link comes in through the middle. */
   private portMeshes: THREE.InstancedMesh;
-  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean }[] = [];
+  private portCores: THREE.InstancedMesh;
+  /** A hyperedge's meeting point: where its spokes join. */
+  private hubs: THREE.InstancedMesh;
+  private edges: { slot: string; points: string[]; key: string; free: boolean; name: boolean; any: boolean }[] = [];
   private slots: Slot[] = [];
   private raf = 0;
   private last = performance.now();
@@ -90,6 +104,16 @@ export class BigraphView {
   autoRotate = true;
   /** Keep everything in view, until whoever is looking takes the camera. */
   private autoFrame = true;
+  /** The place we are inside, if any: its contents fill the view, everything outside fades. */
+  private focus: string | null = null;
+  private crumbs: HTMLElement;
+  private title: HTMLElement;
+  /** Whether a tap on a body focuses it (the world), rather than leaving taps to an editor. */
+  tapFocus = false;
+  /** A tap: on a body, or on nothing. */
+  onTap: (key: string | null, e: PointerEvent) => void = () => {};
+  /** How visible each body is this frame (1 inside the focus, less outside). */
+  private seenBy = new Map<string, number>();
 
   constructor(
     readonly host: HTMLElement,
@@ -117,17 +141,58 @@ export class BigraphView {
 
     this.links = new THREE.LineSegments(
       this.linkGeo,
-      new THREE.LineBasicMaterial({ color: 0x7ff6ff, transparent: true, opacity: 0.85 }),
+      new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9 }),
     );
     this.links.frustumCulled = false;
     this.scene.add(this.links);
-    this.portMeshes = new THREE.InstancedMesh(
-      new THREE.SphereGeometry(0.1, 10, 8),
-      new THREE.MeshBasicMaterial({ color: 0xffffff }),
-      2048,
-    );
-    this.portMeshes.frustumCulled = false;
-    this.scene.add(this.portMeshes);
+    this.portMeshes = new THREE.InstancedMesh(new THREE.TorusGeometry(0.2, 0.05, 8, 28), new THREE.MeshBasicMaterial({ color: 0xffffff }), 2048);
+    this.portCores = new THREE.InstancedMesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff }), 2048);
+    this.hubs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.16, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }), 512);
+    for (const im of [this.portMeshes, this.portCores, this.hubs]) {
+      im.frustumCulled = false;
+      im.count = 0;
+      this.scene.add(im);
+    }
+
+    this.crumbs = document.createElement('nav');
+    this.crumbs.className = 'crumbs';
+    host.appendChild(this.crumbs);
+    this.crumbs.addEventListener('click', (e) => {
+      const k = (e.target as HTMLElement).closest<HTMLElement>('[data-key]')?.dataset.key;
+      if (k !== undefined) this.setFocus(k || null);
+    });
+    this.title = document.createElement('div');
+    this.title.className = 'view-title';
+    host.appendChild(this.title);
+    // double-click a place to go inside it; double-click outside everything to come back out
+    this.renderer.domElement.addEventListener('dblclick', (e) => {
+      if (this.tapFocus) return;
+      const key = this.pick(e.clientX, e.clientY);
+      const b = key ? this.bodies.get(key) : undefined;
+      if (!b) return this.up();
+      if (b.container && b.key !== this.focus) this.setFocus(b.key);
+      else if (b.parent && this.bodies.get(b.parent)?.kind === 'node' && b.parent !== this.focus) this.setFocus(b.parent);
+    });
+    // a tap (a click that is not a drag): focus what it hits, where taps focus; and tell whoever listens
+    let press: { x: number; y: number } | null = null;
+    this.renderer.domElement.addEventListener('pointerdown', (e) => (press = { x: e.clientX, y: e.clientY }));
+    this.renderer.domElement.addEventListener('pointerup', (e) => {
+      if (!press || Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5) return (press = null);
+      press = null;
+      const key = this.pick(e.clientX, e.clientY);
+      const b = key ? this.bodies.get(key) : undefined;
+      if (this.tapFocus && b?.kind === 'node') this.setFocus(b.key);
+      this.onTap(b ? b.key : null, e);
+    });
+    this.renderCrumbs();
+
+    this.dragLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffd36e }));
+    this.dragLine.frustumCulled = false;
+    this.scene.add(this.dragLine);
+    const pairLines = new THREE.LineSegments(this.pairGeo, new THREE.LineDashedMaterial({ color: 0xffd36e, dashSize: 0.5, gapSize: 0.35, transparent: true, opacity: 0.55 }));
+    pairLines.frustumCulled = false;
+    this.scene.add(pairLines);
+    this.pairLines = pairLines;
 
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(host);
@@ -161,7 +226,13 @@ export class BigraphView {
   }
 
   /** Show these carriers; bodies are matched by key, so what persists animates rather than jumps. */
-  show(slots: Slot[], transition?: { slot: string; t: Transition }) {
+  show(slots: Slot[], transition?: { slot: string; t: Transition }, opts: { stable?: boolean } = {}) {
+    // a slot rebuilt from an edit has new identities for the same things: carry the bodies over
+    if (!opts.stable)
+      for (const slot of slots) {
+        const prev = this.slots.find((x) => x.key === slot.key)?.carrier;
+        if (prev && prev !== slot.carrier && transition?.slot !== slot.key) this.carryOver(slot.key, reconcile(prev, slot.carrier));
+      }
     this.slots = slots;
     this.heat = 3;
     const seen = new Set<string>();
@@ -195,7 +266,37 @@ export class BigraphView {
 
     for (const slot of slots) this.place(slot, seen, spawnAt);
     for (const [key, b] of this.bodies) if (!seen.has(key) && !b.dying) this.kill(b);
+    // the place we are in went away: stand in what held it
+    while (this.focus && (!this.bodies.has(this.focus) || this.bodies.get(this.focus)!.dying)) {
+      const p = this.bodies.get(this.focus)?.parent ?? null;
+      this.focus = p && this.bodies.get(p)?.kind === 'node' ? p : null;
+    }
+    this.renderCrumbs();
     this.rebuildEdges();
+  }
+
+  /** Rename bodies `slot:n<old>` to `slot:n<new>`. */
+  private carryOver(slot: string, map: Map<Id, Id>) {
+    const rename = new Map<string, string>();
+    for (const [nw, old] of map) rename.set(`${slot}:n${old}`, `${slot}:n${nw}`);
+    const moving: Body[] = [];
+    for (const [k, b] of this.bodies) if (k.startsWith(`${slot}:n`) && !b.dying) moving.push(b), this.bodies.delete(k);
+    for (const b of moving) {
+      const nk = rename.get(b.key);
+      if (!nk) {
+        // nothing it became: let it go
+        b.key = `${b.key}~gone${Math.random()}`;
+        this.bodies.set(b.key, b);
+        this.kill(b);
+        continue;
+      }
+      b.key = nk;
+      if (b.mesh) b.mesh.userData.key = nk;
+      this.bodies.set(nk, b);
+    }
+    for (const b of this.bodies.values()) if (b.parent && rename.has(b.parent)) b.parent = rename.get(b.parent)!;
+    if (this.focus && rename.has(this.focus)) this.focus = rename.get(this.focus)!;
+    for (const [k, v] of [...this.marks]) if (rename.has(k)) this.marks.delete(k), this.marks.set(rename.get(k)!, v);
   }
 
   /** Light up what a rule is about to rewrite. */
@@ -257,6 +358,7 @@ export class BigraphView {
       this.dress(b, vis, container);
       const k = memberScalar(n.member);
       const keyWord = k && 'text' in k ? `${k.text}: ` : '';
+      b.name = `${keyWord}${this.sig.name(n.type)}${words.length ? ` ${words.join(' ')}` : ''}`;
       this.setLabel(b, `${keyWord}${this.sig.name(n.type)}${words.length ? ` <i>${words.join(' ')}</i>` : ''}`, container ? 'place' : 'node');
       b.ports = n.ports.flatMap((grp, gi) =>
         grp.points.map(([pt], pi) => ({
@@ -276,16 +378,22 @@ export class BigraphView {
       b.parent = parent;
       this.dressSite(b);
       const sk = memberScalar(g.siteKeys[i] ?? { held: null });
-      this.setLabel(b, `${sk ? `${'text' in sk ? sk.text : JSON.stringify(sk)} = ` : ''}?${i}`, 'site');
+      if (slot.quietSites?.has(i)) {
+        b.rTarget = 0.01;
+        this.setLabel(b, '', 'site');
+        if (b.mesh) b.mesh.visible = false;
+        if (b.shell) b.shell.visible = false;
+      } else this.setLabel(b, `${sk ? `${'text' in sk ? sk.text : JSON.stringify(sk)} = ` : ''}?${slot.siteNames?.[i] ?? i}`, 'site');
     });
 
-    g.outer.names.forEach(([x], i) => {
+    const shown = g.outer.names.filter(([x]) => !(slot.names?.get(x) ?? '').startsWith('_'));
+    shown.forEach(([x], i) => {
       const key = `${slot.key}:x${x}`;
       seen.add(key);
-      const at = slot.offset.clone().add(new THREE.Vector3((i - (g.outer.names.length - 1) / 2) * 3, 9, 0));
+      const at = slot.offset.clone().add(new THREE.Vector3((i - (shown.length - 1) / 2) * 3, 9, 0));
       const b = this.bodies.get(key) ?? this.make(key, 'name', null, at);
       b.pin = at;
-      this.setLabel(b, `~${x}`, 'name');
+      this.setLabel(b, `~${slot.names?.get(x) ?? x}`, 'name');
     });
   }
 
@@ -308,6 +416,7 @@ export class BigraphView {
       dying: false,
       group: new THREE.Group(),
       labelText: '',
+      name: '',
       flash: 0,
       ports: [],
       container: false,
@@ -325,7 +434,7 @@ export class BigraphView {
     if (same && b.mesh) return;
     if (b.mesh) b.group.remove(b.mesh);
     if (b.shell) b.group.remove(b.shell);
-    const geo = geometry(container ? 'sphere' : vis.shape);
+    const geo = geometry(container && !vis.shaped ? 'sphere' : vis.shape);
     const mat = new THREE.MeshStandardMaterial({
       color: vis.color,
       emissive: vis.color,
@@ -339,10 +448,11 @@ export class BigraphView {
     });
     b.mesh = new THREE.Mesh(geo, mat);
     b.mesh.userData.key = b.key;
+    b.mesh.userData.base = mat.opacity;
     b.group.add(b.mesh);
     if (container) {
       b.shell = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(1, 2)),
+        new THREE.EdgesGeometry(vis.shaped ? geo : new THREE.IcosahedronGeometry(1, 2)),
         new THREE.LineBasicMaterial({ color: vis.color, transparent: true, opacity: 0.28 }),
       );
       b.group.add(b.shell);
@@ -397,22 +507,63 @@ export class BigraphView {
       }
       for (const [h, points] of on) {
         const isName = h.includes(':x');
-        if (isName) points.push(`${h}|anchor`);
-        this.edges.push({ slot: slot.key, points, key: h, free: points.length < 2, name: isName });
+        const any = isName && !this.bodies.has(h);
+        if (isName && !any) points.push(`${h}|anchor`);
+        this.edges.push({ slot: slot.key, points, key: h, free: any || points.length < 2, name: isName, any });
       }
       void g;
     }
   }
 
-  private portWorld(ref: string, out: THREE.Vector3): boolean {
+  private portWorld(ref: string, out: THREE.Vector3, dir?: THREE.Vector3): boolean {
     const [key, port] = ref.split('|');
     const b = this.bodies.get(key);
     if (!b) return false;
-    if (port === 'anchor') return out.copy(b.world), true;
+    if (port === 'anchor') {
+      dir?.set(0, -1, 0);
+      return out.copy(b.world), true;
+    }
     const p = b.ports.find((x) => x.key === port);
     if (!p) return false;
-    out.copy(p.dir).multiplyScalar(b.r * b.grow * (b.container ? 1 : 0.95)).add(b.world);
+    dir?.copy(p.dir);
+    // just off the surface, so the ring sits on it
+    out.copy(p.dir).multiplyScalar(b.r * b.grow * (b.container ? 1 : 0.95) + 0.08 * b.grow).add(b.world);
     return true;
+  }
+
+  /** Go inside a place (null: the whole). */
+  setFocus(key: string | null) {
+    this.focus = key && this.bodies.has(key) ? key : null;
+    this.autoFrame = true;
+    this.renderCrumbs();
+  }
+
+  /** Come out one place; false if already at the top. */
+  up(): boolean {
+    if (!this.focus) return false;
+    const p = this.bodies.get(this.focus)?.parent;
+    this.setFocus(p && this.bodies.get(p)?.kind === 'node' ? p : null);
+    return true;
+  }
+
+  get focused(): string | null {
+    return this.focus;
+  }
+
+  private renderCrumbs() {
+    const path: Body[] = [];
+    for (let k = this.focus; k; ) {
+      const b = this.bodies.get(k);
+      if (!b || b.kind !== 'node') break;
+      path.unshift(b);
+      k = b.parent;
+    }
+    const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+    const here = path[path.length - 1];
+    this.title.innerHTML = here ? `<b>${esc(here.name.split(' ')[0])}</b>${here.name.includes(' ') ? ` <span>${esc(here.name.slice(here.name.indexOf(' ') + 1))}</span>` : ''}` : '';
+    this.crumbs.innerHTML = path.length
+      ? `<a data-key="">⌂</a>${path.map((b, i) => `<span>›</span>${i === path.length - 1 ? `<b>${esc(b.name)}</b>` : `<a data-key="${b.key}">${esc(b.name)}</a>`}`).join('')}`
+      : '';
   }
 
   /** Keep everything in view again (as it grows and settles). */
@@ -421,11 +572,20 @@ export class BigraphView {
   }
 
   private follow(dt: number) {
+    const f = this.focus ? this.bodies.get(this.focus) : undefined;
+    if (f) return this.aim(new THREE.Sphere(f.world.clone(), Math.max(1, f.r * f.grow * 0.95)), dt);
     const box = new THREE.Box3();
-    for (const b of this.bodies.values())
-      if (!b.dying && b.kind !== 'region') box.expandByPoint(b.world.clone().addScalar(b.r * b.grow)).expandByPoint(b.world.clone().subScalar(b.r * b.grow));
+    for (const b of this.bodies.values()) {
+      if (b.dying) continue;
+      // a region counts even empty: the side of a rule with nothing on it yet is still somewhere to drop
+      const r = b.kind === 'region' ? 3 : b.r * b.grow;
+      box.expandByPoint(b.world.clone().addScalar(r)).expandByPoint(b.world.clone().subScalar(r));
+    }
     if (box.isEmpty()) return;
-    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    this.aim(box.getBoundingSphere(new THREE.Sphere()), dt);
+  }
+
+  private aim(sphere: THREE.Sphere, dt: number) {
     const fov = (this.camera.fov * Math.PI) / 180;
     const fit = Math.min(fov, 2 * Math.atan(Math.tan(fov / 2) * this.camera.aspect));
     const want = Math.max(8, (sphere.radius * 1.15) / Math.sin(fit / 2));
@@ -461,7 +621,7 @@ export class BigraphView {
     // radii, from the leaves up
     const radius = (b: Body): number => {
       const cs = kids.get(b.key) ?? [];
-      const base = b.kind === 'site' ? 1.1 : b.kind === 'name' ? 0.25 : LEAF * (b.visual?.size ?? 1);
+      const base = b.kind === 'site' ? (b.mesh?.visible === false ? 0.01 : 1.1) : b.kind === 'name' ? 0.25 : LEAF * (b.visual?.size ?? 1);
       if (b.kind === 'region') {
         for (const c of cs) radius(c);
         b.rTarget = 1;
@@ -532,6 +692,24 @@ export class BigraphView {
       b.vel.multiplyScalar(Math.pow(0.04, dt));
       b.local.addScaledVector(b.vel, dt);
     }
+    // what is inside the focus is seen; its walls and what holds it, faintly; everything else, a ghost
+    const depth = new Map<string, number>();
+    const walk = (key: string, d: number) => {
+      depth.set(key, d);
+      for (const c of kids.get(key) ?? []) walk(c.key, d + 1);
+    };
+    if (this.focus) walk(this.focus, 0);
+    else for (const b of this.bodies.values()) if (!b.parent) walk(b.key, b.kind === 'region' ? 0 : 1);
+    const above = new Set<string>();
+    for (let k = this.focus ? this.bodies.get(this.focus)?.parent : null; k; k = this.bodies.get(k)?.parent) above.add(k);
+    const seen = (b: Body) => {
+      const d = depth.get(b.key);
+      const leaf = this.focus ? !this.bodies.get(this.focus)?.container : false;
+      const v = d === undefined ? (above.has(b.key) ? 0.25 : leaf ? 0.12 : 0.05) : d === 0 && this.focus && !leaf ? 0.45 : 1;
+      this.seenBy.set(b.key, v);
+      return v;
+    };
+
     const placed = new Set<string>();
     const put = (b: Body) => {
       if (placed.has(b.key)) return;
@@ -552,14 +730,21 @@ export class BigraphView {
         b.mesh.rotation.y += dt * 0.25;
         const m = b.mesh.material as THREE.MeshStandardMaterial;
         if ('emissiveIntensity' in m) m.emissiveIntensity = (b.container ? 0.05 : 0.22) + b.flash * 1.4;
+        m.opacity = (b.mesh.userData.base ?? m.opacity) * seen(b);
       }
+      if (b.shell) (b.shell.material as THREE.LineBasicMaterial).opacity = (b.kind === 'site' ? 0.8 : 0.28) * seen(b);
       if (b.label && b.kind === 'region') {
         let low = 0;
         for (const c of kids.get(b.key) ?? []) low = Math.min(low, c.local.y - c.r);
         b.label.position.set(0, low - 1.2, 0);
+        b.label.element.style.opacity = this.focus ? '0' : '1';
       } else if (b.label) {
         b.label.position.set(0, b.container ? s * 1.02 : s + 0.5, 0);
-        b.label.element.style.opacity = `${b.grow}`;
+        // labels for the two levels below where we stand
+        const d = depth.get(b.key);
+        const leafFocus = d === 0 && !b.container;
+        const shown = (d !== undefined && d >= 1 && d <= 2) || leafFocus ? 1 : 0;
+        b.label.element.style.opacity = `${b.grow * shown}`;
       }
     };
     for (const b of this.bodies.values()) put(b);
@@ -573,47 +758,224 @@ export class BigraphView {
       }
 
     this.drawLinks();
+    this.drawOverlays();
+  }
+
+  private drawOverlays() {
+    for (const [k, v] of this.marks) {
+      const b = this.bodies.get(k);
+      if (!b?.mesh) continue;
+      const m = b.mesh.material as THREE.MeshStandardMaterial;
+      if ('emissiveIntensity' in m) m.emissiveIntensity += v === 2 ? 0.6 : 0.9;
+      if (b.container) m.opacity = Math.max(m.opacity, v === 2 ? 0.28 : 0.2);
+      if (b.shell) (b.shell.material as THREE.LineBasicMaterial).opacity = 0.9;
+    }
+    const a = new THREE.Vector3();
+    if (this.dragFrom && this.portWorld(this.dragFrom, a)) {
+      this.dragLine.geometry.setFromPoints([a, this.dragTo]);
+      this.dragLine.visible = true;
+    } else this.dragLine.visible = false;
+    const pts: THREE.Vector3[] = [];
+    for (const [x, y] of this.pairs) {
+      const p = this.bodies.get(x), q = this.bodies.get(y);
+      if (!p || !q || p.dying || q.dying) continue;
+      // an arc, rising between them
+      const mid = p.world.clone().add(q.world).multiplyScalar(0.5);
+      mid.y += p.world.distanceTo(q.world) * 0.3;
+      let prev = p.world;
+      for (let i = 1; i <= 12; i++) {
+        const t = i / 12;
+        const pt = new THREE.Vector3()
+          .addScaledVector(p.world, (1 - t) * (1 - t))
+          .addScaledVector(mid, 2 * t * (1 - t))
+          .addScaledVector(q.world, t * t);
+        pts.push(prev, pt);
+        prev = pt;
+      }
+    }
+    this.pairGeo.setFromPoints(pts);
+    this.pairLines.computeLineDistances();
   }
 
   private drawLinks() {
     const pos: number[] = [];
-    let ports = 0;
-    const m = new THREE.Matrix4();
-    const a = new THREE.Vector3(), c = new THREE.Vector3();
+    const col: number[] = [];
+    const tmp = new THREE.Color();
+    const seenOf = (ref: string) => this.seenBy.get(ref.split('|')[0]) ?? 1;
+    let rings = 0, cores = 0, hubs = 0;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1), z = new THREE.Vector3(0, 0, 1);
+    const a = new THREE.Vector3(), n = new THREE.Vector3(), hub = new THREE.Vector3();
+    const curve = (p0: THREE.Vector3, c0: THREE.Vector3, c1: THREE.Vector3, p1: THREE.Vector3, rgb: number[]) => {
+      let prev = p0;
+      for (let i = 1; i <= 16; i++) {
+        const t = i / 16, u = 1 - t;
+        const pt = new THREE.Vector3()
+          .addScaledVector(p0, u * u * u)
+          .addScaledVector(c0, 3 * u * u * t)
+          .addScaledVector(c1, 3 * u * t * t)
+          .addScaledVector(p1, t * t * t);
+        pos.push(prev.x, prev.y, prev.z, pt.x, pt.y, pt.z);
+        col.push(...rgb, ...rgb);
+        prev = pt;
+      }
+    };
     for (const e of this.edges) {
-      const pts: THREE.Vector3[] = [];
-      for (const ref of e.points) if (this.portWorld(ref, a)) pts.push(a.clone());
-      for (const ref of e.points) {
-        if (ref.endsWith('|anchor') || ports >= 2048) continue;
-        if (this.portWorld(ref, a)) {
-          this.portMeshes.setColorAt(ports, e.free ? FREE : BOUND);
-          this.portMeshes.setMatrixAt(ports++, m.makeTranslation(a.x, a.y, a.z));
+      const ends: { p: THREE.Vector3; n: THREE.Vector3; ref: string }[] = [];
+      for (const ref of e.points) if (this.portWorld(ref, a, n)) ends.push({ p: a.clone(), n: n.clone(), ref });
+      const linked = !e.free && ends.length >= 2;
+      for (const end of ends) {
+        if (end.ref.endsWith('|anchor') || rings >= 2048) continue;
+        const v = Math.max(0.08, seenOf(end.ref));
+        q.setFromUnitVectors(z, end.n);
+        m.compose(end.p, q, one);
+        this.portMeshes.setColorAt(rings, tmp.copy(e.any ? ANY : linked ? BOUND : FREE).multiplyScalar(v));
+        this.portMeshes.setMatrixAt(rings++, m);
+        if (linked) {
+          this.portCores.setColorAt(cores, tmp.copy(BOUND).multiplyScalar(v));
+          this.portCores.setMatrixAt(cores++, m);
         }
       }
-      if (pts.length < 2) continue;
-      if (pts.length === 2) pos.push(...pts[0].toArray(), ...pts[1].toArray());
-      else {
-        c.set(0, 0, 0);
-        for (const p of pts) c.add(p);
-        c.divideScalar(pts.length);
-        for (const p of pts) pos.push(...p.toArray(), ...c.toArray());
+      if (!linked) continue;
+      const lit = tmp.copy(BOUND).multiplyScalar(Math.max(0.06, Math.max(...e.points.map(seenOf)))).toArray();
+      if (ends.length === 2) {
+        // a bond: out of each ring, round, and into the other
+        const [x, y] = ends;
+        const k = Math.max(0.6, x.p.distanceTo(y.p) * 0.4);
+        curve(x.p, x.p.clone().addScaledVector(x.n, k), y.p.clone().addScaledVector(y.n, k), y.p, lit);
+      } else {
+        // a hyperedge: every point to one meeting place, lifted a little off their middle
+        hub.set(0, 0, 0);
+        const lift = new THREE.Vector3();
+        for (const end of ends) hub.add(end.p), lift.add(end.n);
+        hub.divideScalar(ends.length).addScaledVector(lift.normalize(), 0.8);
+        for (const end of ends) {
+          const k = Math.max(0.5, end.p.distanceTo(hub) * 0.45);
+          curve(end.p, end.p.clone().addScaledVector(end.n, k), hub.clone().lerp(end.p, 0.3), hub, lit);
+        }
+        if (hubs < 512) {
+          this.hubs.setColorAt(hubs, tmp.fromArray(lit));
+          this.hubs.setMatrixAt(hubs++, m.makeTranslation(hub.x, hub.y, hub.z));
+        }
       }
     }
-    this.portMeshes.count = ports;
-    this.portMeshes.instanceMatrix.needsUpdate = true;
-    if (this.portMeshes.instanceColor) this.portMeshes.instanceColor.needsUpdate = true;
+    for (const [im, count] of [[this.portMeshes, rings], [this.portCores, cores], [this.hubs, hubs]] as const) {
+      im.count = count;
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+    }
     this.linkGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    this.linkGeo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
     this.linkGeo.computeBoundingSphere();
   }
 
   /** The node key under a screen point, if any. */
-  pick(clientX: number, clientY: number): string | null {
+  private ray(clientX: number, clientY: number): THREE.Raycaster {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ray = new THREE.Raycaster();
     ray.setFromCamera(new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1), this.camera);
-    const meshes = [...this.bodies.values()].filter((b) => b.mesh && !b.dying).map((b) => b.mesh!);
-    const hit = ray.intersectObjects(meshes, false).find((h) => !(h.object as THREE.Mesh).userData.container);
+    return ray;
+  }
+
+  /** The body under a screen point (the nearest, so the innermost place), passing over those `skip` refuses. */
+  pick(clientX: number, clientY: number, skip: (key: string) => boolean = () => false): string | null {
+    const meshes = [...this.bodies.values()]
+      .filter((b) => b.mesh && !b.dying && b.kind !== 'region' && (this.seenBy.get(b.key) ?? 1) > 0.2 && !skip(b.key))
+      .map((b) => b.mesh!);
+    const hit = this.ray(clientX, clientY).intersectObjects(meshes, false)[0];
     return hit ? (hit.object.userData.key as string) : null;
+  }
+
+  /** The port nearest a screen point, within `px` pixels. */
+  pickPort(clientX: number, clientY: number, px = 12): { body: string; port: string } | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const v = new THREE.Vector3();
+    let best: { body: string; port: string } | null = null;
+    let bestD = px;
+    for (const b of this.bodies.values()) {
+      if (b.dying || (this.seenBy.get(b.key) ?? 1) < 0.5) continue;
+      for (const p of b.ports) {
+        this.portWorld(`${b.key}|${p.key}`, v);
+        v.project(this.camera);
+        if (v.z > 1) continue;
+        const d = Math.hypot(((v.x + 1) / 2) * rect.width + rect.left - clientX, ((1 - v.y) / 2) * rect.height + rect.top - clientY);
+        if (d < bestD) (bestD = d), (best = { body: b.key, port: p.key });
+      }
+    }
+    return best;
+  }
+
+  /** The slot nearest the ray under a screen point: where a drop on empty space lands. */
+  slotAt(clientX: number, clientY: number): string | null {
+    const ray = this.ray(clientX, clientY).ray;
+    let best: string | null = null;
+    let bestD = Infinity;
+    for (const s of this.slots) {
+      const d = ray.distanceSqToPoint(s.offset);
+      if (d < bestD) (bestD = d), (best = s.key);
+    }
+    return best;
+  }
+
+  /** Where a body (`slot:n3`) or a port (`slot:n3|"e"/0`) is on screen, if it is. */
+  screenOf(ref: string): { x: number; y: number } | null {
+    const v = new THREE.Vector3();
+    if (ref.includes('|')) {
+      if (!this.portWorld(ref, v)) return null;
+    } else {
+      const b = this.bodies.get(ref);
+      if (!b) return null;
+      v.copy(b.world);
+    }
+    v.project(this.camera);
+    const r = this.renderer.domElement.getBoundingClientRect();
+    return { x: ((v.x + 1) / 2) * r.width + r.left, y: ((1 - v.y) / 2) * r.height + r.top };
+  }
+
+  /** Body keys, and their ports, for whoever drives the view from outside (tests). */
+  inventory(): { key: string; name: string; ports: string[] }[] {
+    return [...this.bodies.values()].filter((b) => !b.dying).map((b) => ({ key: b.key, name: b.name, ports: b.ports.map((p) => `${b.key}|${p.key}`) }));
+  }
+
+  /** Whether `key` stands within `ancestor` (itself included). */
+  within(ancestor: string, key: string): boolean {
+    for (let k: string | null = key; k; k = this.bodies.get(k)?.parent ?? null) if (k === ancestor) return true;
+    return false;
+  }
+
+  private marks = new Map<string, number>();
+  /** Mark bodies: 1 selected, 2 a drop target. */
+  mark(key: string, kind: number | null) {
+    if (kind === null) this.marks.delete(key);
+    else this.marks.set(key, kind);
+  }
+  clearMarks(kind?: number) {
+    for (const [k, v] of [...this.marks]) if (kind === undefined || v === kind) this.marks.delete(k);
+  }
+
+  private dragFrom: string | null = null;
+  private dragTo = new THREE.Vector3();
+  private dragLine: THREE.Line;
+  /** A line from a port to the pointer, while linking. */
+  setDragLine(from: string | null, clientX = 0, clientY = 0) {
+    this.dragFrom = from;
+    if (!from) return;
+    const a = new THREE.Vector3();
+    this.portWorld(from, a);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), a);
+    this.ray(clientX, clientY).ray.intersectPlane(plane, this.dragTo);
+  }
+
+  private pairs: [string, string][] = [];
+  private pairLines!: THREE.LineSegments;
+  private pairGeo = new THREE.BufferGeometry();
+  /** Arcs between bodies that are one thing on two sides (a kept node, a site and its uses). */
+  setPairs(pairs: [string, string][]) {
+    this.pairs = pairs;
+  }
+
+  /** The body keys of a slot's node ids. */
+  keyOf(slot: string, id: Id) {
+    return `${slot}:n${id}`;
   }
 
   dispose() {
@@ -625,4 +987,31 @@ export class BigraphView {
     this.renderer.domElement.remove();
     this.labels.domElement.remove();
   }
+}
+
+/**
+ * Which node of `b` each node of `a` became, where `b` is `a` rebuilt (same things, new identities): matched place
+ * by place, by type and key first, then by type, in order.
+ */
+export function reconcile(a: Carrier, b: Carrier): Map<Id, Id> {
+  const ia = new Index(a), ib = new Index(b);
+  const out = new Map<Id, Id>();
+  const go = (pa: { node: Id } | { region: number }, pb: { node: Id } | { region: number }) => {
+    const xs = ia.children(pa).filter((n) => typeof n.payload !== 'object');
+    const ys = ib.children(pb).filter((n) => typeof n.payload !== 'object');
+    const used = new Set<Id>();
+    const take = (y: (typeof ys)[number], same: (x: (typeof xs)[number]) => boolean) => {
+      const x = xs.find((x) => !used.has(x.id) && same(x));
+      if (!x) return false;
+      used.add(x.id);
+      out.set(y.id, x.id);
+      go({ node: x.id }, { node: y.id });
+      return true;
+    };
+    const rest = ys.filter((y) => !take(y, (x) => x.type === y.type && JSON.stringify(x.member) === JSON.stringify(y.member)));
+    const rest2 = rest.filter((y) => !take(y, (x) => x.type === y.type));
+    for (const y of rest2) take(y, () => true);
+  };
+  b.outer.places.forEach((_, r) => go({ region: r }, { region: r }));
+  return out;
 }

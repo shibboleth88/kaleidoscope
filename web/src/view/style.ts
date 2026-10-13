@@ -21,6 +21,8 @@ export interface Visual {
   shape: Shape;
   size: number;
   container: boolean | undefined;
+  /** Whether the type chose its shape (a container then keeps it; otherwise it is a sphere). */
+  shaped: boolean;
 }
 
 const hash = (s: string) => {
@@ -57,8 +59,9 @@ export function visualOf(sig: Signature, type: number, attrs: Map<string, Scalar
     const v = num(attrs.get(st.sizeBy));
     if (v !== null) size *= Math.max(0.2, Math.cbrt(Math.abs(v)));
   }
-  const shape = (SHAPES as readonly string[]).includes(st.shape as string) ? (st.shape as Shape) : SHAPES[hash(t.name) % 6];
-  return { color, shape, size, container: typeof st.container === 'boolean' ? st.container : undefined };
+  const shaped = (SHAPES as readonly string[]).includes(st.shape as string);
+  const shape = shaped ? (st.shape as Shape) : SHAPES[hash(t.name) % 6];
+  return { color, shape, size, container: typeof st.container === 'boolean' ? st.container : undefined, shaped };
 }
 
 const geoCache = new Map<string, THREE.BufferGeometry>();

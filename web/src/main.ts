@@ -2,19 +2,40 @@
  * Kaleidoscope: a bigraphical reactive system editor.
  *
  * Left, the library: the types the world is made of, states built from them, reactions. Right, the world: the
- * system (an initial state and a set of reactions) running, one reaction at a time. Click a pane to fill the
- * screen with it; Escape to split again. Any change to what the system is made of starts it over.
+ * system (an initial state and a set of reactions) running, one reaction at a time, every step kept on a
+ * timeline. Click empty space in a pane to fill the screen with it; Escape to come back out. Any change to what
+ * the system is made of starts it over.
  */
 
 import './style.css';
-import * as THREE from 'three';
-import { type Carrier, type Rule, Signature } from './engine';
-import { type Compiled, type Library, type RuleEntry, type StateEntry, compile, load, mapk, save, uid } from './library';
+import type { Rule } from './engine';
+import { SHAPES } from './view/style';
+import {
+  type Compiled,
+  type Library,
+  type RuleEntry,
+  type StateEntry,
+  type TypeDef,
+  type TypeEntry,
+  EXAMPLES,
+  compile,
+  empty,
+  loadShelf,
+  parseType,
+  saveShelf,
+  upgrade,
+  working,
+  typeName,
+  typeText,
+  uid,
+} from './library';
 import { BigraphView } from './view/scene';
 import { World } from './world';
+import { Editor } from './edit/editor';
+import { Timeline, ruleColor } from './timeline';
 
 type Mode = 'split' | 'library' | 'world';
-type Selection = { kind: 'types' } | { kind: 'state'; id: string } | { kind: 'rule'; id: string };
+type Selection = { kind: 'none' } | { kind: 'type'; id: string } | { kind: 'state'; id: string } | { kind: 'rule'; id: string };
 
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector(sel) as T;
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
@@ -23,14 +44,19 @@ document.querySelector('#app')!.innerHTML = `
   <section class="pane" id="library">
     <header>
       <h1>Library</h1>
-      <span class="hint">states · reactions · the types they are made of</span>
-      <button class="ghost" id="lib-reset" title="Replace the library with the MAPK example">example</button>
+      <select id="shelf" title="Your saved libraries, and the examples (always fresh)"></select>
+      <button id="save-as" title="Save this library under a name">save as…</button>
+      <button class="ghost" id="lib-new" title="An empty library">new</button>
+      <button class="ghost" id="lib-del" title="Delete this saved library">delete</button>
+      <button class="ghost" id="lib-down" title="Download this library as a file">⤓</button>
+      <label class="ghost file" title="Open a library file">⤒<input type="file" id="lib-open" accept=".json,application/json"></label>
       <button class="mode" data-mode="library" title="Fill the screen">⤢</button>
     </header>
     <div class="lib-body">
       <nav id="lib-list"></nav>
       <div id="lib-editor">
         <div class="editor-head"></div>
+        <div class="type-form"></div>
         <div class="preview"></div>
         <div class="editor-text">
           <textarea spellcheck="false"></textarea>
@@ -45,57 +71,68 @@ document.querySelector('#app')!.innerHTML = `
       <label class="initial">from <select id="initial"></select></label>
       <button id="reset" class="big" title="Start again from the initial state (R)">↺ reset</button>
       <button id="play" title="Play / pause (Space)">❚❚</button>
-      <button id="step" title="One reaction (→)">step ▸</button>
+      <button id="step" title="One reaction (→); ← goes back">step ▸</button>
       <label class="speed" title="Reactions per second"><input id="speed" type="range" min="0.2" max="8" step="0.1" value="1.2"><span></span></label>
       <button class="mode" data-mode="world" title="Fill the screen">⤢</button>
     </header>
     <div class="system" id="system"></div>
     <div class="stage" id="world-stage"></div>
     <div class="status" id="status"></div>
-    <ol class="ticker" id="ticker"></ol>
+    <div class="timeline" id="timeline"></div>
   </section>
-  <div class="esc-hint">Esc · split</div>
+  <div class="esc-hint">Esc · back</div>
 `;
 
 const app = document.querySelector('#app') as HTMLElement;
+/** The pane last touched: where Escape steps out of a place. */
+let lastPane: 'library' | 'world' = 'world';
+$('#library').addEventListener('pointerdown', () => (lastPane = 'library'));
+$('#world').addEventListener('pointerdown', () => (lastPane = 'world'));
 let mode: Mode = 'split';
 function setMode(m: Mode) {
   mode = m;
   app.dataset.mode = m;
 }
 setMode('split');
-
-// a click (not a drag) on a pane, while split, fills the screen with it
-for (const pane of ['library', 'world'] as const) {
-  const el = $(`#${pane}`);
-  let down: { x: number; y: number } | null = null;
-  el.addEventListener('pointerdown', (e) => (down = { x: e.clientX, y: e.clientY }));
-  el.addEventListener('pointerup', (e) => {
-    if (mode !== 'split' || !down) return;
-    const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5;
-    down = null;
-    const t = e.target as HTMLElement;
-    if (moved || t.closest('button, input, select, textarea, label, nav, .chip')) return;
-    setMode(pane);
-  });
-}
 document.querySelectorAll<HTMLButtonElement>('button.mode').forEach((b) =>
   b.addEventListener('click', () => setMode(mode === b.dataset.mode ? 'split' : (b.dataset.mode as Mode))),
 );
 
 // ── the library and the system ─────────────────────────────────────────────────────────────────────────────
 
-let lib: Library = load();
+const shelf = loadShelf();
+let lib: Library = working(shelf);
 let compiled: Compiled = compile(lib);
-let selection: Selection = lib.rules[0] ? { kind: 'rule', id: lib.rules[0].id } : { kind: 'types' };
+let selection: Selection = lib.rules[0] ? { kind: 'rule', id: lib.rules[0].id } : { kind: 'none' };
 
 const world = new World($('#world-stage'), compiled.sig);
 const preview = new BigraphView($('#lib-editor .preview'), compiled.sig);
 preview.autoRotate = false;
+const textarea = $<HTMLTextAreaElement>('#lib-editor textarea');
+/** Edits made in 3-D come back as text: the entry's, and the text box's. */
+const editor = new Editor(preview, $('#lib-editor .preview'), compiled.sig, (text) => {
+  const e = entryOf();
+  if (!e) return;
+  e.text = text;
+  textarea.value = text;
+  changed();
+});
+const timeline = new Timeline($('#timeline'));
+
+// a tap on empty space, while split, fills the screen with that pane; anything else is the pane's own
+world.view.onTap = (key) => {
+  if (!key && mode === 'split') setMode('world');
+};
+preview.onTap = (key) => {
+  if (!key && mode === 'split' && !editor.tookPointer) setMode('library');
+};
+
+/** A rule's entry, by the name the world knows it by. */
+const ruleIdByName = () => new Map(lib.rules.map((r) => [r.name, r.id]));
 
 function systemSetup() {
   const problems: string[] = [];
-  if (compiled.typeError) problems.push(`types: ${compiled.typeError}`);
+  for (const [id, msg] of compiled.typeErrors) problems.push(`type ${typeName(lib.types.find((t) => t.id === id)?.text ?? '')}: ${msg}`);
   const init = compiled.states.get(lib.system.initial);
   const initial = init instanceof Error || !init ? null : init;
   if (!init) problems.push('no initial state chosen');
@@ -112,10 +149,10 @@ function systemSetup() {
 
 let changeTimer = 0;
 /** Anything changed: compile, redraw the library, and (soon, so typing is not interrupted) start the world over. */
-function changed(opts: { now?: boolean; list?: boolean } = {}) {
-  save(lib);
+function changed(opts: { now?: boolean } = {}) {
+  saveShelf(shelf);
   compiled = compile(lib);
-  if (opts.list !== false) renderList();
+  renderList();
   renderEditor(false);
   renderSystem();
   clearTimeout(changeTimer);
@@ -124,17 +161,38 @@ function changed(opts: { now?: boolean; list?: boolean } = {}) {
 
 // ── the world's controls ───────────────────────────────────────────────────────────────────────────────────
 
-const ticker = $('#ticker');
-world.onEvent = ({ step, t, rule }) => {
-  const li = document.createElement('li');
-  li.innerHTML = `<b>${esc(rule)}</b><span>#${step} · t ${t.toFixed(2)}</span>`;
-  ticker.prepend(li);
-  while (ticker.children.length > 8) ticker.lastElementChild!.remove();
+const typeColor = (t: number) => {
+  const st = (compiled.sig.get(t).style ?? {}) as { color?: string };
+  return st.color ?? ruleColor(compiled.sig.name(t));
 };
-world.onStatus = ({ steps, t, live, resting, problems }) => {
+
+world.onStatus = ({ steps, t, live, resting, problems, scrubbing }) => {
+  const f = world.frame;
+  const what = f?.transition ? `<i style="color:${ruleColor(f.transition.rule)}">${esc(f.transition.rule)}</i>` : 'the initial state';
   $('#status').innerHTML =
-    `<span>${steps} reactions</span><span>t ${t.toFixed(2)}</span><span>${resting ? '<b>resting</b>: nothing can react' : `${live} places a reaction can happen`}</span>` +
+    `<span>#${steps} · ${what}</span><span>t ${t.toFixed(2)}</span>` +
+    (scrubbing ? `<span><b>looking back</b>: play or step to go on from here</span>` : `<span>${resting ? '<b>resting</b>: nothing can react' : `${live} places a reaction can happen`}</span>`) +
     problems.map((p) => `<div class="problem">${esc(p)}</div>`).join('');
+};
+
+/** The reaction a frame came from, lit in the list and the system: a flash as it happens, steady while looked at. */
+world.onFrame = (f, i, fresh) => {
+  timeline.set(world.frames, i, compiled.sig, typeColor);
+  const id = f.transition ? ruleIdByName().get(f.transition.rule) : undefined;
+  document.querySelectorAll('.current-rule').forEach((el) => el.classList.remove('current-rule'));
+  if (!id) return;
+  for (const el of document.querySelectorAll<HTMLElement>(`[data-id="${id}"], [data-rule="${id}"]`)) {
+    el.classList.add('current-rule');
+    if (fresh) {
+      el.classList.remove('fired');
+      void el.offsetWidth; // restart the animation
+      el.classList.add('fired');
+    }
+  }
+};
+timeline.onSeek = (i) => {
+  setPlay(false);
+  world.seek(i);
 };
 
 function renderSystem() {
@@ -144,7 +202,7 @@ function renderSystem() {
     .map((r) => {
       const on = lib.system.rules.includes(r.id);
       const bad = compiled.rules.get(r.id) instanceof Error;
-      return `<span class="chip ${on ? 'on' : ''} ${bad ? 'bad' : ''}" data-rule="${r.id}" title="${on ? 'In the system: click to take it out' : 'Click to put it in the system'}">${esc(r.name)}</span>`;
+      return `<span class="chip ${on ? 'on' : ''} ${bad ? 'bad' : ''}" data-rule="${r.id}" style="--rule:${ruleColor(r.name)}" title="${on ? 'In the system: click to take it out' : 'Click to put it in the system'}">${esc(r.name)}</span>`;
     })
     .join('');
 }
@@ -158,10 +216,7 @@ $('#system').addEventListener('click', (e) => {
   lib.system.rules = lib.system.rules.includes(id) ? lib.system.rules.filter((x) => x !== id) : [...lib.system.rules, id];
   changed({ now: true });
 });
-$('#reset').addEventListener('click', () => {
-  ticker.innerHTML = '';
-  world.reset(systemSetup());
-});
+$('#reset').addEventListener('click', () => world.reset(systemSetup()));
 const playBtn = $('#play');
 const setPlay = (p: boolean) => {
   world.setPlaying(p);
@@ -177,154 +232,373 @@ const showSpeed = () => ($('.speed span').textContent = `${Number(speed.value).t
 speed.addEventListener('input', () => ((world.speed = Number(speed.value)), showSpeed()));
 showSpeed();
 
-// ── the library's list and editor ──────────────────────────────────────────────────────────────────────────
+// ── the library's list ─────────────────────────────────────────────────────────────────────────────────────
 
 function renderList() {
+  const isSel = (kind: string, id: string) => selection.kind === kind && 'id' in selection && selection.id === id;
+  const typeItem = (t: TypeEntry) => {
+    const name = typeName(t.text);
+    let color = '#7d8db0';
+    try {
+      color = (parseType(t.text).style.color as string) ?? color;
+    } catch {
+      /* a type that does not read: grey */
+    }
+    return `<a class="${isSel('type', t.id) ? 'sel' : ''} ${compiled.typeErrors.has(t.id) ? 'bad' : ''}" data-kind="type" data-id="${t.id}"><i class="dot" style="background:${color}"></i>${esc(name)}</a>`;
+  };
   const item = (kind: 'state' | 'rule', e: StateEntry) => {
-    const sel = selection.kind === kind && selection.id === e.id;
     const c = kind === 'state' ? compiled.states.get(e.id) : compiled.rules.get(e.id);
     const mark =
       kind === 'state'
-        ? lib.system.initial === e.id ? '<i title="the initial state">★</i>' : ''
-        : lib.system.rules.includes(e.id) ? '<i title="in the system">●</i>' : '<i class="off">○</i>';
-    return `<a class="${sel ? 'sel' : ''} ${c instanceof Error ? 'bad' : ''}" data-kind="${kind}" data-id="${e.id}">${mark}${esc(e.name)}</a>`;
+        ? lib.system.initial === e.id ? '<i title="the initial state">★</i>' : '<i></i>'
+        : `<i class="dot ${lib.system.rules.includes(e.id) ? '' : 'off'}" style="--rule:${ruleColor(e.name)}" title="${lib.system.rules.includes(e.id) ? 'in the system' : 'not in the system'}"></i>`;
+    return `<a class="${isSel(kind, e.id) ? 'sel' : ''} ${c instanceof Error ? 'bad' : ''}" data-kind="${kind}" data-id="${e.id}">${mark}${esc(e.name)}</a>`;
   };
   $('#lib-list').innerHTML = `
-    <a class="${selection.kind === 'types' ? 'sel' : ''} ${compiled.typeError ? 'bad' : ''}" data-kind="types">types</a>
+    <h2>types <button data-add="type" title="New type">+</button></h2>
+    ${lib.types.map(typeItem).join('')}
     <h2>states <button data-add="state" title="New state">+</button></h2>
     ${lib.states.map((s) => item('state', s)).join('')}
     <h2>reactions <button data-add="rule" title="New reaction">+</button></h2>
     ${lib.rules.map((r) => item('rule', r)).join('')}`;
+  // keep the world's current reaction lit across redraws
+  const f = world.frame;
+  const id = f?.transition ? ruleIdByName().get(f.transition.rule) : undefined;
+  if (id) $(`#lib-list [data-id="${id}"]`)?.classList.add('current-rule');
 }
 
 $('#lib-list').addEventListener('click', (e) => {
   const t = e.target as HTMLElement;
   const add = t.closest<HTMLElement>('[data-add]')?.dataset.add;
-  if (add === 'state') {
-    const s: StateEntry = { id: uid(), name: `state ${lib.states.length + 1}`, text: '' };
-    lib.states.push(s);
-    selection = { kind: 'state', id: s.id };
+  if (add) {
+    if (add === 'type') {
+      const names = new Set(lib.types.map((x) => typeName(x.text)));
+      let n = 1;
+      while (names.has(`Thing${n}`)) n++;
+      const ty: TypeEntry = { id: uid(), text: `Thing${n}` };
+      lib.types.push(ty);
+      selection = { kind: 'type', id: ty.id };
+    } else if (add === 'state') {
+      const s: StateEntry = { id: uid(), name: `state ${lib.states.length + 1}`, text: '' };
+      lib.states.push(s);
+      selection = { kind: 'state', id: s.id };
+    } else {
+      const r: RuleEntry = { id: uid(), name: `reaction ${lib.rules.length + 1}`, text: '()\n  => ()', rate: 1 };
+      lib.rules.push(r);
+      selection = { kind: 'rule', id: r.id };
+    }
     changed();
-    return;
-  }
-  if (add === 'rule') {
-    const r: RuleEntry = { id: uid(), name: `reaction ${lib.rules.length + 1}`, text: '\n  => ', rate: 1 };
-    lib.rules.push(r);
-    selection = { kind: 'rule', id: r.id };
-    changed();
+    renderEditor(true);
     return;
   }
   const a = t.closest<HTMLElement>('a[data-kind]');
   if (!a) return;
-  selection = a.dataset.kind === 'types' ? { kind: 'types' } : { kind: a.dataset.kind as 'state' | 'rule', id: a.dataset.id! };
+  const kind = a.dataset.kind as 'type' | 'state' | 'rule';
+  // the selected one again: let go of it
+  selection = 'id' in selection && selection.kind === kind && selection.id === a.dataset.id ? { kind: 'none' } : { kind, id: a.dataset.id! };
   renderList();
   renderEditor(true);
 });
 
-const textarea = $<HTMLTextAreaElement>('#lib-editor textarea');
-const entryOf = (): StateEntry | RuleEntry | undefined => {
+// ── the editor: a type, a state or a reaction ──────────────────────────────────────────────────────────────
+
+const entryOf = (): TypeEntry | StateEntry | RuleEntry | undefined => {
   const s = selection;
-  return s.kind === 'state' ? lib.states.find((x) => x.id === s.id) : s.kind === 'rule' ? lib.rules.find((x) => x.id === s.id) : undefined;
+  if (s.kind === 'type') return lib.types.find((x) => x.id === s.id);
+  if (s.kind === 'state') return lib.states.find((x) => x.id === s.id);
+  if (s.kind === 'rule') return lib.rules.find((x) => x.id === s.id);
+  return undefined;
 };
 
 function renderEditor(fresh: boolean) {
   const head = $('#lib-editor .editor-head');
+  const form = $('#lib-editor .type-form');
   const problems = $('#lib-editor .problems');
   const e = entryOf();
-  if (selection.kind === 'types') {
-    if (fresh) {
-      head.innerHTML = `<h3>types</h3><span class="hint">Name[port :: Link | attr :: Float] &lt;: Super {color: "#f80", shape: "torus", sizeBy: "attr"}</span>`;
-      textarea.value = lib.types;
-    }
-    problems.textContent = compiled.typeError ?? '';
-    showTypes();
+  $('#lib-editor').dataset.kind = selection.kind;
+  if (selection.kind === 'none' || !e) {
+    selection = { kind: 'none' };
+    head.innerHTML = `<h3>the library</h3><span class="hint">every type, as it looks · select a type, a state or a reaction to edit it</span>`;
+    form.innerHTML = '';
+    textarea.value = '';
+    problems.textContent = '';
+    editor.openTypes(compiled.sig);
+    if (fresh) preview.frame();
     return;
   }
-  if (!e) {
-    selection = { kind: 'types' };
-    return renderEditor(true);
+  if (selection.kind === 'type') {
+    const t = e as TypeEntry;
+    if (fresh) {
+      head.innerHTML = `<h3>type</h3><span class="hint">Name[port :: Link | attr :: Float] &lt;: Super {color, shape, size, sizeBy, colorBy, container}</span><button class="ghost del" title="Delete">delete</button>`;
+      $('.del', head).addEventListener('click', () => {
+        lib.types = lib.types.filter((x) => x.id !== t.id);
+        selection = { kind: 'none' };
+        changed({ now: true });
+        renderEditor(true);
+      });
+    }
+    if (fresh || document.activeElement !== textarea) textarea.value = t.text;
+    renderTypeForm(t, fresh);
+    problems.textContent = compiled.typeErrors.get(t.id) ?? '';
+    editor.openType(compiled.sig, typeName(t.text));
+    if (fresh) preview.frame();
+    return;
   }
+  form.innerHTML = '';
+  const se = e as StateEntry;
   if (fresh) {
     const isRule = selection.kind === 'rule';
     head.innerHTML = `
-      <input class="name" value="${esc(e.name)}" spellcheck="false">
-      ${isRule ? `<label>rate <input class="rate" type="number" min="0" step="0.1" value="${(e as RuleEntry).rate}"></label>` : ''}
-      ${isRule ? `<button class="toggle">${lib.system.rules.includes(e.id) ? 'in the system ●' : 'not in the system ○'}</button>` : `<button class="toggle">${lib.system.initial === e.id ? 'the initial state ★' : 'make initial ☆'}</button>`}
+      <input class="name" value="${esc(se.name)}" spellcheck="false">
+      ${isRule ? `<label>rate <input class="rate" type="number" min="0" step="0.1" value="${(se as RuleEntry).rate}"></label>` : ''}
+      ${isRule ? `<button class="toggle">${lib.system.rules.includes(se.id) ? 'in the system ●' : 'not in the system ○'}</button>` : `<button class="toggle">${lib.system.initial === se.id ? 'the initial state ★' : 'make initial ☆'}</button>`}
       <button class="ghost del" title="Delete">delete</button>`;
-    textarea.value = e.text;
+    textarea.value = se.text;
     $('.name', head).addEventListener('input', (ev) => {
-      e.name = (ev.target as HTMLInputElement).value;
+      se.name = (ev.target as HTMLInputElement).value;
       changed();
     });
     $('.rate', head)?.addEventListener('input', (ev) => {
-      (e as RuleEntry).rate = Number((ev.target as HTMLInputElement).value) || 0;
+      (se as RuleEntry).rate = Number((ev.target as HTMLInputElement).value) || 0;
       changed();
     });
     $('.toggle', head).addEventListener('click', () => {
       if (selection.kind === 'rule')
-        lib.system.rules = lib.system.rules.includes(e.id) ? lib.system.rules.filter((x) => x !== e.id) : [...lib.system.rules, e.id];
-      else lib.system.initial = e.id;
+        lib.system.rules = lib.system.rules.includes(se.id) ? lib.system.rules.filter((x) => x !== se.id) : [...lib.system.rules, se.id];
+      else lib.system.initial = se.id;
       changed({ now: true });
       renderEditor(true);
     });
     $('.del', head).addEventListener('click', () => {
-      lib.states = lib.states.filter((s) => s.id !== e.id);
-      lib.rules = lib.rules.filter((r) => r.id !== e.id);
-      lib.system.rules = lib.system.rules.filter((x) => x !== e.id);
-      selection = { kind: 'types' };
+      lib.states = lib.states.filter((s) => s.id !== se.id);
+      lib.rules = lib.rules.filter((r) => r.id !== se.id);
+      lib.system.rules = lib.system.rules.filter((x) => x !== se.id);
+      selection = { kind: 'none' };
       changed({ now: true });
       renderEditor(true);
     });
   }
-  const c = selection.kind === 'state' ? compiled.states.get(e.id) : compiled.rules.get(e.id);
-  problems.textContent = c instanceof Error ? c.message : '';
-  if (c && !(c instanceof Error)) showEntry(c);
+  // the editor reads the text itself, so what it shows is what is written, edited in place
+  const err = editor.open(selection.kind, se.text, compiled.sig);
+  const c = selection.kind === 'state' ? compiled.states.get(se.id) : compiled.rules.get(se.id);
+  problems.textContent = err ?? (c instanceof Error ? c.message : '');
+  if (fresh) preview.frame();
 }
 
-function showEntry(c: Carrier | Rule) {
-  preview.setSignature(compiled.sig);
-  if ('redex' in c) {
-    const w = 4 + 2.2 * Math.max(c.redex.nodes.length, c.reactum.nodes.length) ** 0.5;
-    preview.show([
-      { key: 'L', carrier: c.redex, offset: new THREE.Vector3(-w, 0, 0), title: 'redex' },
-      { key: 'R', carrier: c.reactum, offset: new THREE.Vector3(w, 0, 0), title: 'reactum' },
-    ]);
-  } else preview.show([{ key: 'S', carrier: c, offset: new THREE.Vector3() }]);
-  preview.frame();
-}
-
-/** The types, each an instance, side by side: a palette. */
-function showTypes() {
-  preview.setSignature(compiled.sig);
-  const user = compiled.sig.user();
-  const sig: Signature = compiled.sig;
-  const nodes = user.map((t, i) => ({
-    id: i,
-    type: t.id,
-    parent: { region: 0 },
-    member: { held: null },
-    payload: 'composite' as const,
-    ports: [],
-  }));
-  preview.show([{ key: 'T', carrier: { inner: { places: [], names: [], locality: [] }, outer: { places: [sig.id('Place')], names: [], locality: [] }, nodes, edges: [], sites: [], names: [], siteKeys: [] }, offset: new THREE.Vector3() }]);
-  preview.frame();
-}
-
-textarea.addEventListener('input', () => {
-  if (selection.kind === 'types') lib.types = textarea.value;
-  else {
-    const e = entryOf();
-    if (e) e.text = textarea.value;
+/** The type as a form: its name, what it is within, its slots, and how it looks. Each change rewrites its line. */
+function renderTypeForm(t: TypeEntry, fresh: boolean) {
+  const form = $('#lib-editor .type-form');
+  let d: TypeDef;
+  try {
+    d = parseType(t.text);
+  } catch {
+    form.innerHTML = '<div class="hint">fix the text below and the form comes back</div>';
+    return;
   }
-  changed({ list: true });
+  // while typing in the form, leave it be: only the text and the preview follow
+  if (!fresh && form.contains(document.activeElement) && form.dataset.for === t.id) return;
+  form.dataset.for = t.id;
+  const others = lib.types.map((x) => typeName(x.text)).filter((n) => n !== d.name);
+  const slotTypes = ['Link', ...others.filter((n) => compiled.sig.has(n) && compiled.sig.get(compiled.sig.id(n)).kind === 'link'), 'Int', 'Float', 'Text', 'Bool'];
+  const numeric = d.slots.filter((x) => x.type === 'Int' || x.type === 'Float').map((x) => x.key);
+  const st = d.style as { color?: string; shape?: string; size?: number; sizeBy?: string; colorBy?: string; container?: boolean };
+  const opt = (v: string, cur: string | undefined, label = v) => `<option value="${esc(v)}" ${v === (cur ?? '') ? 'selected' : ''}>${esc(label)}</option>`;
+  form.innerHTML = `
+    <div class="row"><label>name <input data-f="name" value="${esc(d.name)}" spellcheck="false"></label>
+      <label>within <select data-f="super">${opt('', d.supers[0], '—')}${['Link', ...others].map((n) => opt(n, d.supers[0])).join('')}</select></label></div>
+    <div class="slots">
+      ${d.slots
+        .map(
+          (x, i) => `<div class="row slot">
+        <input data-slot="${i}" data-k="key" value="${esc(x.key)}" spellcheck="false">
+        <span>::</span>
+        <select data-slot="${i}" data-k="type">${slotTypes.map((n) => opt(n, x.type)).join('')}</select>
+        ${slotTypes.slice(0, slotTypes.length - 4).includes(x.type) ? `<label title="points">× <input data-slot="${i}" data-k="arity" type="number" min="1" max="8" value="${x.arity ?? 1}"></label><em>port</em>` : '<em>attribute</em>'}
+        <button data-del-slot="${i}" title="Remove">✕</button></div>`,
+        )
+        .join('')}
+      <div class="row"><button data-add-slot="port">+ port</button><button data-add-slot="attr">+ attribute</button></div>
+    </div>
+    <div class="row look">
+      <label>colour <input data-f="color" type="color" value="${esc(st.color ?? '#7d8db0')}"></label>
+      <label>shape <select data-f="shape">${opt('', st.shape, 'auto')}${SHAPES.map((x) => opt(x, st.shape)).join('')}</select></label>
+      <label>size <input data-f="size" type="range" min="0.3" max="3" step="0.1" value="${st.size ?? 1}"></label>
+      <label>size by <select data-f="sizeBy">${opt('', st.sizeBy, '—')}${numeric.map((n) => opt(n, st.sizeBy)).join('')}</select></label>
+      <label>hue by <select data-f="colorBy">${opt('', st.colorBy, '—')}${numeric.map((n) => opt(n, st.colorBy)).join('')}</select></label>
+      <label>a place <select data-f="container">${opt('', st.container === undefined ? '' : String(st.container), 'when it holds')}${opt('true', String(st.container), 'always')}${opt('false', String(st.container), 'never')}</select></label>
+    </div>`;
+
+  const write = (rename?: [string, string]) => {
+    t.text = typeText(d);
+    textarea.value = t.text;
+    if (rename) renameType(...rename);
+    changed();
+  };
+  form.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-f]').forEach((el) => {
+    const ev = el.tagName === 'INPUT' && (el as HTMLInputElement).type !== 'color' && (el as HTMLInputElement).type !== 'range' ? 'change' : 'input';
+    el.addEventListener(ev, () => {
+      const f = el.dataset.f!;
+      const v = el.value;
+      if (f === 'name') {
+        const old = d.name;
+        if (!/^[A-Za-z_]\w*$/.test(v) || v === old) return;
+        d.name = v;
+        return write([old, v]);
+      }
+      if (f === 'super') d.supers = v ? [v] : [];
+      else if (f === 'size') d.style.size = Number(v) === 1 ? undefined : Number(v);
+      else if (f === 'container') d.style.container = v === '' ? undefined : v === 'true';
+      else d.style[f] = v || undefined;
+      write();
+    });
+  });
+  form.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-slot]').forEach((el) =>
+    el.addEventListener('change', () => {
+      const x = d.slots[Number(el.dataset.slot)];
+      const k = el.dataset.k!;
+      if (k === 'key') x.key = el.value.replace(/\W/g, '') || x.key;
+      else if (k === 'type') x.type = el.value;
+      else x.arity = Math.max(1, Number(el.value) || 1);
+      write();
+      renderTypeForm(t, true);
+    }),
+  );
+  form.querySelectorAll<HTMLButtonElement>('[data-del-slot]').forEach((b) =>
+    b.addEventListener('click', () => {
+      d.slots.splice(Number(b.dataset.delSlot), 1);
+      write();
+      renderTypeForm(t, true);
+    }),
+  );
+  form.querySelectorAll<HTMLButtonElement>('[data-add-slot]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const port = b.dataset.addSlot === 'port';
+      const used = new Set(d.slots.map((x) => x.key));
+      let n = 1;
+      const stem = port ? 'p' : 'a';
+      while (used.has(`${stem}${n}`)) n++;
+      d.slots.push({ key: `${stem}${n}`, type: port ? 'Link' : 'Float' });
+      write();
+      renderTypeForm(t, true);
+    }),
+  );
+}
+
+/** A type renamed: everything written in its name follows. */
+function renameType(old: string, now: string) {
+  const re = new RegExp(`\\b${old}\\b`, 'g');
+  for (const s of [...lib.states, ...lib.rules]) s.text = s.text.replace(re, now);
+  for (const t of lib.types) if (typeName(t.text) !== now) t.text = t.text.replace(re, now);
+}
+
+// a type renamed in its text: when the text is left, everything written in the old name follows
+let nameAtFocus: string | null = null;
+textarea.addEventListener('focus', () => (nameAtFocus = selection.kind === 'type' ? typeName(textarea.value) : null));
+textarea.addEventListener('change', () => {
+  if (selection.kind !== 'type' || !nameAtFocus) return;
+  const now = typeName(textarea.value);
+  if (now !== nameAtFocus && now !== '?') {
+    renameType(nameAtFocus, now);
+    nameAtFocus = now;
+    changed({ now: true });
+  }
 });
 
-$('#lib-reset').addEventListener('click', () => {
-  if (!confirm('Replace the library with the MAPK example? Your entries will be lost.')) return;
-  lib = mapk();
-  selection = { kind: 'rule', id: lib.rules[0].id };
+textarea.addEventListener('input', () => {
+  const e = entryOf();
+  if (!e) return;
+  e.text = textarea.value;
+  changed();
+});
+
+// ── the shelf: libraries saved by name, and the examples ───────────────────────────────────────────────────
+
+function renderShelf() {
+  const names = Object.keys(shelf.saved).sort();
+  const scratchTitle = (shelf.scratch as Library & { title?: string }).title ?? 'library';
+  $('#shelf').innerHTML =
+    `<option value="__scratch" ${shelf.current === null ? 'selected' : ''}>${esc(scratchTitle)}${shelf.current === null ? ' (unsaved)' : ''}</option>` +
+    (names.length ? `<optgroup label="saved">${names.map((n) => `<option value="s:${esc(n)}" ${shelf.current === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</optgroup>` : '') +
+    `<optgroup label="examples (fresh copy)">${Object.keys(EXAMPLES).map((n) => `<option value="x:${esc(n)}">${esc(n)}</option>`).join('')}</optgroup>`;
+  $('#lib-del').style.display = shelf.current ? '' : 'none';
+}
+
+/** Work on another library: everything follows, and the world starts over. */
+function switchTo(next: Library) {
+  lib = next;
+  selection = lib.rules[0] ? { kind: 'rule', id: lib.rules[0].id } : { kind: 'none' };
+  renderShelf();
   changed({ now: true });
   renderEditor(true);
+}
+
+const unsavedWork = () => shelf.current === null && (shelf.scratch.rules.length > 0 || shelf.scratch.types.length > 0);
+
+$('#shelf').addEventListener('change', (e) => {
+  const v = (e.target as HTMLSelectElement).value;
+  if (v === '__scratch') {
+    shelf.current = null;
+    return switchTo(shelf.scratch);
+  }
+  if (v.startsWith('s:')) {
+    shelf.current = v.slice(2);
+    return switchTo(shelf.saved[shelf.current]);
+  }
+  const name = v.slice(2);
+  if (unsavedWork() && !confirm(`Replace your unsaved library with a fresh ${name}? (Save it first to keep it.)`)) return renderShelf();
+  shelf.current = null;
+  shelf.scratch = Object.assign(EXAMPLES[name](), { title: name });
+  switchTo(shelf.scratch);
+});
+
+$('#save-as').addEventListener('click', () => {
+  const suggestion = shelf.current ?? (shelf.scratch as Library & { title?: string }).title ?? 'my library';
+  const name = prompt('Save this library as:', suggestion)?.trim();
+  if (!name) return;
+  if (shelf.saved[name] && name !== shelf.current && !confirm(`Replace the saved library "${name}"?`)) return;
+  shelf.saved[name] = structuredClone(lib);
+  shelf.current = name;
+  switchTo(shelf.saved[name]);
+});
+
+$('#lib-new').addEventListener('click', () => {
+  if (unsavedWork() && !confirm('Start an empty library? Your unsaved one will be replaced. (Save it first to keep it.)')) return;
+  shelf.current = null;
+  shelf.scratch = Object.assign(empty(), { title: 'new library' });
+  switchTo(shelf.scratch);
+});
+
+$('#lib-del').addEventListener('click', () => {
+  const name = shelf.current;
+  if (!name || !confirm(`Delete the saved library "${name}"? This cannot be undone.`)) return;
+  delete shelf.saved[name];
+  shelf.current = null;
+  switchTo(shelf.scratch);
+});
+
+$('#lib-down').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(lib, null, 2)], { type: 'application/json' }));
+  a.download = `${(shelf.current ?? (shelf.scratch as Library & { title?: string }).title ?? 'library').replace(/[^\w.-]+/g, '-')}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$<HTMLInputElement>('#lib-open').addEventListener('change', async (e) => {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  try {
+    const next = upgrade(JSON.parse(await file.text()));
+    if (!Array.isArray(next.states) || !Array.isArray(next.rules)) throw new Error('not a library');
+    if (unsavedWork() && !confirm('Replace your unsaved library with this file? (Save it first to keep it.)')) return;
+    shelf.current = null;
+    shelf.scratch = Object.assign(next, { title: file.name.replace(/\.json$/, '') });
+    switchTo(shelf.scratch);
+  } catch (err) {
+    alert(`Could not open ${file.name}: ${(err as Error).message}`);
+  }
 });
 
 // ── keys ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -332,17 +606,28 @@ $('#lib-reset').addEventListener('click', () => {
 addEventListener('keydown', (e) => {
   const typing = (e.target as HTMLElement).closest('input, textarea, select');
   if (e.key === 'Escape') {
-    if (typing) (e.target as HTMLElement).blur();
-    setMode('split');
+    if (typing) return (e.target as HTMLElement).blur();
+    // out of the place we are in first; out of full screen once at the top
+    const view = (mode === 'split' ? lastPane : mode) === 'world' ? world.view : preview;
+    if (!view.up()) setMode('split');
     return;
   }
   if (typing) return;
+  const inWorld = mode === 'world' || (mode === 'split' && lastPane === 'world');
   if (e.key === ' ') (e.preventDefault(), setPlay(!world.playing));
-  else if (e.key === 'ArrowRight') (setPlay(false), world.advance(true));
+  else if (e.key === 'ArrowRight' && inWorld) {
+    setPlay(false);
+    if (world.at < world.frames.length - 1) world.seek(world.at + 1);
+    else world.advance(true);
+  } else if (e.key === 'ArrowLeft' && inWorld) (setPlay(false), world.seek(world.at - 1));
   else if (e.key === 'r' || e.key === 'R') $('#reset').click();
 });
 
+renderShelf();
 renderList();
 renderEditor(true);
 renderSystem();
 world.reset(systemSetup());
+
+// for scripts driving the page (tests, demos)
+(window as unknown as { kaleidoscope: unknown }).kaleidoscope = { preview, world, editor };
