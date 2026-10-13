@@ -198,6 +198,8 @@ export interface Transition {
   copied: [Id, Id][];
   edgesRemoved: Id[];
   edgesCreated: Id[];
+  /** Scalars kept where they stood with only their values rewritten (`World.apply`'s `inPlace`; also in `kept`). */
+  revalued?: Id[];
 }
 
 export interface Reacted {
@@ -206,9 +208,10 @@ export interface Reacted {
 }
 
 /** The occurrence replaced: `apply_spec`, as composition. */
-export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature): Reacted {
+export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, opts: { ids?: { node: Id; edge: Id } } = {}): Reacted {
   const { context, parameter, implicit } = decompose(g, rule, occ);
-  const ids = nextIds(g);
+  // fresh identities from one past the largest in use, or from where a caller's own counters stand (a world's)
+  const ids = opts.ids ?? nextIds(g);
   let nextNode = ids.node;
   let nextEdge = ids.edge;
   const σ = rule.sites;

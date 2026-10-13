@@ -539,3 +539,334 @@ closed edge has points.
 **Question for the spec:** the same as F8, now with an answer to weigh. Dropping idle edges makes reaction
 congruent up to them; `discover_sound` still holds (the occurrence composes back to the state before), but the
 result is the composition *minus* idle edges, which the reaction theorem would have to say.
+
+---
+
+## Found building a whole cell (Boundary, `../boundary/cell`)
+
+Boundary's organism is written as v004 programs and run on this engine. These entries come from that work.
+
+### F39. A whole program, read: `Program(module = (…) | world = (…) | run = (…))`
+
+**Came up:** a cell is hundreds of declarations across modules. The editor's library (types as lines, rules as
+separate texts) cannot hold it, and a model kept in a TypeScript object is not in the language.
+
+**Kaleidoscope:** `engine/program.ts` reads a program as v004 writes it. The module holds type declarations
+`Name[binder] = Type[attrs](<: S | slot :: T)`, rules `name = lhs where g => rhs unless n` and modules
+`m = Module["path"]`, which the caller's loader answers (each loaded once). The world is the starting state, and the run
+holds the run's values. A type's own attributes in `Type[…]` become its style. A type whose kind is a scalar's,
+`Mass = Type[kind = "float"](<: Float)` or one within it by `<:`, is a scalar type.
+
+A rule side is one term or a bracketed place, and a line break ends it (decision 12, g12). This differs from the
+editor's single-rule reader, where a side is a whole place. In a module it has to be this way, or a reactum would run
+on into the next declaration.
+
+**Question:** none for the grammar. Slots in a type's body `()` are read but not enforced here: a composite node
+holds anything. Should the reader refuse a member a type does not declare once `types.defaults` and admission land?
+
+### F40. A rule's rate written as its node's attribute (G7), PROVISIONAL
+
+**Came up:** every rule in a cell has a rate law (`kcat · E · S/(Km + S)`), and LEGACY.md's G7 puts rate, priority
+and label among the rule node's attributes, with no sugar decided.
+
+**Kaleidoscope:** `name[rate = expr | label = "…"] = lhs => rhs`. The `[]` of a declaration's name holds the rule
+node's attributes. It is told apart from a type's binder (`T[x :: Int] = Type(…)`) and a function's
+(`f[x :: Int] :: Int = …`) by what follows: `k = v` rather than `k :: T`. The rate is evaluated per spot over the
+redex's sites (F22).
+
+**Question:** is `name[attrs] = rule` the sugar for a rule node with attributes? It reads as `H[A](B)` does: the
+rule node `name`, its attributes `A`.
+
+### F41. Slot defaults, constants, filled where a node is made
+
+**Came up:** a cytosol is about 30 counts, most of them zero at first. Writing every one in every state and every
+fresh reactum node is noise.
+
+**Kaleidoscope:** `k :: T = v` in a type's binder declares a default (spec `types.defaults`, done). A state's nodes
+and a reactum's fresh nodes are given the defaults of attributes they leave unwritten, when they are read. So it
+costs nothing as the system runs. Kept reactum nodes keep what they had, as before. Defaults are constants here,
+and are not inherited along `<:`.
+
+### F42. Print writes a bare literal where its slot fixes its type (decision 13)
+
+**Came up:** `Cell[mass :: Mass = 1.0]` printed `mass = Mass(1.0)`.
+
+**Kaleidoscope:** an attribute's scalar whose type is exactly the slot's declared type is written bare, as decision
+13 asks. Core is still written where they differ.
+
+### F43. A run that resumes exactly: candidates in a canonical order, chance as a value
+
+**Came up:** Boundary checkpoints long runs, saving the state as data and continuing later. The policy here
+(`policy.ts`) takes spots in the order discovery keeps them, and that order depends on the history of incremental
+updates. A resumed run, which rediscovers from scratch, draws the same random numbers against a different order and
+diverges.
+
+**Boundary's scheduler:** it takes live spots in a canonical order (rule, then spot key) and keeps the random
+source's whole state as one number. A checkpoint is the carrier as data (identities kept), the clock, the random
+state and the tallies. A run resumed from one reaches the state the uninterrupted run reaches, and Boundary's tests
+check this exactly.
+
+**Question:** R3 in Boundary's `docs/32`. With identities kept, a canonical order by spot is enough. Across a print
+and read, identities change (Alike), so exact resume from text needs an order by value, not by identity. Should the
+policy library order candidates by a canonical form of each occurrence?
+
+### F44. Reaction in place: a world whose reactions cost what they touch
+
+**Came up:** a cell's state holds its genome, thousands of nodes, and most reactions change a count or two. `react`
+makes each new state by decomposing and composing the whole state, which is `apply_spec` taken literally, so a
+reaction cost about 2.2 µs per node in the state: 27 ms per reaction at genome size (12,294 nodes).
+
+**Kaleidoscope:** `engine/world.ts`. A `World` holds one state and changes it in place by the same reaction, applied
+as a local rewrite:
+- removes what nothing keeps;
+- puts in the reactum's nodes, kept ones by identity;
+- moves what the first use of a site held, copies it for each later use, and drops it for none;
+- drops idle edges.
+
+The index is kept by exactly those changes. `react` takes the world's identity counters (`opts.ids`), so the proof
+can demand identity. The proof is `test/world.test.ts`: every reaction of eight systems, applied both ways, gives
+`sameCarrier` states, identities included. Incremental discovery over the world (`Discovery.advanceWorld`, given what
+the reaction could have changed as it stood: `Before`) finds what a full search finds after every step. Counts,
+moves, drops, copies, fresh nodes, links and nesting are all exercised.
+
+**Also found:** `react`'s transition reports every node a kept site held as moved, even contents put back exactly
+where they stood. With `Cell(… | ?rest)` that is the whole genome on every reaction, and incremental discovery then
+re-searches everything. The world reports only roots whose parent, key or links changed. The test above holds
+discovery to a full search under that sharper report.
+
+**Question:** the spec's cost law (`discover_local`) is about discovery. Should there be one for reaction too: a
+commit costs what its occurrence and its site contents' moves touch, not the state? `Conforms` could state it as
+`react` agreeing with a local rewrite.
+
+### F45. A pattern's first root finds its candidates by type
+
+**Came up:** the matcher found a first root's candidates, where nothing placed it, among every node in the state,
+filtered by type. A rule that loses its only occurrence on each reaction (a count pool rule, whose one node changes
+every time) is re-searched whole every step, and each search walked the whole state. That was most of the remaining
+time.
+
+**Kaleidoscope:** the index keeps nodes by type (`byType`, in state order) and the signature each type's subtypes
+(`downs`). A first root's candidates are the nodes of its type and those within it, in state order, so results and
+trajectories are unchanged (all existing tests, the stochastic simulations included). A world keeps the type index in
+place.
+
+Result, with both F44 and F45, on Boundary's cell with an inert genome: 44 nodes 338 µs, 1,294 nodes 306 µs,
+5,044 nodes 264 µs, 12,294 nodes 239 µs per reaction. Cost no longer grows with the state. The editor's own
+benchmark is unchanged.
+
+### F46. Affine count rules, and many firings in one step (τ-leaping)
+
+**Came up:** a cell pays about 4 ATP per amino acid, so a 350-residue protein costs about 700 glucose of glycolysis,
+some 9,000 metabolic reactions for each protein made. Exact one-at-a-time simulation of metabolism cannot keep pace
+with expression at real stoichiometry. Whole-cell models leap the high-count chemistry and keep the structural events
+exact.
+
+**Kaleidoscope:** `affine(rule)` recognizes a rule that only adds constants to whole-number attributes of the nodes
+it meets: every redex node kept and unlinked, the reactum fresh only in those attributes (`?x ± c` of the
+attribute's own value), and every other site put back where it stood. It returns each count's step.
+`World.applyRepeated(rule, occ, k, steps)` applies k firings at once. The proof (`test/world.test.ts`): it prints the
+same as k single applications, and incremental discovery stays a full search. Boundary's scheduler builds hybrid
+τ-leaping on it:
+- Cao–Gillespie–Petzold step selection;
+- critical reactions (any that could use up a reactant within 10 firings) fire exactly;
+- Poisson draws (Knuth, PTRS);
+- a leap that would drive a count below zero is halved.
+
+Counts move by whole steps, so conservation stays exact. Only timing is approximated.
+
+**Question:** SPEC.md's scheduling section keeps "an approximation, which carries its own error contract" apart from
+a model's law. τ-leaping is such an approximation, and it needs a kernel-recognizable property of rules (affinity in
+counts) and an operation applying k firings. Is "affine in its counts" a declared property of a rule, checked by
+admission, and `fire[k]` an operation the kernel offers for such rules, with the leap's error contract (ε, critical
+threshold) a policy value in the run part?
+
+### F47. Where only values change, occurrences stand: work out rates, do not search
+
+**Came up:** in a cell, hundreds of occurrences read shared pools: every ribosome at work, every protein that could
+be turned over, every gene. A leap changes only counts, yet incremental discovery treated each changed pool as a
+structural change. It dropped and re-searched every occurrence meeting it, about 100 µs each, a thousand per leap.
+
+**Kaleidoscope:** `Discovery.advanceValues(world, before, t, hosts)`. When a change is only to values (counts moved
+in place, identities kept, nothing made, moved or broken), a rule whose occurrences cannot depend on values keeps
+every occurrence, and their rates are worked out again. Such a rule has no guard, no negative and no literal value
+in its redex. If a rule that does depend on values could meet a changed node, the full update runs. Affine rules
+fired one at a time take the same path. The proof is `test/world.test.ts`: after every leap, the live spots, rates
+included, are a full search's. On Boundary's cell, a simulated second went from 246 s to 2 s of wall time. The
+trajectory was identical event for event, which the exactness requires.
+
+**Modelling consequence (Boundary):** a guard that reads a pool makes every occurrence of its rule depend on that
+pool's values. Writing the condition into the rate (`rate = if[enough … k 0.0]`) instead keeps the occurrence
+standing, and the rule's effect is the same: a spot whose rate is zero does not fire.
+
+**Question:** the spec separates a rule's guard (whether it meets) from its rate (the policy's weight). The
+distinction has a cost model: guards are part of matching and rates are not. Should the spec say so, and should a
+modelling guide prefer rate factors over guards where a condition reads a quantity that changes often?
+
+### F48. Two links made one in a reaction
+
+**Came up (lotus, 2026-10-13):** porting lotus's operations world, interaction combinators under conservation
+(`~/code/lotus/v004`). When a γγ or δδ pair annihilates, the auxiliary links of the two agents must become one:
+whatever was on the first agent's `l` is joined to whatever was on the second's `l`, and likewise for `r`. This is
+the core of interaction-net reduction.
+
+**Spec:** a rule's redex and reactum share one outer face, so two outer names of the redex stay two names. A reactum
+can re-point a matched node's port, but it cannot say "u and w are now one link". That holds for standard bigraphical
+reactive systems too. A DPO rule with a non-injective right morphism can merge, and so can a reactum composed with a
+substitution.
+
+**Lotus:** annihilation leaves a `Join[a = ~u | b = ~w]` node, which has no mass and no energy. Fast rules splice it
+out: the neighbour on `u` has its port re-pointed to `w`. Because a neighbour must be matched by type and port (F49),
+that takes one rule per (type, port) a neighbour can be on, for each side: 22 splice rules, plus one for a Join
+closed on itself and one for a Join between two free ports. Generated by `lotus/v004/tools/gen_ops.py`. Correct, and
+it keeps the books exact. The same need arises when a wire is contracted or any structure is cut out of a chain.
+
+**Question:** is there a reactum form identifying two outer names: a linear substitution `u/w` composed with the
+reactum, or a reactum outer face that is a quotient of the redex's? If not, is "a Join and its splices" the idiom the
+spec recommends, and should the suite carry a case for it?
+
+### F49. A bond matched whatever ports its ends are on
+
+**Came up (lotus, 2026-10-13):** thermal detachment. Any bond lets go at a rate, whatever the types and ports at its
+two ends. In ys (spec1) lotus wrote it once, matching two generic nodes and testing that they share a link
+(`term.links` in a `where`). That was correct but quadratic, at 60–80 s CPU for a small world.
+
+**Spec / kaleidoscope:** a pattern binds a link only at a named port of a named type (F37 for supertypes), so "the
+two ends of link u, whatever they are" has no pattern.
+
+**Lotus:** one detach rule per unordered pair of end kinds. With 8 kinds (γ and δ on p, l or r, ε on p, a Cap) that
+is 36 rules, plus 22 splices (F48). The whole O2 world runs about 50× faster than in ys, so the cost is not in
+running. It is in the text: a change to the elements means regenerating.
+
+**Question:** could a redex name an edge rather than its ends? For example, `~u` with two points of any type and any
+port, `(?a = Node[?q = ~u] | ?b = Node[?q2 = ~u])`, with the port as a variable. Link-directed matching (F27) would
+make that cheap, and it is the natural form of any law about bonds as such: breaking, energy per bond, a bond's age.
+
+### F50. A model's books cannot be stated in the program
+
+**Came up (lotus, 2026-10-13):** every lotus witness asserts its books: mass (agents plus stock) and energy (bonds,
+activations, sun, quanta, heat) constant. In spec1 that was an `Assert` computed in the program from folds over the
+state. In v004 there is no `Assert`, `Fold` or `def`, so the books live in TypeScript (`lotus/v004/src/observe.ts`),
+as boundary's do (`cell/src/observe.ts`). The same holds for the outcome of every one of lotus's 20 requirements in
+`conformance/inherited/lotus/`.
+
+**Question:** the suite's outcome format ("every `Assert` holds at the horizon") needs a way to state an invariant
+over a whole state in the language. That means a sum over all nodes of a type, a count of edges with a property,
+and a comparison with the initial state. Is that the planned observation axis (traces as data, G11), and until it
+exists, how should a downstream state its outcomes so the suite can judge them?
+
+### F51. A piecewise-deterministic policy: count rules integrated as a flow, structure jumping exactly
+
+**Came up (Boundary, 2026-10-13):** the faithful Syn3A metabolism (Thornburg et al. 2022: 171 reactions, 272 rules
+of reversible Michaelis–Menten and convenience kinetics) is stiff. Its fastest reactions (PGK, PYK, triose and
+hexose isomerases) fire 10^5–10^6 times a simulated second over pools of a few hundred molecules. Exact simulation
+and τ-leaping (F46) both stall on them. Hybrid leaping keeps them critical and fires them one at a time. The
+published model is itself hybrid: CME for expression, ODE for metabolism (CME-ODE). That is a piecewise-deterministic
+Markov process (PDMP), the same split as JumpProcesses.jl's `VariableRateJump` over an ODE.
+
+**Kaleidoscope plus Boundary:** a rule is continuous when it is affine in counts (F46) and has no guard and no
+negative. Its occurrences become reactions in extent space. Everything else jumps exactly.
+- **Integrator:** ROS2 Rosenbrock, L-stable, with an embedded linearly-implicit Euler error estimate. It integrates
+  the extents, with species y = y₀ + S·extent and a finite-difference Jacobian restricted to the sites a rate reads.
+- **Realization:** the whole part of each extent is realized as firings through `World.applyRepeated`. Along a
+  pathway one reaction's products feed the next reaction's reactants, so realization runs in passes over a working
+  copy of the counts. A reaction is limited only by its own reactants. What does not fit stays pending.
+- **Why this matters:** counts move only by whole firings, so conservation is exact, as under exact simulation.
+- **Jumps:** a discrete event fires when the integrated discrete hazard reaches an Exp(1) draw. The flow then takes
+  its count changes and is rebuilt over the new graph.
+- **Result:** on the whole organism (421 rules: metabolism, expression, turnover), 85 simulated seconds take
+  85 s of wall time: 3,000 flow steps standing for 7.7×10^7 firings, with carbon and phosphorus books exact
+  throughout. Under exact SSA the same metabolism could not pass a second. `test/flow.test.ts` (Boundary) checks
+  three things:
+  - a reversible pair reaches its equilibrium with exact conservation, in < 1% as many steps as firings;
+  - a discrete process reading a flowing pool produces events at the rate the analytic ∫ a(t) dt says, within
+    4 standard errors over 6 seeds;
+  - native compiled rates equal `evaluate` to 1e-12 on every affine rule of the organism.
+
+**Engine support added:**
+- **`Discovery.all(g)`:** every spot, rated zero or not. A flow must integrate a reaction whose rate is zero now but
+  can rise. `live` drops such spots, and a flow built from `live` silently leaves reactions out.
+- **`advanceValues(…, unrated)`:** a policy that works some rules' rates out itself (here, on the flow's real-valued
+  state) asks discovery to keep their occurrences and skip their rates. Discovery then pays only for the jumps' rates.
+- **Rates outside the graph:** the flow evaluates a rule's rate expression on a real-valued state vector, not on the
+  graph. Boundary compiles `Expr` to a native function (`cell/src/native.ts`), where each site reads either a species
+  index or a fixed graph value. Whole-number `/` stays integer division. Through `evaluate`, environment allocation
+  dominated the Jacobian.
+
+**Known limit:** the discrete hazard is held at its value from the start of each flow step (first order in h). Step
+control bounds the error, but an exact PDMP integrates the hazard alongside the flow, as one more ODE component.
+
+**Questions:**
+1. SPEC.md's scheduling section allows "an approximation, which carries its own error contract". Is a PDMP split a
+   policy the run part can name? It would need:
+   - the continuous set: affine, unguarded, no negatives;
+   - an integrator and tolerance;
+   - whole-firing realization as the conservation rule.
+2. Is "a rate expression is a pure function of its sites' values" a stated property, so that an implementation may
+   evaluate rates off-graph and compile them?
+3. Should the suite carry a PDMP case? An outline:
+   - a reversible pair at equilibrium, plus a jump channel reading the flowing pool;
+   - outcome: the jump count's mean within a stated tolerance of the analytic integral, and books exact at every
+     observation.
+
+### F52. A value rewritten where it stands: structure and value told apart in a transition
+
+**Came up (Boundary, 2026-10-13):** most discrete events in the cell also spend from a shared pool. A protein finished
+takes charged tRNAs and GTP from the cell's pools. A transcript broken returns its nucleotides. The transition
+reported that pool as changed in two ways:
+- the pool node itself, as kept;
+- each count the reactum wrote (`Metabolites[gtp = ?g - 2 * ?l - 2]`), as a scalar removed and a fresh one created
+  (`apply_spec` taken literally).
+
+Incremental discovery then dropped and searched again every occurrence meeting the pool. That is the whole
+metabolism, 272 rules, at about 50 ms an event: half the organism's run time. F47's value-only path did not apply,
+because the same reaction also makes or removes nodes.
+
+**Kaleidoscope (performance only, no change to what a reaction does):**
+1. **`World.apply(…, { inPlace: true })`, opt-in.** A value the reactum writes at a key of a node it keeps, where
+   the redex held a lone scalar at that key in a site it drops, is written into that scalar where it stands.
+   - The identity `react` would mint is used up all the same, so every other identity is react's.
+   - The transition lists such scalars as `revalued` (also in `kept`).
+   - `applyRepeated` (F46) now reports its counts as `revalued` too.
+   - Proof, `test/world.test.ts` ("values written in place"), for every library system and the pools program:
+     - after every step, the state is `react`'s, the same carrier once each revalued scalar is identified with
+       react's fresh one at the same holder and key;
+     - incremental discovery over it is a full search.
+2. **`Discovery.update`.** A kept node that stands as it stood (type, place, key, links and value) is no longer
+   "changed". What it holds that changed is changed itself, and makes it affected.
+   - A revalued scalar re-rates what meets its holder, unless a rule that depends on values could meet either.
+   - `advanceWorld(…, unrated)` leaves a flow's own rules for the flow to rate (as `advanceValues`, F51).
+3. **Three latent gaps, found by the full-search proofs once kept nodes stopped being over-reported.** Each had been
+   masked by the over-reporting, and each is fixed:
+   - The holder walk stopped at a node already reached in the other state, so a moved node's new holders were never
+     visited (the lac operon's `repress`).
+   - A rule with one passive rest site skipped re-search from a holder whose attribute changed. Dropping already
+     told attributes apart; finding again did not (the embryo's clock).
+   - A rule reading across links (`?ps.x`) missed a neighbour whose attributes changed (the embryo's `settle`).
+
+**Results:**
+- **Benchmark:** the embryo goes from 4.1 to 2.7 ms a step, and from 17 to 11 searches a step. The rest is within
+  noise. The suite is 95/95.
+- **Boundary:** 10 simulated seconds of the whole organism took 25 s of wall time and now take 3.5 s.
+  - Discovery's share fell from 49% to 7%.
+  - The rest came from Boundary's own scheduler, without engine changes:
+    - the flow is kept across events that leave its reactions as they were;
+    - compiled rates take their constants as parameters;
+    - the flow's linear systems use a sparse LU with a static Markowitz order (KPP's method), every solve checked by
+      its backward error, with dense pivoting as the fallback.
+
+**Questions:**
+1. **Identity of a rewritten value.** Does `n = ?n + 1` make a fresh scalar node, or rewrite the one standing at
+   `n`? `apply_spec` mints a fresh one.
+   - An attribute scalar has no ports and holds nothing, so its identity is observable only through identity
+     counters.
+   - May an implementation keep it? Is trajectory equivalence then "up to the identities of rewritten scalars"
+     (as `applyRepeated` already assumes, F46)?
+2. **Structure and value in a transition.** Should a transition distinguish a structural change from a value change
+   (here, `revalued`)? `discover_local` could then state its obligation separately for each: occurrences meeting a
+   node whose values alone changed stand, and are only re-rated where no value-dependent rule meets them.
+3. **A suite case.** One reaction that both creates a node and spends from a shared pool, beside many value-free
+   rules on that pool.
+   - **Outcome:** incremental discovery equals full search after every step.
+   - A case where a kept node's holder changes (a move into a kept container) and one where only a kept node's
+     attribute changes, under a rule with a passive rest site. Those were the two places the obligation was easy to
+     get wrong.

@@ -99,6 +99,21 @@ export const FUNCTIONS: Record<string, [number, number]> = {
 };
 export const BINARY = ['or', 'and', '==', '!=', '<', '<=', '>', '>=', '++', '+', '-', '*', '/', '%'];
 
+/**
+ * Native operations, registered by a program's host (PROVISIONAL; wyrm's ask, "folds over a node's links"): a name the
+ * reader accepts as a call, answered by host code given the call's arguments unevaluated, the occurrence's `Env` (so a
+ * rest of points can be folded: `env.far`, `env.attr`) and a way to evaluate an argument. A native given a rest reads
+ * across links (`readsAcross`), as `sum` does. Its answer is a value like any other; it should be a pure function of
+ * what it reads, and it may memoise per `Env` (a state does not change while an occurrence is evaluated).
+ */
+export type Native = (args: Expr[], env: Env, value: (e: Expr) => number | string | boolean) => number | string | boolean;
+export const NATIVE = new Map<string, Native>();
+export function registerNative(name: string, arity: [number, number], fn: Native) {
+  if (name in FUNCTIONS && !NATIVE.has(name)) throw new EvalError(`${name} is an operation already`);
+  FUNCTIONS[name] = arity;
+  NATIVE.set(name, fn);
+}
+
 /** An expression compiled: a closure per node of it, built once (expressions are evaluated constantly). */
 type Compiled = (env: Env) => V;
 const compiledCache = new WeakMap<Expr, Compiled>();
@@ -171,6 +186,10 @@ function compileExpr(e: Expr): Compiled {
   } else if (e.op === 'count' && 'rest' in e.args[0]) {
     const r = e.args[0].rest;
     f = (env) => env.points?.(r) ?? 0;
+  } else if (NATIVE.has(e.op)) {
+    const fn = NATIVE.get(e.op)!;
+    const args = e.args;
+    f = (env) => fn(args, env, (x) => value(x, env));
   } else {
     const op = e.op;
     const a = e.args.map(compileExpr);
@@ -195,6 +214,17 @@ function compileExpr(e: Expr): Compiled {
       case 'max': f = (env) => Math.max(num(a[0](env), op), num(a[1](env), op)); break;
       case 'min': f = (env) => Math.min(num(a[0](env), op), num(a[1](env), op)); break;
       case 'clamp': f = (env) => Math.min(Math.max(num(a[0](env), op), num(a[1](env), op)), num(a[2](env), op)); break;
+      case '/': {
+        // division compiled too (it is in most rate laws): a whole number where both sides are, as `interpret` says
+        const [ea, eb] = e.args;
+        f = (env) => {
+          const p = num(a[0](env), op), q = num(a[1](env), op);
+          if (q === 0) throw new EvalError('division by zero');
+          // (a fractional side is no whole number: no need to ask the kinds)
+          return Number.isInteger(p) && Number.isInteger(q) && isInt(ea, env) && isInt(eb, env) ? Math.floor(p / q) : p / q;
+        };
+        break;
+      }
       // the rest (division's whole-number rule, count, text) as written below
       default: f = (env) => interpret(e, env);
     }
@@ -314,5 +344,6 @@ export function sitesOf(e: Expr): number[] {
 export function readsAcross(e: Expr | undefined): boolean {
   if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e) return false;
   if ('restAttr' in e) return true;
+  if (NATIVE.has(e.op) && e.args.some((a) => 'rest' in a)) return true;
   return e.args.some(readsAcross);
 }

@@ -16,10 +16,11 @@
  * The spec's `discover_local` asks this of an implementation; the tests hold it to the full search.
  */
 
-import { type Carrier, type Id, Index, isAttr, keyed, memberKey, scalarKey } from './carrier';
+import { type Carrier, type Id, Index, isAttr, keyed, memberKey, parentKey, scalarKey } from './carrier';
 import { evaluate, readsAcross, sitesOf } from './expr';
 import { type Occurrence, discover, siteEnv, spotKey } from './match';
 import type { Transition } from './react';
+import type { View, World } from './world';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
 
@@ -27,6 +28,8 @@ export interface LiveSpot {
   rule: Rule;
   occurrences: Occurrence[];
   rate: number;
+  /** Its spot (`spotKey`), worked out once: what a policy orders spots by without working it out again. */
+  key?: string;
 }
 
 /** An occurrence's identity: its rule, and where it sends each redex node and edge (in the redex's order, whatever order it was found in). */
@@ -83,6 +86,12 @@ export class Discovery {
   private readonly lazy: (Set<number> | null)[];
   /** Rules whose expressions read the far ends of a rest of points (`?ps.x`): a change there is a change to them. */
   private readonly across: boolean[];
+  /**
+   * Rules whose occurrences do not depend on values: no guard, no negative, no literal value in the redex. Where
+   * only values change (a count moves, nothing is made, moved or broken), such a rule's occurrences all stand, and
+   * only their rates need working out again.
+   */
+  private readonly valueFree: boolean[];
 
   constructor(
     readonly rules: Rule[],
@@ -91,6 +100,51 @@ export class Discovery {
     this.isLocal = rules.map(local);
     this.lazy = rules.map(lazySites);
     this.across = rules.map((r) => [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(readsAcross));
+    this.valueFree = rules.map((r, i) => !r.guard && !r.negatives.length && !this.across[i] && !r.redex.nodes.some((n) => typeof n.payload === 'object'));
+  }
+
+  /** Whether a rule that is not value-free could meet a node of this type: then a change to its values may change it. */
+  private sensitiveTo = new Map<Id, boolean>();
+  private sensitive(type: Id): boolean {
+    let v = this.sensitiveTo.get(type);
+    if (v === undefined) {
+      v = this.rules.some((r, i) => !this.valueFree[i] && r.redex.nodes.some((pn) => this.sig.sub(type, pn.type)));
+      this.sensitiveTo.set(type, v);
+    }
+    return v;
+  }
+
+  /**
+   * A world whose only change since the last step is to values: counts at the nodes `hosts` hold, moved in place
+   * with their identities kept (`World.applyRepeated`). Where no rule that depends on values can meet those nodes,
+   * every occurrence stands, and the rates of those meeting them are worked out again: work in proportion to what
+   * reads the change, not a search. Otherwise, the full update. Rules in `unrated` keep their occurrences but not their
+   * rates current: for a policy that does not read those rates (a flow working them out itself).
+   */
+  advanceValues(world: World, before: View, t: Transition, hosts: Id[], unrated?: Set<Rule>) {
+    if (world.g !== this.state) return this.rebuild(world.g);
+    const ix = world.ix;
+    if (hosts.some((h) => this.sensitive(ix.node.get(h)!.type))) return this.update(before, ix, world.g, t);
+    const done = new Set<string>();
+    for (const h of hosts)
+      for (const k of this.byNode.get(h) ?? []) {
+        const v = this.occs.get(k);
+        if (!v || done.has(v.spot)) continue;
+        done.add(v.spot);
+        // a policy that works these rules' rates out itself (a flow integrating them) asks that they be left as they were
+        if (unrated?.has(v.rule)) continue;
+        const spot = this.spots.get(v.spot)!;
+        spot.rate = this.rateOf(spot.rule, spot.occurrences[0], ix);
+      }
+  }
+
+  private rateOf(rule: Rule, o: Occurrence, ix: Index): number {
+    if (!rule.rateExpr) return rule.rate ?? 1;
+    try {
+      return (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig, o.rests), 'float') as { float: number }).float;
+    } catch {
+      return 0;
+    }
   }
 
   /** An occurrence as it stands now: where its rule's site contents may be stale, found again, from its nodes. */
@@ -106,19 +160,39 @@ export class Discovery {
     return [...this.spots.values()].filter((s) => s.rate > 0 && Number.isFinite(s.rate));
   }
 
+  /** Every spot in `g`, live or not (a rate of zero now): what a policy integrating rules needs, as a rate can rise. */
+  all(g: Carrier): LiveSpot[] {
+    if (g !== this.state) this.rebuild(g);
+    return [...this.spots.values()];
+  }
+
   private rebuild(g: Carrier) {
     this.occs.clear();
     this.spots.clear();
     this.byNode.clear();
     this.state = g;
     const ix = Index.of(g);
-    for (const rule of this.rules) for (const o of discover(g, rule, this.sig, { index: ix })) this.add(o, rule, ix);
+    this.rules.forEach((rule, i) => {
+      for (const o of discover(g, rule, this.sig, { index: ix, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, ix);
+    });
   }
 
   /** `g` became `next` by `t`: keep what still holds, find what is new. */
   advance(g: Carrier, next: Carrier, t: Transition) {
     if (g !== this.state) return this.rebuild(next);
-    const before = Index.of(g), after = Index.of(next);
+    this.update(Index.of(g), Index.of(next), next, t);
+  }
+
+  /**
+   * A world changed in place by `t`; `before` is what it could have changed, as it stood. Rules in `unrated` keep
+   * their rates as they were where only values changed (as `advanceValues`).
+   */
+  advanceWorld(world: World, before: View, t: Transition, unrated?: Set<Rule>) {
+    if (world.g !== this.state) return this.rebuild(world.g);
+    this.update(before, world.ix, world.g, t, unrated);
+  }
+
+  private update(before: View, after: Index, next: Carrier, t: Transition, unrated?: Set<Rule>) {
 
     // what changed; and where its links changed, what shares a link with it, before and after
     const changed = new Set<Id>([...t.removed, ...t.created, ...t.moved, ...t.kept, ...t.copied.map(([, c]) => c), ...t.occurrence.nodes.map(([, s]) => s)]);
@@ -129,6 +203,32 @@ export class Discovery {
       const a = before.node.get(id), b = after.node.get(id);
       if ((a?.ports.length || b?.ports.length) && portsOf(a) !== portsOf(b)) relinked.add(id);
     }
+    // what stood still: a node kept where it stood, as it stood (its type, place, key, links and value), changed in
+    // nothing but perhaps what it holds, does not change what meets it, since whatever it holds that changed is
+    // changed itself (and makes it affected, below). A scalar whose value only was rewritten where it stood
+    // (`revalued`) changes only the rates of what meets its holder, where no rule that depends on values could meet
+    // either.
+    const gone = new Set(t.removed);
+    const revalued = new Set(t.revalued ?? []);
+    const rerate = new Set<Id>();
+    for (const id of [...changed]) {
+      if (gone.has(id) || relinked.has(id)) continue;
+      const a = before.node.get(id), b = after.node.get(id);
+      if (!a || !b) continue;
+      if (revalued.has(id)) {
+        const host = 'node' in b.parent ? after.node.get(b.parent.node) : undefined;
+        if (!host || this.sensitive(host.type) || this.sensitive(b.type) || (host.ports.length && this.across.some(Boolean))) continue;
+        changed.delete(id);
+        rerate.add(host.id);
+        continue;
+      }
+      if (a === b && typeof b.payload === 'object') continue;
+      if (a.type !== b.type || parentKey(a.parent) !== parentKey(b.parent) || memberKey(a.member) !== memberKey(b.member) || portsOf(a) !== portsOf(b)) continue;
+      if (typeof a.payload === 'object' || typeof b.payload === 'object') {
+        if (typeof a.payload !== 'object' || typeof b.payload !== 'object' || scalarKey(a.payload.scalar) !== scalarKey(b.payload.scalar)) continue;
+      } else if (a.payload !== b.payload) continue;
+      changed.delete(id);
+    }
     for (const ix of [before, after])
       for (const id of relinked) {
         changed.add(id);
@@ -137,33 +237,46 @@ export class Discovery {
         for (const grp of n.ports) for (const [, pt] of grp.points) for (const p of ix.pointsOn(pt.target)) changed.add(p.node);
       }
     // and everything that holds it
+    // (walked in each state on its own: a node that moved has different holders before and after)
     const affected = new Set<Id>();
-    for (const ix of [before, after])
+    for (const ix of [before, after]) {
+      const walked = new Set<Id>();
       for (const id of changed) {
         let n = ix.node.get(id);
-        while (n && !affected.has(n.id)) {
+        while (n && !walked.has(n.id)) {
+          walked.add(n.id);
           affected.add(n.id);
           n = 'node' in n.parent ? ix.node.get(n.parent.node) : undefined;
         }
         if (!ix.node.get(id)) affected.add(id);
       }
+    }
 
     // what is linked to a changed node: a rule reading across links (`?ps.x`) reads them
+    // (and to a node whose attributes changed: what is read across a link is an attribute)
     const linked = new Set<Id>();
     if (this.across.some(Boolean))
       for (const ix of [before, after])
-        for (const id of changed) {
+        for (const id of [...changed, ...[...changed].flatMap((c) => {
+          const n = ix.node.get(c);
+          return n && 'node' in n.parent && isAttr(n.member) ? [n.parent.node] : [];
+        })]) {
           const n = ix.node.get(id);
           if (!n) continue;
           for (const grp of n.ports) for (const [, pt] of grp.points) for (const p of ix.pointsOn(pt.target)) if (!changed.has(p.node)) linked.add(p.node);
         }
 
-    // the changed nodes and their parents, before and after: where a lazy rule's new occurrences can be
+    // the changed nodes and their parents, before and after: where a lazy rule's new occurrences can be; and the
+    // parents whose attributes changed (a change no site absorbs)
     const near = new Set<Id>(changed);
+    const attrsChanged = new Set<Id>();
     for (const ix of [before, after])
       for (const c of changed) {
         const n = ix.node.get(c);
-        if (n && 'node' in n.parent) near.add(n.parent.node);
+        if (n && 'node' in n.parent) {
+          near.add(n.parent.node);
+          if (isAttr(n.member)) attrsChanged.add(n.parent.node);
+        }
       }
     // let go of what met them: for most rules, whatever met a changed node or anything holding one; for a rule
     // whose site contents may go stale, only what met a changed node, or met its parent where a change there
@@ -210,7 +323,7 @@ export class Discovery {
     // find again: anchored at each affected node, for each redex node it could be
     this.rules.forEach((rule, i) => {
       if (whole[i]) {
-        for (const o of discover(next, rule, this.sig, { index: after })) this.add(o, rule, after);
+        for (const o of discover(next, rule, this.sig, { index: after, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, after);
         return;
       }
       const anchors = this.across[i] ? new Set([...(this.lazy[i] ? near : affected), ...linked]) : this.lazy[i] ? near : affected;
@@ -226,12 +339,22 @@ export class Discovery {
           if (parentAnchored && !('region' in pn.parent)) continue;
           if (!this.literalsAgree(rule, pn.id, after, id)) continue;
           // a parent anchored where its redex node has its one site: a change among what it holds is that site's,
-          // so nothing new meets there
-          if (lz && lz.has(pn.id) && !changed.has(id)) continue;
-          for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id } })) this.add(o, rule, after);
+          // so nothing new meets there (but a change to its attributes is no site's)
+          if (lz && lz.has(pn.id) && !changed.has(id) && !attrsChanged.has(id)) continue;
+          for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id }, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, after);
         }
       }
     });
+    // where only values changed, what stands is rated again
+    const done = new Set<string>();
+    for (const h of rerate)
+      for (const k of this.byNode.get(h) ?? []) {
+        const v = this.occs.get(k);
+        if (!v || done.has(v.spot) || unrated?.has(v.rule)) continue;
+        done.add(v.spot);
+        const spot = this.spots.get(v.spot);
+        if (spot) spot.rate = this.rateOf(spot.rule, spot.occurrences[0], after);
+      }
   }
 
   /** Each redex node's literal attributes (`founder = "ab"`): what an anchor must have to be worth a search. */
@@ -264,15 +387,7 @@ export class Discovery {
     for (const [, s] of o.nodes) (this.byNode.get(s) ?? this.byNode.set(s, new Set()).get(s)!).add(k);
     let spot = this.spots.get(sk);
     if (!spot) {
-      let rate = rule.rate ?? 1;
-      if (rule.rateExpr) {
-        try {
-          rate = (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig, o.rests), 'float') as { float: number }).float;
-        } catch {
-          rate = 0;
-        }
-      }
-      spot = { rule, occurrences: [], rate, keys: new Set() };
+      spot = { rule, occurrences: [], rate: this.rateOf(rule, o, ix), keys: new Set(), key: sk };
       this.spots.set(sk, spot);
     }
     spot.occurrences.push(o);

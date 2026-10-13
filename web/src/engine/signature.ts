@@ -8,7 +8,7 @@
  * (the spec's type body: ports and attributes in `[]`), and how they look (`style`, the editor's own).
  */
 
-import type { Id } from './carrier';
+import type { Id, Scalar } from './carrier';
 
 export type Kind = 'composite' | 'int' | 'float' | 'text' | 'bool' | 'link' | 'place';
 
@@ -23,6 +23,8 @@ export interface PortDecl {
 export interface AttrDecl {
   key: string;
   type: Id;
+  /** `k :: T = v`: what a node made without it holds (spec `types.defaults`; constants only here). */
+  dflt?: Scalar;
 }
 
 export interface TypeDecl {
@@ -41,8 +43,8 @@ export interface TypeSpec {
   supers?: string[];
   /** Port group key → contract name (one point), or [contract name, arity]. */
   ports?: Record<string, string | [string, number]>;
-  /** Attribute key → type name. */
-  attrs?: Record<string, string>;
+  /** Attribute key → type name, or the type and its default. */
+  attrs?: Record<string, string | { type: string; dflt?: Scalar }>;
   style?: Record<string, unknown>;
 }
 
@@ -53,6 +55,7 @@ export class Signature {
   private byName = new Map<string, TypeDecl>();
   private byId = new Map<Id, TypeDecl>();
   private upCache = new Map<Id, Set<Id>>();
+  private downCache = new Map<Id, Id[]>();
 
   constructor() {
     this.declare('Place', { kind: 'place' });
@@ -90,9 +93,12 @@ export class Signature {
       const [contract, arity] = typeof c === 'string' ? [c, 1] : c;
       return { key, contract: this.id(contract), arity };
     });
-    t.attrs = Object.entries(spec.attrs ?? {}).map(([key, ty]) => ({ key, type: this.id(ty) }));
+    t.attrs = Object.entries(spec.attrs ?? {}).map(([key, ty]) =>
+      typeof ty === 'string' ? { key, type: this.id(ty) } : { key, type: this.id(ty.type), ...(ty.dflt ? { dflt: ty.dflt } : {}) },
+    );
     if (spec.style) t.style = spec.style;
     this.upCache.clear();
+    this.downCache.clear();
     return t;
   }
 
@@ -125,6 +131,13 @@ export class Signature {
     while (stack.length) for (const sup of this.byId.get(stack.pop()!)?.supers ?? []) if (!s.has(sup)) (s.add(sup), stack.push(sup));
     this.upCache.set(a, s);
     return s;
+  }
+
+  /** Every type within `b` (`b` itself included), in declaration order: what a pattern of type `b` can meet. */
+  downs(b: Id): Id[] {
+    let d = this.downCache.get(b);
+    if (!d) this.downCache.set(b, (d = this.types.filter((t) => this.sub(t.id, b)).map((t) => t.id)));
+    return d;
   }
 
   /** `a ≤ b`. */

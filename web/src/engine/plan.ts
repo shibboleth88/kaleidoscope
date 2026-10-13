@@ -64,6 +64,8 @@ interface Step {
   parent: number;
   region: number;
   member: string;
+  /** Whether it stands at a key: then its parent's child at that key is its one candidate. */
+  keyed: boolean;
   payload: string;
   ports: GroupPlan[];
   /** A point on a link some earlier step binds: candidates are the nodes on it. */
@@ -149,6 +151,7 @@ function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan
       parent: 'node' in n.parent ? stepOf.get(n.parent.node)! : NONE,
       region,
       member: memberKey(n.member),
+      keyed: keyed(n.member),
       payload: payloadKey(n),
       ports,
       via,
@@ -192,6 +195,12 @@ export function runPlan(
   seed?: Map<Id, Id>,
   seedEdges?: Map<Id, Id>,
   places0?: (Parent | undefined)[],
+  /**
+   * Redex nodes whose one anonymous site nothing reads (`lazySites`): what that site holds is left unworked (an empty
+   * list), to be found when the occurrence is used (`Discovery.fresh`). Ignored where the redex has closed edges, whose
+   * check reads what sites hold.
+   */
+  lazy?: Set<Id>,
 ): void {
   const plan = planFor(pattern, seed?.size ? new Set(seed.keys()) : null, sig);
   const { steps, edgeIds } = plan;
@@ -331,9 +340,20 @@ export function runPlan(
         return out;
       }
     }
-    if (st.parent !== NONE) return ix.children({ node: nodeOf[st.parent] });
+    // a keyed member is found by its key, not among all its siblings
+    if (st.parent !== NONE) {
+      if (st.keyed) {
+        const c = ix.childAt({ node: nodeOf[st.parent] }, st.member);
+        return c ? [c] : [];
+      }
+      return ix.children({ node: nodeOf[st.parent] });
+    }
     const place = places[st.region];
-    return place ? ix.children(place) : ix.g.nodes;
+    if (place && st.keyed) {
+      const c = ix.childAt(place, st.member);
+      return c ? [c] : [];
+    }
+    return place ? ix.children(place) : ix.ofType(sig.downs(st.pn.type));
   };
 
   const assign = (k: number): void => {
@@ -422,6 +442,8 @@ export function runPlan(
       if (!plan.holdsSite[k]) continue;
       const anon: number[] = [];
       plan.sites.forEach((s, i) => s.parent === k && s.key === null && anon.push(i));
+      // a lazy node's one site: whatever is left is its, worked out only when the occurrence is used
+      if (lazy && anon.length === 1 && !edgeIds.length && lazy.has(steps[k].pn.id)) continue;
       const rest: Id[] = [];
       for (const c of ix.children({ node: nodeOf[k] })) {
         if (used.has(c.id) || taken.has(c.id)) continue;

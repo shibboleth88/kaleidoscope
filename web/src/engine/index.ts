@@ -8,3 +8,5 @@ export * from './signature';
 export * from './text';
 export * from './expr';
 export * from './incremental';
+export * from './program';
+export * from './world';

@@ -70,7 +70,7 @@ function lex(src: string): Tok[] {
       const two = src.slice(i, i + 2);
       const prev = out[out.length - 1];
       const afterValue = !!prev && (['id', 'num', 'str', 'site', 'link'].includes(prev.t) || (prev.t === 'sym' && (prev.v === ')' || prev.v === ']')));
-      if (['||', '=>', '::', '==', '!=', '<=', '>=', '++'].includes(two)) push({ t: 'sym', v: two, nl, at }), (i += 2);
+      if (['||', '=>', '::', '==', '!=', '<=', '>=', '++', '<:'].includes(two)) push({ t: 'sym', v: two, nl, at }), (i += 2);
       else if (c === '-' && /[0-9]/.test(src[i + 1] ?? '') && !afterValue) {
         const m = /-\d+(\.\d+)?([eE][-+]?\d+)?/y;
         m.lastIndex = i;
@@ -318,6 +318,243 @@ class Parser {
     }
     return { k: 'term', head: t.v, attrs, body, at: t.at };
   }
+
+  // ── programs (v004 `Program(module = (…) | world = (…) | run = (…))`) ───────────────────────────────────────
+
+  /** Skip `|` and line breaks between a body's entries; true while there is another before `)` or the end. */
+  more(): boolean {
+    while (this.isSym('|')) this.next();
+    const t = this.peek();
+    return !(t.t === 'eof' || (t.t === 'sym' && t.v === ')'));
+  }
+
+  ident(what: string): string {
+    const t = this.next();
+    if (t.t !== 'id') throw new ReadError(`${what} must be a name, at ${t.at}`);
+    return t.v;
+  }
+
+  /** A type as written in a slot: a name, perhaps `* n` points (a port group's arity, kaleidoscope's). */
+  slotType(): { type: string; arity?: number } {
+    const type = this.ident('a slot\'s type');
+    if (this.isSym('*') && !this.peek().nl) {
+      this.next();
+      const n = this.peek();
+      if (n.t === 'num' && !n.nl) return this.next(), { type, arity: n.v };
+      return { type, arity: 0 };
+    }
+    return { type };
+  }
+
+  /** One entry of a type's binder or body: `<: S`, `~p :: T`, `in p :: T`, `out p :: T`, `k :: T`, `k :: T = v`. */
+  slot(into: TypeAst) {
+    if (this.isSym('<:')) {
+      this.next();
+      into.supers.push(this.ident('a supertype'));
+      return;
+    }
+    const t = this.peek();
+    if (t.t === 'link') {
+      this.next();
+      this.expect('::');
+      into.slots.push({ key: t.v, port: true, ...this.slotType() });
+      return;
+    }
+    if (t.t === 'id' && (t.v === 'in' || t.v === 'out') && this.peek(1).t === 'id' && this.isSym('::', 2)) {
+      this.next();
+      const key = this.ident('a port');
+      this.next();
+      into.slots.push({ key, port: true, direction: t.v, ...this.slotType() });
+      return;
+    }
+    const key = this.ident('a slot');
+    if (this.isSym('[')) throw new ReadError(`${key}[…]: methods in a type's body are not read yet, at ${t.at}`);
+    this.expect('::');
+    const st = this.slotType();
+    let dflt: Value | undefined;
+    if (this.isSym('=')) {
+      this.next();
+      dflt = this.value();
+    }
+    into.slots.push({ key, port: false, ...st, ...(dflt ? { dflt } : {}) });
+  }
+
+  /** A rule side: one term, or a place in brackets, regions joined by `||`. A line break ends it (decision g12). */
+  ruleSide(): Item[][] {
+    const one = (): Item[] => {
+      if (this.isSym('(')) {
+        this.next();
+        const items = this.place();
+        this.expect(')');
+        return items;
+      }
+      return [this.item()];
+    };
+    const regions = [one()];
+    while (this.isSym('||')) {
+      this.next();
+      regions.push(one());
+    }
+    return regions;
+  }
+
+  ruleBody(): RuleAst {
+    const lhs = this.ruleSide();
+    let guard: Value | null = null;
+    if (this.peek().t === 'id' && (this.peek() as { v: string }).v === 'where') {
+      this.next();
+      guard = this.value();
+    }
+    this.expect('=>');
+    const rhs = this.ruleSide();
+    const negs: Item[][][] = [];
+    while (this.peek().t === 'id' && (this.peek() as { v: string }).v === 'unless') {
+      this.next();
+      negs.push(this.ruleSide());
+    }
+    return { lhs, guard, rhs, negs };
+  }
+
+  /** A module's declarations, up to `)` or the end. */
+  declarations(into: ModuleAst) {
+    while (this.more()) {
+      const at = this.peek().at;
+      const name = this.ident('a declaration');
+      let attrs: Item[] = [];
+      let binder: TypeAst | null = null;
+      if (this.isSym('[')) {
+        // `T[slots] = Type(…)` or `rule[rate = …] = …`: which one is told by what follows `=`
+        const start = this.i;
+        this.next();
+        const typed = this.peek(1).t === 'sym' && (this.peek(1) as { v: string }).v === '::';
+        const linked = this.peek().t === 'link' || (this.peek().t === 'id' && ['in', 'out'].includes((this.peek() as { v: string }).v));
+        if (typed || linked) {
+          const held: TypeAst = { name, binder: [], supers: [], slots: [], attrs: [], at };
+          for (;;) {
+            while (this.isSym('|')) this.next();
+            if (this.isSym(']')) break;
+            this.slot(held);
+          }
+          this.expect(']');
+          binder = { name, binder: held.slots, supers: [], slots: [], attrs: [], at };
+        } else {
+          this.i = start;
+          this.next();
+          attrs = this.place();
+          this.expect(']');
+        }
+      }
+      this.expect('=');
+      const head = this.peek();
+      if (head.t === 'id' && head.v === 'Module' && this.isSym('[', 1)) {
+        this.next();
+        this.next();
+        const p = this.next();
+        if (p.t !== 'str') throw new ReadError(`Module["path"] names its module by a string, at ${p.at}`);
+        this.expect(']');
+        into.modules.push({ name, path: p.v, at });
+        continue;
+      }
+      if (head.t === 'id' && head.v === 'Type' && !this.isSym('=>', 1)) {
+        this.next();
+        const ty: TypeAst = binder ?? { name, binder: [], supers: [], slots: [], attrs: [], at };
+        if (this.isSym('[')) {
+          this.next();
+          ty.attrs = this.place();
+          this.expect(']');
+        }
+        if (this.isSym('(')) {
+          this.next();
+          while (this.more()) this.slot(ty);
+          this.expect(')');
+        }
+        into.types.push(ty);
+        continue;
+      }
+      if (binder) throw new ReadError(`${name}[…] = …: a declaration with slots is a type, at ${at}`);
+      const from = this.peek().at;
+      const rule = this.ruleBody();
+      into.rules.push({ name, attrs, rule, at, text: this.src.slice(from, this.peek().at).trim() });
+    }
+  }
+
+  src = '';
+}
+
+/** A type declared: `Name[binder] = Type[attrs](body)`. */
+export interface SlotAst {
+  key: string;
+  type: string;
+  /** A port (a link slot): `~p :: T`, `in p :: T`, `out p :: T`. */
+  port: boolean;
+  direction?: string;
+  /** Points in a port group (kaleidoscope's `* n`); 0 for any number. */
+  arity?: number;
+  /** `k :: T = v`: the slot's default (spec `types.defaults`). */
+  dflt?: Value;
+}
+export interface TypeAst {
+  name: string;
+  /** The slots in `[]`: attributes and ports. */
+  binder: SlotAst[];
+  supers: string[];
+  /** The slots in `()`: members (kaleidoscope reads them; a composite node holds anything). */
+  slots: SlotAst[];
+  /** `Type[…]`: the type's own attributes (here, how its instances look). */
+  attrs: Item[];
+  at: number;
+}
+/** A rule declared: `name = lhs where g => rhs unless n`, its node's attributes in `name[…]` (rate, label: gap G7). */
+export interface RuleDeclAst {
+  name: string;
+  attrs: Item[];
+  rule: RuleAst;
+  text: string;
+  at: number;
+}
+export interface ModuleAst {
+  types: TypeAst[];
+  rules: RuleDeclAst[];
+  modules: { name: string; path: string; at: number }[];
+}
+export interface ProgramAst extends ModuleAst {
+  world: Item[][];
+  run: Item[];
+}
+
+/** A module's text: its declarations, one after another. */
+export function parseModule(src: string): ModuleAst {
+  const p = new Parser(lex(src));
+  p.src = src;
+  const m: ModuleAst = { types: [], rules: [], modules: [] };
+  p.declarations(m);
+  if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
+  return m;
+}
+
+/** A program: `Program(module = (…) | world = (…) | run = (…))`, each part optional. */
+export function parseProgram(src: string): ProgramAst {
+  const p = new Parser(lex(src));
+  p.src = src;
+  const out: ProgramAst = { types: [], rules: [], modules: [], world: [[]], run: [] };
+  if (p.ident('a program') !== 'Program') throw new ReadError('a program is written Program(…)');
+  p.expect('(');
+  while (p.more()) {
+    const part = p.ident('a program\'s part');
+    p.expect('=');
+    p.expect('(');
+    if (part === 'module') p.declarations(out);
+    else if (part === 'world') {
+      const regions = [p.place()];
+      while (p.isSym('||')) p.next(), regions.push(p.place());
+      out.world = regions;
+    } else if (part === 'run') out.run = p.place();
+    else throw new ReadError(`a program's parts are module, world and run, not ${part}`);
+    p.expect(')');
+  }
+  p.expect(')');
+  if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
+  return out;
 }
 
 /** How tightly each operator binds. */
@@ -554,6 +791,11 @@ class Builder {
     }
     this.nodes.push({ id, type: decl.id, parent, member, payload: 'composite', ports });
     for (const it of attrItems) this.member(it, { node: id }, true, this.attrType(decl.attrs, it.key));
+    // an attribute left unwritten on a node made here (a state's, or a reactum's fresh one) holds its default
+    if (this.mode === 'state' || (this.mode === 'reactum' && named === null))
+      for (const a of decl.attrs)
+        if (a.dflt && !attrItems.some((it) => it.key && 'text' in it.key && it.key.text === a.key))
+          this.nodes.push({ id: this.ids.node++, type: a.type, parent: { node: id }, member: { attr: { text: a.key } }, payload: { scalar: a.dflt }, ports: [] });
     // an attribute left unwritten: in a redex, whatever it is (a site at its key); on a kept node in the
     // reactum, what it was (that same site)
     const keptHere = this.mode === 'reactum' && named !== null;
@@ -851,11 +1093,12 @@ export function print(g: Carrier, sig: Signature): string {
   const kidsOf = (p: Parent): Node[] =>
     [...ix.children(p)].sort((a, b) => (shapeOf(a) < shapeOf(b) ? -1 : shapeOf(a) > shapeOf(b) ? 1 : 0));
 
-  const node = (n: Node): string => {
+  /** A node; `slot`, the type its attribute slot declares, so a scalar of exactly that type is written bare. */
+  const node = (n: Node, slot?: Id): string => {
     const head = sig.name(n.type);
     if (typeof n.payload === 'object') {
       const lit = scalarText(n.payload.scalar);
-      return head === literalType(n.payload.scalar) ? lit : `${head}(${lit})`;
+      return head === literalType(n.payload.scalar) || n.type === slot ? lit : `${head}(${lit})`;
     }
     const kids = kidsOf({ node: n.id });
     const attrs = [
@@ -864,7 +1107,11 @@ export function print(g: Carrier, sig: Signature): string {
         (grp) =>
           `${keyText(grp.key)} = ${grp.points.length === 1 ? linkName(grp.points[0][1].target) : `(${grp.points.map(([, p]) => linkName(p.target)).join(' ')})`}`,
       ),
-      ...kids.filter((c) => isAttr(c.member)).map((c) => `${keyText(memberScalar(c.member)!)} = ${node(c)}`),
+      ...kids.filter((c) => isAttr(c.member)).map((c) => {
+        const k = memberScalar(c.member)!;
+        const slot = 'text' in k ? sig.get(n.type).attrs.find((a) => a.key === k.text)?.type : undefined;
+        return `${keyText(k)} = ${node(c, slot)}`;
+      }),
       ...sites(`n${n.id}`, true),
     ];
     const body = [...members(kids.filter((c) => !isAttr(c.member))), ...sites(`n${n.id}`, false)];

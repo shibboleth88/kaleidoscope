@@ -153,10 +153,16 @@ export class Index {
   readonly kids = new Map<string, Node[]>();
   /** The points on each handle. */
   readonly points = new Map<string, PointRef[]>();
+  /** Each node's place in `g.nodes`. */
+  readonly pos = new Map<Id, number>();
+  /** The nodes of each type (exactly), in `g.nodes` order: where a pattern's first root finds its candidates. */
+  readonly byType = new Map<Id, Node[]>();
 
   constructor(readonly g: Carrier) {
+    g.nodes.forEach((n, i) => this.pos.set(n.id, i));
     for (const n of g.nodes) {
       this.node.set(n.id, n);
+      (this.byType.get(n.type) ?? this.byType.set(n.type, []).get(n.type)!).push(n);
       const pk = parentKey(n.parent);
       (this.kids.get(pk) ?? this.kids.set(pk, []).get(pk)!).push(n);
       for (const grp of n.ports)
@@ -166,6 +172,14 @@ export class Index {
         }
     }
     for (const e of g.edges) this.edge.set(e.id, e);
+  }
+
+  /** The nodes of these types, in `g.nodes` order: a pattern's first root's candidates, by its type's `downs`. */
+  ofType(types: Id[]): readonly Node[] {
+    if (types.length === 1) return this.byType.get(types[0]) ?? [];
+    const out: Node[] = [];
+    for (const t of types) for (const n of this.byType.get(t) ?? []) out.push(n);
+    return out.sort((a, b) => this.pos.get(a.id)! - this.pos.get(b.id)!);
   }
 
   children(p: Parent): Node[] {
@@ -187,6 +201,15 @@ export class Index {
 
   pointsOn(h: Handle): PointRef[] {
     return this.points.get(handleKey(h)) ?? [];
+  }
+
+  /** A node joined or left its place (a world's in-place reaction): the place's map of keyed children follows. */
+  rekey(n: Node, present: boolean) {
+    if (!keyed(n.member)) return;
+    const m = this.keyedKids.get(parentKey(n.parent));
+    if (!m) return;
+    if (present) m.set(memberKey(n.member), n);
+    else if (m.get(memberKey(n.member))?.id === n.id) m.delete(memberKey(n.member));
   }
 
   /** Whether `id` stands within `ancestor` (itself included). */

@@ -64,6 +64,8 @@ export interface MatchOptions {
   anchor?: { pattern: Id; state: Id };
   /** An index of `g` already built. */
   index?: Index;
+  /** Redex nodes whose one anonymous site is left unworked (`runPlan`'s `lazy`). */
+  lazy?: Set<Id>;
 }
 
 interface Bound {
@@ -118,6 +120,7 @@ export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOpti
     seed,
     opts.seedEdges,
     places,
+    opts.lazy,
   );
   return found;
 }
