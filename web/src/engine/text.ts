@@ -292,6 +292,25 @@ class Parser {
       if (args.length < lo || args.length > hi) throw new ReadError(`${t.v} takes ${lo === hi ? lo : `${lo} or ${hi}`} value${hi > 1 ? 's' : ''}`);
       return { k: 'expr', op: t.v, args };
     }
+    // `?p.f[a b]`: a method call, `f[?p a b]`, the receiver first (SYNTAX §9)
+    if (t.t === 'site' && t.attr && this.isSym('[', 1) && !this.peek(1).nl) {
+      this.next();
+      this.next();
+      const args: Value[] = [{ k: 'site', name: t.v }];
+      while (!this.isSym(']')) {
+        if (this.isSym('|')) {
+          this.next();
+          continue;
+        }
+        if (this.peek().t === 'eof') throw new ReadError(`an unclosed ?${t.v}.${t.attr}[`);
+        args.push(this.value());
+      }
+      this.next();
+      if (!(t.attr in FUNCTIONS)) throw new ReadError(`?${t.v}.${t.attr}[…]: no operation ${t.attr}`);
+      const [lo, hi] = FUNCTIONS[t.attr];
+      if (args.length < lo || args.length > hi) throw new ReadError(`?${t.v}.${t.attr}[…] takes ${lo - 1}${hi > lo ? ` to ${hi - 1}` : ''} values`);
+      return { k: 'expr', op: t.attr, args };
+    }
     return this.atom();
   }
 
@@ -574,12 +593,14 @@ const KIND_TYPE: Record<ScalarKind, string> = { int: 'Int', float: 'Float', text
 const ZERO: Record<ScalarKind, Scalar> = { int: { int: 0 }, float: { float: 0 }, text: { text: '' }, bool: { bool: false } };
 
 /** An expression as the engine evaluates it: sites by their index in the redex. */
-function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> = new Set()): Expr {
+function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> = new Set(), named: Map<string, Id> | null = null): Expr {
   switch (v.k) {
     case 'lit':
       return { lit: v.v };
     case 'site': {
       if (rests.has(v.name)) return v.attr ? { restAttr: v.name, key: v.attr } : { rest: v.name };
+      // a node the redex names: a host method's receiver or argument
+      if (!v.attr && named?.has(v.name) && !sites?.has(v.name)) return { node: named.get(v.name)! };
       if (v.attr) throw new ReadError(`?${v.name}.${v.attr}: ?${v.name} is no rest of points`);
       if (!sites) throw new ReadError(`?${v.name}: a site is read only in a reactum or a guard`);
       const i = sites.get(v.name);
@@ -587,7 +608,7 @@ function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> 
       return { site: i };
     }
     case 'expr':
-      return { op: v.op, args: v.args.map((a) => toExpr(a, sites, rests)) };
+      return { op: v.op, args: v.args.map((a) => toExpr(a, sites, rests, named)) };
     case 'term':
       // a bare type name: what count[?x Type] counts
       if (!v.attrs.length && v.body === null) return { type: v.head };
@@ -614,6 +635,8 @@ class Builder {
   /** Rests of points this part names (each once), and in a reactum the redex's, which expressions fold over. */
   rests = new Set<string>();
   readRests: Set<string> | null = null;
+  /** In a reactum: the redex's named nodes, which host methods take. */
+  readNamed: Map<string, Id> | null = null;
   /** In a reactum: the scalar nodes whose values are computed. */
   computed: { node: Id; expr: Expr; kind: ScalarKind }[] = [];
   /** The item each site was read from (null for an unwritten attribute's). */
@@ -686,7 +709,7 @@ class Builder {
       const slotKind = slotType !== null && (kinds as string[]).includes(this.sig.get(slotType).kind) ? (this.sig.get(slotType).kind as ScalarKind) : null;
       if (this.mode === 'reactum') {
         // a value computed from what the redex's sites hold, when the rule fires
-        const expr = toExpr(v, this.readSites ?? new Map(), this.readRests ?? new Set());
+        const expr = toExpr(v, this.readSites ?? new Map(), this.readRests ?? new Set(), this.readNamed);
         const kind = slotKind ?? kindOf(expr);
         const type = slotType ?? this.sig.id(KIND_TYPE[kind]);
         this.source.set(this.ids.node, it);
@@ -922,8 +945,9 @@ export function buildRule(
   const reactum = new Builder(sig, 'reactum', ids, outer);
   reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
   reactum.readRests = redex.rests;
+  reactum.readNamed = redex.named;
   rhs.forEach((items, r) => reactum.region(items, r));
-  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests) : undefined;
+  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests, redex.named) : undefined;
   let rate: number | undefined;
   let rateExpr: Expr | undefined;
   if (typeof opts.rate === 'number') rate = opts.rate;
@@ -932,7 +956,7 @@ export function buildRule(
     if (Number.isFinite(n)) rate = n;
     else {
       try {
-        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites, redex.rests);
+        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites, redex.rests, redex.named);
       } catch (e) {
         throw new ReadError(`rate: ${(e as Error).message}`);
       }

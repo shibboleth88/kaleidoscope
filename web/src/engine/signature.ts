@@ -36,6 +36,11 @@ export interface TypeDecl {
   attrs: AttrDecl[];
   /** How instances look: the renderer's to read. Free-form, so it can grow without the engine knowing. */
   style?: Record<string, unknown>;
+  /**
+   * A host type (D-host-types-have-a-public-face; host.ts): its arms are the natives the named host package supplies,
+   * configured by the type's own attributes (`Type[host = "membrane" | …]`).
+   */
+  host?: { name: string; config: Record<string, number | string | boolean> };
 }
 
 export interface TypeSpec {
@@ -46,6 +51,7 @@ export interface TypeSpec {
   /** Attribute key → type name, or the type and its default. */
   attrs?: Record<string, string | { type: string; dflt?: Scalar }>;
   style?: Record<string, unknown>;
+  host?: { name: string; config: Record<string, number | string | boolean> };
 }
 
 export const BUILTIN = ['Place', 'Link', 'Int', 'Float', 'Text', 'Bool'] as const;
@@ -97,6 +103,7 @@ export class Signature {
       typeof ty === 'string' ? { key, type: this.id(ty) } : { key, type: this.id(ty.type), ...(ty.dflt ? { dflt: ty.dflt } : {}) },
     );
     if (spec.style) t.style = spec.style;
+    if (spec.host) t.host = spec.host;
     this.upCache.clear();
     this.downCache.clear();
     return t;

@@ -25,6 +25,10 @@ export interface FrameMeta {
 export const meta = (f: SimFrame): FrameMeta => ({ rule: f.transition?.rule ?? null, t: f.t, live: f.live, counts: f.counts });
 
 const MAX_FRAMES = 20_000;
+const QUIET_MAX = 5_000;
+
+/** A reaction that changes no link: values rewritten, unlinked things made or let go (a photon, a pool drawn down). */
+export const quiet = (t: Transition): boolean => !t.edgesCreated.length && !t.edgesRemoved.length;
 
 export class Simulation {
   frames: SimFrame[] = [];
@@ -79,11 +83,17 @@ export class Simulation {
     this.pending = null;
   }
 
-  /** One reaction; false where the system rests. */
-  stepOnce(): boolean {
-    const s = this.draw();
-    if (!s) return false;
-    this.apply(s);
+  /**
+   * One reaction; false where the system rests. `skipQuiet`: go on through reactions that change no link (`quiet`) to
+   * the next that does, up to `QUIET_MAX`; every one is still a frame.
+   */
+  stepOnce(skipQuiet = false): boolean {
+    for (let i = 0; i < QUIET_MAX; i++) {
+      const s = this.draw();
+      if (!s) return i > 0;
+      this.apply(s);
+      if (!skipQuiet || !quiet(s.transition)) return true;
+    }
     return true;
   }
 

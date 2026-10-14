@@ -36,6 +36,7 @@ export class World {
   at = 0;
   playing = true;
   private _pace: 'steps' | 'time' = 'steps';
+  private _skipQuiet = false;
   private _speed = 1.2;
   private resting = false;
   private problems: string[] = [];
@@ -76,8 +77,17 @@ export class World {
     this.worker.postMessage(m);
   }
 
+  /** By steps, pass over reactions that change no link (each is still a frame on the timeline). */
+  get skipQuiet() {
+    return this._skipQuiet;
+  }
+  set skipQuiet(q: boolean) {
+    this._skipQuiet = q;
+    this.tell();
+  }
+
   private tell() {
-    this.send({ kind: 'play', playing: this.playing, pace: this._pace, speed: this._speed });
+    this.send({ kind: 'play', playing: this.playing, pace: this._pace, speed: this._speed, skipQuiet: this._skipQuiet });
   }
 
   /** Begin again, from the initial state, with whatever the system now is. */
@@ -103,7 +113,7 @@ export class World {
 
   /** One reaction (from the frame shown). */
   advance(_manual = true) {
-    this.send({ kind: 'step' });
+    this.send({ kind: 'step', skipQuiet: this._skipQuiet });
   }
 
   /** Show frame `i`: one step forward animates the reaction; anything else goes straight there. */

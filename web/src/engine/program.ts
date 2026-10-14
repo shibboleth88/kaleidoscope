@@ -118,6 +118,11 @@ export function buildProgram(ast: ProgramAst, types: (TypeAst & { module: string
       else spec.attrs![s.key] = s.dflt ? { type: s.type, dflt: constant(s.dflt, kindOfType(s.type)) } : s.type;
     }
     for (const it of t.attrs) if (it.k === 'member' && it.key && 'text' in it.key && it.value.k === 'lit') spec.style![it.key.text] = Object.values(it.value.v)[0];
+    // a host type: `Type[host = "name" | …]`, its other attributes the host's configuration (host.ts)
+    if (typeof spec.style!.host === 'string') {
+      const { host, ...config } = spec.style! as Record<string, number | string | boolean>;
+      spec.host = { name: host as string, config };
+    }
     specs[t.name] = spec;
   }
   const sig = Signature.of(specs);

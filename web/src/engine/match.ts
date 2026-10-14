@@ -32,7 +32,7 @@ import {
 } from './carrier';
 import type { Rule } from './rule';
 import { runPlan } from './plan';
-import { type Env, evaluate, holds } from './expr';
+import { type Env, EvalError, evaluate, holds } from './expr';
 import type { Signature } from './signature';
 
 /** One place a rule meets the state. */
@@ -148,9 +148,16 @@ function blockedReference(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, 
 }
 
 /** What an occurrence's sites hold, for expressions to read. */
-export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [string, { owner: Id; ports: Port[] }][]): Env {
+export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [string, { owner: Id; ports: Port[] }][], nodes?: [Id, Id][]): Env {
   const rest = (name: string) => rests?.find(([n]) => n === name)?.[1];
   return {
+    index: ix,
+    sig,
+    nodeOf(r) {
+      const hit = nodes?.find(([a]) => a === r);
+      if (!hit) throw new EvalError(`the redex's node ${r} met nothing here`);
+      return hit[1];
+    },
     far(name) {
       const r = rest(name);
       if (!r) return [];
@@ -186,7 +193,7 @@ export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [stri
 /** The guard holds here, and every computed value can be computed here. */
 function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
   if (!rule.guard && !rule.computed?.length) return true;
-  const env = siteEnv(ix, occ.sites, sig, occ.rests);
+  const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
   try {
     if (rule.guard && !holds(rule.guard, env)) return false;
     for (const c of rule.computed ?? []) evaluate(c.expr, env, c.kind);

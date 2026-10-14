@@ -39,6 +39,7 @@ import {
   scalarKey,
 } from './carrier';
 import { evaluate } from './expr';
+import { type Face, settleHosts, startHosts } from './host';
 import { type Occurrence, siteEnv } from './match';
 import type { Transition } from './react';
 import type { Rule } from './rule';
@@ -96,11 +97,42 @@ export class World {
   next: { node: Id; edge: Id; name: Id };
   private readonly edgePos = new Map<Id, number>();
 
-  constructor(start: Carrier) {
+  /**
+   * `sig`: the signature the state's types are in. Given it, the world keeps the state's host-type instances
+   * (host.ts): each made (or realized from its channel) now, and kept by every reaction.
+   */
+  constructor(start: Carrier, readonly sig?: Signature) {
     this.g = structuredClone(start);
     this.ix = Index.of(this.g);
     this.next = nextIds(this.g);
     this.g.edges.forEach((e, i) => this.edgePos.set(e.id, i));
+    if (sig) startHosts(this.ix, sig, (id, face) => this.writeFace(sig, id, face));
+  }
+
+  /**
+   * A host's projection written into a node's face: each field's scalar changed where it stands (made, if the node
+   * has none yet: those go to `made`). Returns the scalars changed where they stand.
+   */
+  private writeFace(sig: Signature, id: Id, face: Face, made: Id[] = []): Id[] {
+    const out: Id[] = [];
+    const decls = [...sig.ups(this.ix.node.get(id)!.type)].flatMap((t) => sig.get(t).attrs);
+    for (const [key, v] of Object.entries(face)) {
+      const decl = decls.find((a) => a.key === key);
+      if (!decl) throw new Error(`${sig.name(this.ix.node.get(id)!.type)}: its host writes ${key}, which it does not declare`);
+      const kind = sig.get(decl.type).kind;
+      const scalar = kind === 'int' ? { int: Math.floor(Number(v)) } : kind === 'float' ? { float: Number(v) } : kind === 'bool' ? { bool: Boolean(v) } : { text: String(v) };
+      const at = this.ix.childAt({ node: id }, memberKey({ attr: { text: key } }));
+      if (at) {
+        if (typeof at.payload === 'object' && scalarKey(at.payload.scalar) === scalarKey(scalar)) continue;
+        (at as { payload: Node['payload'] }).payload = { scalar };
+        out.push(at.id);
+      } else {
+        const n: Node = { id: this.next.node++, type: decl.type, parent: { node: id }, member: { attr: { text: key } }, payload: { scalar }, ports: [] };
+        this.addNode(n);
+        made.push(n.id);
+      }
+    }
+    return out;
   }
 
   /** The state as an ordinary, unchanging carrier. */
@@ -204,7 +236,7 @@ export class World {
     for (const e of imageEdges) before.handle({ edge: e });
 
     // values computed from what the sites hold, read before anything changes
-    const env = siteEnv(ix, occ.sites, sig, occ.rests);
+    const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
     const computedOf = new Map((rule.computed ?? []).map((c) => [c.node, evaluate(c.expr, env, c.kind)]));
 
     // what each site holds, walked only where it is needed (a site dropped or copied, or one whose contents link
@@ -440,6 +472,19 @@ export class World {
     }
 
     this.next = { node: nextNode, edge: nextEdge, name: this.next.name };
+
+    // 4. host instances (host.ts): made, carried, copied and dropped as the reaction did to their nodes; what the
+    // hosts write back is a change of values where they stand
+    const hs = sig ?? this.sig;
+    if (hs) {
+      const made: Id[] = [];
+      const written = settleHosts(this.ix, hs, { created: [...created], kept: [...keptState], removed, copied }, (id, face) => this.writeFace(hs, id, face, made));
+      created.push(...made);
+      for (const id of written) {
+        before.keep(id);
+        revalued.add(id);
+      }
+    }
     return {
       transition: {
         rule: rule.name,

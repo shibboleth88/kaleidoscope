@@ -301,7 +301,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
   const relabelled = relabel(rule.reactum, (x) => fn.get(x) ?? x, (x) => fe.get(x) ?? x);
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   // values computed from what the sites held
-  const env = siteEnv(ix, occ.sites, sig, occ.rests);
+  const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
   const computed = new Map((rule.computed ?? []).map((c) => [fn.get(c.node)!, evaluate(c.expr, env, c.kind)]));
   // a group with a rest of points: its own points, then the rest's, through the names the decomposition gave them
   const nameOfHandle = new Map(implicit.map(([z, h]) => [handleKey(h), z]));

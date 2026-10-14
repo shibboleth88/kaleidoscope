@@ -17,6 +17,8 @@ export type Expr =
   | { rest: string }
   /** Within `sum[?ps …]`: the attribute `key` of the node at the far end of the point being summed over. */
   | { restAttr: string; key: string }
+  /** A node the redex names (`?p` where `?p = Cell[…]`): a host type's receiver or argument (host.ts). */
+  | { node: number }
   | { op: string; args: Expr[] };
 
 export class EvalError extends Error {}
@@ -35,6 +37,11 @@ export interface Env {
   shared?(a: string, b: string): number;
   /** The scalar attribute `key` of a node, if it has one. */
   attr?(node: number, key: string): Scalar | null;
+  /** The state node a redex node (by its identity in the redex) met. */
+  nodeOf?(redexNode: number): number;
+  /** The state and its signature, for a host type's arms (host.ts). */
+  index?: import('./carrier').Index;
+  sig?: import('./signature').Signature;
 }
 
 /** What `?ps.x` reads: the far node being summed over, for each rest (set by `sum`). */
@@ -62,7 +69,7 @@ const toV = (s: Scalar): V => ('int' in s ? s.int : 'float' in s ? s.float : 'te
 /** Whether a value is a whole number held as such (an Int), so arithmetic on Ints stays whole. */
 const isInt = (e: Expr, env: Env): boolean => {
   if ('lit' in e) return 'int' in e.lit;
-  if ('type' in e || 'rest' in e) return false;
+  if ('type' in e || 'rest' in e || 'node' in e) return false;
   if ('restAttr' in e) {
     const n = current.get(e.restAttr);
     const s = n === undefined ? null : (env.attr?.(n, e.key) ?? null);
@@ -108,6 +115,8 @@ export const BINARY = ['or', 'and', '==', '!=', '<', '<=', '>', '>=', '++', '+',
  */
 export type Native = (args: Expr[], env: Env, value: (e: Expr) => number | string | boolean) => number | string | boolean;
 export const NATIVE = new Map<string, Native>();
+/** Host types' methods (host.ts): a call dispatched on its receiver's type, answered by the type's arm. */
+export const HOST_CALL: { methods: Set<string>; call: ((op: string, args: Expr[], env: Env, value: (e: Expr) => V) => V) | null } = { methods: new Set(), call: null };
 export function registerNative(name: string, arity: [number, number], fn: Native) {
   if (name in FUNCTIONS && !NATIVE.has(name)) throw new EvalError(`${name} is an operation already`);
   FUNCTIONS[name] = arity;
@@ -148,6 +157,10 @@ function compileExpr(e: Expr): Compiled {
       if (!v) throw new EvalError(`a node at the far end of ?${r} has no ${key}`);
       return toV(v);
     };
+  } else if ('node' in e) {
+    f = () => {
+      throw new EvalError('a named node stands only as a host method\'s receiver or argument');
+    };
   } else if (e.op === 'sum') {
     const [over, body] = e.args;
     if (!('rest' in over)) throw new EvalError('sum[?ps E]: the first is a rest of points');
@@ -186,6 +199,9 @@ function compileExpr(e: Expr): Compiled {
   } else if (e.op === 'count' && 'rest' in e.args[0]) {
     const r = e.args[0].rest;
     f = (env) => env.points?.(r) ?? 0;
+  } else if (HOST_CALL.methods.has(e.op)) {
+    const op = e.op, args = e.args;
+    f = (env) => HOST_CALL.call!(op, args, env, (x) => value(x, env));
   } else if (NATIVE.has(e.op)) {
     const fn = NATIVE.get(e.op)!;
     const args = e.args;
@@ -245,7 +261,7 @@ function interpret(e: Expr, env: Env): V {
     return toV(s);
   }
   if ('type' in e) throw new EvalError(`${e.type} is a type: count[?x ${e.type}] counts them`);
-  if ('rest' in e || 'restAttr' in e) return compileExpr(e)(env);
+  if ('rest' in e || 'restAttr' in e || 'node' in e) return compileExpr(e)(env);
   const { op, args } = e;
   if (op === 'count') {
     const [a, t] = args;
@@ -323,7 +339,7 @@ export function evaluate(e: Expr, env: Env, kind: ScalarKind): Scalar {
 /** The kind an expression gives where nothing else says (no slot declares it). */
 export function kindOf(e: Expr): ScalarKind {
   if ('type' in e) return 'text';
-  if ('rest' in e || 'restAttr' in e) return 'float';
+  if ('rest' in e || 'restAttr' in e || 'node' in e) return 'float';
   if ('lit' in e) return 'int' in e.lit ? 'int' : 'float' in e.lit ? 'float' : 'text' in e.lit ? 'text' : 'bool';
   if ('site' in e) return 'float';
   if (['==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'].includes(e.op)) return 'bool';
@@ -335,15 +351,17 @@ export function kindOf(e: Expr): ScalarKind {
 
 /** Every site an expression reads. */
 export function sitesOf(e: Expr): number[] {
-  if ('lit' in e || 'type' in e || 'rest' in e || 'restAttr' in e) return [];
+  if ('lit' in e || 'type' in e || 'rest' in e || 'restAttr' in e || 'node' in e) return [];
   if ('site' in e) return [e.site];
   return e.args.flatMap(sitesOf);
 }
 
 /** Whether an expression reads the nodes at the far ends of a rest's points (their attributes). */
 export function readsAcross(e: Expr | undefined): boolean {
-  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e) return false;
+  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e || 'node' in e) return false;
   if ('restAttr' in e) return true;
+  // a host method reads what its type declares, across the receiver's links among it
+  if (HOST_CALL.methods.has(e.op)) return true;
   if (NATIVE.has(e.op) && e.args.some((a) => 'rest' in a)) return true;
   return e.args.some(readsAcross);
 }

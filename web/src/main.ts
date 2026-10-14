@@ -8,7 +8,7 @@
  */
 
 import './style.css';
-import { type Rule, parseRule, parseValue, ruleText, valueText } from './engine';
+import { type Program, type Rule, type Signature, parseRule, parseValue, readProgram, ruleText, valueText } from './engine';
 import { SHAPES } from './view/style';
 import {
   type Compiled,
@@ -69,10 +69,13 @@ document.querySelector('#app')!.innerHTML = `
     <header>
       <h1>World</h1>
       <label class="initial">from <select id="initial"></select></label>
+      <label class="ghost file" title="Open a folder of .ys files and run a Program from it (its modules are found in the folder)">program…<input type="file" id="prog-open" webkitdirectory multiple></label>
+      <select id="program" hidden title="The Program running (choose another from the folder, or the library)"></select>
       <button id="reset" class="big" title="Start again from the initial state (R)">↺ reset</button>
       <button id="play" title="Play / pause (Space)">❚❚</button>
       <button id="step" title="One reaction (→); ← goes back">step ▸</button>
       <label class="speed" title="How fast it plays"><input id="speed" type="range" min="0.2" max="8" step="0.1" value="1.2"><span></span></label>
+      <button id="quiet" class="ghost" title="By steps: pass over reactions that change no link (light, a pool drawn down), so every step shows the net changing. Each is still on the timeline."></button>
       <button id="pace" class="ghost" title="Steps: every reaction takes the same while. Time: each waits as long as the time it took, so a busy system rushes and a quiet one dawdles."></button>
       <button class="mode" data-mode="world" title="Fill the screen">⤢</button>
     </header>
@@ -131,7 +134,13 @@ preview.onTap = (key) => {
 /** A rule's entry, by the name the world knows it by. */
 const ruleIdByName = () => new Map(lib.rules.map((r) => [r.name, r.id]));
 
+/** A Program opened from a folder, running in place of the library's system (null: the library's). */
+let program: { name: string; p: Program } | null = null;
+/** What the world is made of: the program's signature while one runs, else the library's. */
+const worldSig = (): Signature => program?.p.sig ?? compiled.sig;
+
 function systemSetup() {
+  if (program) return { sig: program.p.sig, initial: program.p.world, rules: program.p.rules, seed: lib.system.seed, problems: [] };
   const problems: string[] = [];
   for (const [id, msg] of compiled.typeErrors) problems.push(`type ${typeName(lib.types.find((t) => t.id === id)?.text ?? '')}: ${msg}`);
   const init = compiled.states.get(lib.system.initial);
@@ -157,14 +166,14 @@ function changed(opts: { now?: boolean } = {}) {
   renderEditor(false);
   renderSystem();
   clearTimeout(changeTimer);
-  changeTimer = window.setTimeout(() => world.reset(systemSetup()), opts.now ? 0 : 450);
+  if (!program) changeTimer = window.setTimeout(() => world.reset(systemSetup()), opts.now ? 0 : 450);
 }
 
 // ── the world's controls ───────────────────────────────────────────────────────────────────────────────────
 
 const typeColor = (t: number) => {
-  const st = (compiled.sig.get(t).style ?? {}) as { color?: string };
-  return st.color ?? ruleColor(compiled.sig.name(t));
+  const st = (worldSig().get(t).style ?? {}) as { color?: string };
+  return st.color ?? ruleColor(worldSig().name(t));
 };
 
 world.onStatus = ({ steps, t, live, resting, problems, scrubbing }) => {
@@ -178,7 +187,7 @@ world.onStatus = ({ steps, t, live, resting, problems, scrubbing }) => {
 
 /** The reaction a frame came from, lit in the list and the system: a flash as it happens, steady while looked at. */
 world.onFrame = (f, i, fresh) => {
-  timeline.set(world.frames, i, compiled.sig, typeColor);
+  timeline.set(world.frames, i, worldSig(), typeColor);
   const id = f.transition ? ruleIdByName().get(f.transition.rule) : undefined;
   document.querySelectorAll('.current-rule').forEach((el) => el.classList.remove('current-rule'));
   if (!id) return;
@@ -208,6 +217,7 @@ function renderSystem() {
     .join('');
 }
 $('#initial').addEventListener('change', (e) => {
+  closeProgram();
   lib.system.initial = (e.target as HTMLSelectElement).value;
   changed({ now: true });
 });
@@ -656,6 +666,60 @@ $<HTMLInputElement>('#lib-open').addEventListener('change', async (e) => {
     alert(`Could not open ${file.name}: ${(err as Error).message}`);
   }
 });
+
+// ── a program from a folder ────────────────────────────────────────────────────────────────────────────────
+
+/** The folder's .ys files, by path within it (`lib/interact.ys`), and which of them are Programs. */
+let folder = new Map<string, string>();
+const progSel = $<HTMLSelectElement>('#program');
+
+function closeProgram() {
+  if (!program) return;
+  program = null;
+  progSel.value = '';
+}
+
+function openProgram(path: string) {
+  if (!path) {
+    closeProgram();
+    world.reset(systemSetup());
+    return;
+  }
+  const load = (m: string) => {
+    const text = folder.get(`${m}.ys`);
+    if (text === undefined) throw new Error(`no ${m}.ys in the folder`);
+    return text;
+  };
+  try {
+    program = { name: path, p: readProgram(folder.get(path)!, load) };
+  } catch (err) {
+    alert(`Could not read ${path}: ${(err as Error).message}`);
+    return closeProgram();
+  }
+  progSel.value = path;
+  setPlay(false);
+  world.reset(systemSetup());
+}
+
+$<HTMLInputElement>('#prog-open').addEventListener('change', async (e) => {
+  const input = e.target as HTMLInputElement;
+  const files = [...(input.files ?? [])].filter((f) => f.name.endsWith('.ys'));
+  input.value = '';
+  if (!files.length) return alert('No .ys files in that folder.');
+  // paths within the folder chosen: its own name is dropped, so `Module["lib/x"]` finds lib/x.ys
+  folder = new Map(await Promise.all(files.map(async (f) => [f.webkitRelativePath.split('/').slice(1).join('/') || f.name, await f.text()] as [string, string])));
+  const programs = [...folder].filter(([, t]) => /^\s*Program\s*\(/m.test(t)).map(([path]) => path).sort();
+  if (!programs.length) return alert('No Program in that folder.');
+  progSel.innerHTML = `<option value="">— the library's system —</option>` + programs.map((path) => `<option value="${esc(path)}">${esc(path)}</option>`).join('');
+  progSel.hidden = false;
+  openProgram(programs.find((path) => path.startsWith('scenes/')) ?? programs[0]);
+});
+progSel.addEventListener('change', () => openProgram(progSel.value));
+
+const quietBtn = $('#quiet');
+const showQuiet = () => (quietBtn.textContent = world.skipQuiet ? '◇ links only' : '◆ every reaction');
+quietBtn.addEventListener('click', () => ((world.skipQuiet = !world.skipQuiet), showQuiet()));
+showQuiet();
 
 // ── keys ───────────────────────────────────────────────────────────────────────────────────────────────────
 

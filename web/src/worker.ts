@@ -13,8 +13,8 @@ import { type FrameMeta, Simulation, meta } from './sim';
 
 export type ToWorker =
   | { kind: 'setup'; gen: number; types: TypeDecl[]; initial: Carrier | null; rules: Rule[]; seed: number; problems: string[] }
-  | { kind: 'play'; playing: boolean; pace: 'steps' | 'time'; speed: number }
-  | { kind: 'step' }
+  | { kind: 'play'; playing: boolean; pace: 'steps' | 'time'; speed: number; skipQuiet?: boolean }
+  | { kind: 'step'; skipQuiet?: boolean }
   | { kind: 'seek'; i: number };
 
 /** Every message out carries the setup it is about (`gen`), so the page can let go of one about an older setup. */
@@ -31,6 +31,8 @@ const sim = new Simulation();
 let playing = false;
 let pace: 'steps' | 'time' = 'steps';
 let speed = 1.2;
+/** By steps, go on through reactions that change no link. */
+let skipQuiet = false;
 let timer = 0;
 let simClock = 0;
 let generation = 0;
@@ -62,7 +64,7 @@ function schedule() {
 /** By steps: one reaction, then wait. */
 function tickStep() {
   const base = sim.at;
-  if (sim.stepOnce()) send(base, true);
+  if (sim.stepOnce(skipQuiet)) send(base, true);
   else post({ kind: 'rest', at: sim.at, problems: sim.problems });
   schedule();
 }
@@ -113,13 +115,14 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       playing = m.playing;
       pace = m.pace;
       speed = m.speed;
+      skipQuiet = !!m.skipQuiet;
       simClock = sim.frame?.t ?? 0;
       generation++;
       schedule();
       break;
     case 'step': {
       const base = sim.at;
-      if (sim.stepOnce()) send(base, true);
+      if (sim.stepOnce(m.skipQuiet ?? skipQuiet)) send(base, true);
       else post({ kind: 'rest', at: sim.at, problems: sim.problems });
       break;
     }
