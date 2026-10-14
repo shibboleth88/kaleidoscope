@@ -10,3 +10,4 @@ export * from './expr';
 export * from './incremental';
 export * from './program';
 export * from './world';
+export * from './encounter';

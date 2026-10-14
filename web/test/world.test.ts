@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { type Carrier, Discovery, type Rule, type Signature, World, affine, print, react, readProgram, readState, relabel, rng, sameCarrier, spots, spotKey } from '../src/engine';
+import { type Carrier, Discovery, type Rule, type Signature, World, affine, memberKey, print, react, readProgram, readState, relabel, rng, sameCarrier, spots, spotKey } from '../src/engine';
 import { compile, emberMossMist, embryo, growth, lacOperon, mapk, yinYang } from '../src/library';
 
 /** The live spots, as comparable text: rule, spot, rate. */
@@ -196,5 +196,55 @@ Program(
       d.advanceValues(w, before, transition, [occ.nodes[0][1]]);
       expect(view(d.live(w.g)), `after leap ${i}`).toEqual(view(spots(w.g, p.rules, p.sig)));
     }
+  });
+});
+
+describe('discovery where only some counts change: only what reads them is rated again', () => {
+  // leaps that each move two of three counts, and readers of each count (with an Item read beside one)
+  const src = `
+Program(
+  module = (
+    Count = Type[kind = "int"](<: Int)
+    Pool[a :: Count = 0 | b :: Count = 0 | c :: Count = 0] = Type()
+    Item[w :: Int = 1] = Type()
+    ab[rate = 0.3 * ?x] = ?p = Pool[a = ?x | b = ?y] => ?p = Pool[a = ?x - 1 | b = ?y + 1]
+    bc[rate = 0.2 * ?y] = ?p = Pool[b = ?y | c = ?z] => ?p = Pool[b = ?y - 1 | c = ?z + 1]
+    ca[rate = 0.1 * ?z] = ?p = Pool[c = ?z | a = ?x] => ?p = Pool[c = ?z - 1 | a = ?x + 1]
+    readA[rate = 0.01 * ?x * ?w] = (?p = Pool[a = ?x] | ?i = Item[w = ?w]) => (?p = Pool[a = ?x] | ?i = Item[w = ?w])
+    readC[rate = 0.02 * ?z] = (?p = Pool[c = ?z] | ?i = Item[w = ?w]) => (?p = Pool[c = ?z] | ?i = Item[w = ?w])
+  )
+  world = (Pool[a = 400 | b = 300 | c = 200] | Item[w = 2] | Item[w = 5])
+)`;
+  it('finds what a full search finds, rates included, after every leap, told which keys changed', () => {
+    const p = readProgram(src);
+    const w = new World(p.world);
+    const d = new Discovery(p.rules, p.sig);
+    d.live(w.g);
+    const random = rng(6);
+    const movers = ['ab', 'bc', 'ca'].map((n) => p.rules.find((r) => r.name === n)!);
+    for (let i = 0; i < 60; i++) {
+      const rule = movers[Math.floor(random() * 3)];
+      const occ = spots(w.g, [rule], p.sig)[0]?.occurrences[0];
+      if (!occ) continue;
+      const steps = affine(rule)!;
+      const { transition, before } = w.applyRepeated(rule, occ, 1 + Math.floor(random() * 4), steps);
+      const host = new Map(occ.nodes).get(steps[0].node)!;
+      const keys = new Set(steps.map((s) => memberKey({ attr: { text: s.key } })));
+      d.advanceValues(w, before, transition, [host], undefined, new Map([[host, keys]]));
+      expect(view(d.live(w.g)), `after leap ${i} by ${rule.name}`).toEqual(view(spots(w.g, p.rules, p.sig)));
+    }
+  });
+  it('and told wrongly (only b changed, when c did too), it leaves readC stale: the keys are what decide', () => {
+    const p = readProgram(src);
+    const w = new World(p.world);
+    const d = new Discovery(p.rules, p.sig);
+    d.live(w.g);
+    const rule = p.rules.find((r) => r.name === 'bc')!;
+    const occ = spots(w.g, [rule], p.sig)[0].occurrences[0];
+    const steps = affine(rule)!;
+    const { transition, before } = w.applyRepeated(rule, occ, 5, steps);
+    const host = new Map(occ.nodes).get(steps[0].node)!;
+    d.advanceValues(w, before, transition, [host], undefined, new Map([[host, new Set([memberKey({ attr: { text: 'b' } })])]]));
+    expect(view(d.live(w.g))).not.toEqual(view(spots(w.g, p.rules, p.sig)));
   });
 });

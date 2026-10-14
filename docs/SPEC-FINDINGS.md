@@ -870,3 +870,181 @@ because the same reaction also makes or removes nodes.
    - A case where a kept node's holder changes (a move into a kept container) and one where only a kept node's
      attribute changes, under a rule with a passive rest site. Those were the two places the obligation was easy to
      get wrong.
+
+### F53. A law over two bonds at once costs a rule per port combination, and a law between any two motifs has quadratically many instances
+
+**Came up (lotus, 2026-10-13):** bond exchange, two bonds swapping partners in one step. That is how a replicated γδ
+loop separates into two copies (lotus `docs/o3-searching-for-persistence.md` §10–§11). The general law matches four
+agents X, Y, Z, W: context bonds X–Y and Z–W, crossing bonds X–Z and Y–W, any ports. Its detailed-balance reverse
+(fuse) joins any two doubly bonded pairs anywhere in the place.
+
+**Kaleidoscope:** a supertype matches every subtype (`sig.sub` in `match.ts`), so one rule covers γ and every δ. That
+works and helped. Ports, though, must be named (F49), so the general law is 6⁴ = 1,296 resolve rules plus 1,296 fuse
+rules. With 10 loops it runs at about 5 s a step (resolve alone, 1.8 s; the bare interactions, 6 ms). Fuse also has
+O(D²) instances in D doubly bonded pairs, whatever its syntax, and incremental discovery tracks every one.
+
+**Lotus:** the law is restricted to active pairs as the context (16 rules, 34 ms a step) and driven by an activation,
+so its reverse is suppressed by e^(−9) and lives only in a control arm.
+
+**Questions:**
+- Port variables (F49's question) would make the general law 2 rules.
+- Could a rule whose redex is two disconnected motifs be sampled in aggregate, at a rate from their counts, without
+  enumerating pairs? That is the mass-action form of a bimolecular law between structures, and the natural one for
+  attach, fuse and any encounter in a well-mixed place.
+
+### F54. A value change re-rates only what reads the changed keys
+
+**Came up (Boundary, 2026-10-13):** under a piecewise-deterministic policy whose low-count reactions jump exactly
+(Boundary's plan step D2), every jump moves a few counts in a pool that thousands of occurrences meet. Every flowing
+reaction meets the metabolite pool, and so do every ribosome at work and every finishing transcript. F47's
+value-only path re-rated every occurrence meeting the changed node, though most jumps change keys their rates never
+read (a rare deoxynucleotide, an acyl-carrier form).
+
+**Kaleidoscope (performance only):**
+- **`Discovery.advanceValues(…, unrated, changed)`.** `changed` names, per host, the member keys whose values
+  changed. An occurrence whose rate reads none of them there keeps its rate.
+  - What a rate reads under each redex node is worked out once per rule: the keyed sites its expression names, or
+    "all" where it names an anonymous site.
+  - The proof (`test/world.test.ts`, "only what reads them is rated again"):
+    - a three-key pool with leaps moving different key pairs and readers of each key equals a full search, rates
+      included, after every leap;
+    - a control told the wrong keys diverges, which shows the keys decide.
+- **A cache of what discovery rates at each node** (excluding the `unrated` rules a flow rates itself), rebuilt only
+  when the occurrences at that node change. A value change at a node met by thousands of flowing occurrences then
+  costs what discovery actually re-rates.
+- The suite passes 97/97. The benchmark is unchanged in what it counts; it does not use this path.
+
+**What it did not do:** in Boundary, the organism's wall time per simulated second under D2 is unchanged within noise.
+The cost is the number of flow steps: every exact jump ends one, and each step realizes, re-rates and refactors. That
+cost belongs to exactness, not to bookkeeping. Boundary records it as the price of exact low-count chemistry (R7's
+error contract: exact where it jumps).
+
+**Question:** F52 asked whether a transition should tell value from structure. This adds which keys: a transition's
+`revalued` could carry the member keys it rewrote, so that `discover_local`'s value-only obligation reads "occurrences
+whose rate or guard reads a changed key at a changed node". Should the spec state rate dependence at the level of
+keys?
+
+### F55. F51's known limit closed: the jump hazard integrated with the flow
+
+**Came up (Boundary, 2026-10-13, plan step D1):** F51's piecewise-deterministic policy held the jumps' total rate at
+its value from the start of each flow step (first order). A jump whose rate reads a flowing pool (a ribosome finishing
+reads GTP) then fired at a rate that was already out of date.
+
+**Boundary (no engine change):**
+- Every jump rate, structural ones included, is evaluated on the flow's continuous state. Each is compiled once per
+  occurrence (Boundary `cell/src/native.ts`), its sites reading the state where they are flow species.
+- The hazard is integrated across each accepted step by the trapezoid (second order, matching ROS2). Where it would
+  pass the Exp(1) draw, the crossing is solved for (a quadratic in the step) and the step is taken again to that
+  moment, where the event fires.
+- **Measured** (`cell/test/flow.test.ts`): a pool decaying smoothly, with a jump channel reading it that is too rare
+  to fire. The accumulated hazard, against its exact integral ∫ k a(t) dt:
+  - integrated: within 0.12%;
+  - held: 1.8% at the default tolerance.
+
+  At a loose tolerance they are 2.9% against 12.6%; the integrated error there is the flow's own.
+- **Cost:** about 1.4-1.6× the held mode's wall time in the whole organism, after keeping the compiled rates across
+  structural events and summing once the rates that read nothing the flow moves. The held mode stays available as a
+  stated first-order policy.
+
+**For the spec (R7 in Boundary's `docs/32`):** a piecewise-deterministic policy's error contract should say how the jump
+hazard is integrated. "Held per step" is first order in the step; "integrated with the flow" is the flow integrator's
+order. Both keep conservation exact.
+
+**Found on the way (Boundary only):** compiled rate laws were cached by rule name and the shape of their sites. Two
+programs in one process with a rule of the same name and different laws then shared a compiled function, which carries
+its literals. They are now keyed by the expression itself. Any implementation compiling rates should key by
+expression identity, which matters as soon as variants of one model run together (an inference ensemble).
+
+### F56. A literal in a redex made a rule value-sensitive at every node it meets, and molecule pairs are listed one by one
+
+**Came up (Boundary, 2026-10-13, plan step R2):** Boundary unfolded four proteins (about 1,900 molecules) from counts
+into one node per molecule. Each molecule carries its phosphoryl group as an attribute, and the per-molecule rules match
+on it as a literal (`Mol_ptsI[P = 0]`). A rule like that also meets a pool of counts (`Metabolites[pep = ?x]`), whose
+values only feed its rate.
+
+**Engine change (`web/src/engine/incremental.ts`):**
+- `Discovery` judged value sensitivity per rule: any literal anywhere in the redex made every node the rule meets
+  sensitive to value changes. A count moving in the metabolite pool then took the full update instead of re-rating,
+  and every occurrence meeting the pool was dropped and searched again, at every event and every flow realization.
+- **Now:** for a rule whose only value dependence is literal attributes (no guard, no negative, no reading across
+  links), sensitivity is confined to the redex nodes holding those literals. A value changing under any other node
+  re-rates what meets it, as for a value-free rule.
+- **Also:** each rule's occurrence count is kept as occurrences are added and removed, instead of counted over every
+  occurrence at each update. Rules found again whole are cleared in one pass, instead of one pass per rule.
+- **Measured:** in Boundary's organism with the PTS unfolded, one update went from 3.6 s to 16 ms. Benchmark before and
+  after (incremental ms/step): MAPK 0.53 → 0.46, Growth 0.35 → 0.28, lac 0.29 → 0.27, yin yang 0.52 → 0.57,
+  ×10 5.25 → 4.43, MAPK ×10 0.72 → 0.85, MAPK ×40 6.07 → 5.20; embryo 3.26 → 2.59. The machine was loaded (load about
+  9), so the differences are within its noise. The suite passes 97/97.
+
+**Still open (the next finding's motivation, Boundary R2b):** a rule meeting two molecules that share nothing
+(`Mol_ptsH[P = 0] | Mol_ptsI[P = 1]`) has one occurrence per pair. In the PTS that is 77,000 occurrences, and a
+scheduler that works over occurrences pays for all of them at every event. Its propensity is the product of each
+component's matches. Kappa's simulators (KaSim) count the embeddings of a disconnected left-hand side as the product of
+its components' embeddings, and choose each component's match independently. That is exact and never lists the pairs.
+
+**For the spec:**
+- Occurrence identity and the rate of a disconnected redex should be stated so that an implementation may factor them.
+  An occurrence is a tuple of component matches, and the propensity is the rate summed over the product.
+- A literal in a redex constrains where a rule matches. It should not make values elsewhere in the match structural.
+
+### F57. Encounter rules held factored: a disconnected redex counted as the product of its components (F53's question)
+
+**Came up:**
+- **Lotus F53:** fuse joins any two doubly bonded pairs, O(D²) instances.
+- **Boundary R2:** the PTS unfolded into molecule nodes. A phosphotransfer `(Mol_ptsH[P = 0] | Mol_ptsI[P = 1])` has
+  one occurrence per pair: 77,000 in all, about 3,800 molecule matches.
+
+**Engine change (opt-in; `web/src/engine/encounter.ts`, `incremental.ts`):**
+- **The option:** `new Discovery(rules, sig, { factor })` holds factored each rule the predicate accepts that is an
+  encounter rule. Without it, nothing changes, so the editor's one-at-a-time policy is as it was.
+- **What counts as an encounter rule:** one region; two or more root components sharing no edge, name or site; no
+  guard, negative or rest. The rate is a product (`*`, `/`) of factors that each read one component. The reactum's
+  computed values cannot fail (`+ - *`). No type lies below two components' root types.
+- **How it is held:** each component becomes a rule of its own, with the same node ids and its sites renumbered, and
+  is discovered and kept incrementally by an inner `Discovery`.
+- **Its spots:** one spot per rule and place, rate k × ∏ (each component's positive factors summed), with
+  `occurrences` empty. `Discovery.sample(g, spot, random)` chooses each component's match by its factor and composes
+  the occurrence. `occurrencesHeld` reports what is held.
+- **Why the last condition:** a spot is the set of nodes an occurrence meets. Where no state node can be met by two
+  components' roots, tuples of component matches and spots correspond one to one, so the product is exact.
+  A symmetric product (`A | A`) would count each spot twice and is left enumerated. That is simpler than KaSim's
+  null events and exact without them. Each non-encounter rule's reason is returned by `encounter()`.
+- **Tests (`web/test/encounter.test.ts`):**
+  - over 300-step runs on 3 seeds, each factored spot equals the full search summed for its rule and place at every
+    step, and every sampled occurrence is one the full search has;
+  - sampling frequencies match the rates (χ²);
+  - 300 factored runs against 300 full ones agree in distribution;
+  - with four times the molecules, the factored hold about four times as many occurrences and the listed sixteen;
+  - Boundary checks the PTS: the same rates at the seed, and held occurrences reduced by exactly ∏ − Σ of the
+    components (75,604 pairs against 3,826 matches).
+- **Result:** the suite passes 102/102. Benchmark (incremental ms/step): MAPK 0.49, Growth 0.30, lac 0.21, yin yang
+  0.35, ×10 4.02, MAPK ×10 0.55, MAPK ×40 3.70, embryo 2.50. That is no degradation against F56.
+
+**Not yet:** the factored spots are rebuilt from the components each time they are asked for (linear in the
+components' matches, with a sort per part). A scheduler wanting cost per event that follows only what changed needs
+them kept incrementally, which is Boundary's R2b2.
+
+**For the spec:**
+- **The propensity:** a disconnected redex's propensity is a sum over tuples of component matches, which the spec can
+  state as the product of sums where the rate factors.
+- **Occurrence identity:** whether symmetric tuples are one spot or two (Boundary reads them as one, as `spotKey`
+  does) must be stated. The rate of a homodimerisation depends on it (n(n−1)/2 against n(n−1)).
+
+### F58. A value rewritten in place anchored a search for every rule with a literal of its type
+
+**Came up (Boundary, 2026-10-14, plan step R3):** one gene unfolded to one rule per nucleotide and per codon (519
+rules), each matching its machine by a literal position (`Translating_rpsK[pos = 12]`). A step rewrites the machine's
+attributes in place (`pos`, and its atoms). The machine itself counts as unchanged (only what it holds changed), so
+each rewritten attribute anchored a search on its own. Every rule's literal pattern node is of type `Int`, so each
+passed the type test against it: 2,075 anchored searches per event, 17 ms a step on a world of 248 nodes.
+
+**Engine change (`web/src/engine/incremental.ts`):** before an anchored search, the pattern node and the state node
+must have the same payload (a literal, its value) and the same member key. A plan checks exactly these at every node
+it meets (`plan.ts`), so the filter drops only searches that would find nothing. Searches per event went from 2,075 to
+5, with the same trajectory, and a 129-codon elongation sample from 2.3 s to 0.29 s. The suite passes 102/102.
+Benchmark (incremental ms/step): MAPK 0.36, Growth 0.28, lac 0.22, yin yang 0.44, ×10 3.96, MAPK ×10 0.56, MAPK ×40
+3.88, embryo 2.50, level with F57.
+
+**For the spec:** none; an implementation matter. Implementations should index or pre-filter anchors by payload and
+member as well as type. A program written per position (residue-level elongation; any positional state as literals)
+otherwise costs per event in proportion to its number of rules.
