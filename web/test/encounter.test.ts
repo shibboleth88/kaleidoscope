@@ -173,3 +173,24 @@ describe('encounter rules, held factored', () => {
     for (const i of [0, 1]) expect(Math.abs(a[i].m - b[i].m), `observable ${i}: ${a[i].m} against ${b[i].m}`).toBeLessThan(4 * Math.sqrt((a[i].s2 + b[i].s2) / N) + 1e-9);
   });
 });
+
+describe('a factored rate keeps the value the rule as written has (F59)', () => {
+  it('regrouping two whole-number factors does not floor their quotient', () => {
+    // the rate as written divides a fractional product (2.0 * 3 / 4 = 1.5); regrouped by component it would be 3 / 4
+    const text = `Program(
+      module = (
+        Count = Type[kind = "int"](<: Int)
+        Pool[x :: Count = 0 | y :: Count = 0] = Type()
+        A[P :: Int = 0] = Type()
+        r[rate = 2.0 * ?x / ?y] = (?p = Pool[x = ?x | y = ?y] | ?a = A[P = 0]) => (?p = Pool[x = ?x | y = ?y] | ?a = A[P = 1])
+      )
+      world = (Pool[x = 3 | y = 4] | A | A)
+    )`;
+    const p = readProgram(text);
+    const total = (d: Discovery) => d.all(p.world).filter((s) => s.rule.name === 'r').reduce((a, s) => a + s.rate, 0);
+    const listed = new Discovery(p.rules, p.sig), factored = new Discovery(p.rules, p.sig, { factor: () => true });
+    expect(total(listed)).toBeCloseTo(3, 12);
+    expect(total(factored)).toBeCloseTo(3, 12);
+  });
+});
+

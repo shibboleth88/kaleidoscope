@@ -131,9 +131,11 @@ export function encounter(rule: Rule, sig: Signature): Encounter | string {
     };
     const fs = own[c];
     let rateExpr: Expr | undefined;
+    // each component's factors as a real product, seeded with 1.0: regrouped, two whole-number factors would otherwise
+    // divide as whole numbers (floored) where the rule as written divides a fractional product (F59)
     for (const f of fs) {
       const e = renumber(f.e, m);
-      rateExpr = !rateExpr ? (f.div ? { op: '/', args: [{ lit: { float: 1 } }, e] } : e) : { op: f.div ? '/' : '*', args: [rateExpr, e] };
+      rateExpr = { op: f.div ? '/' : '*', args: [rateExpr ?? { lit: { float: 1 } }, e] };
     }
     parts.push({ name: `${rule.name}#${c}`, redex, reactum: redex, sites: [], kept: [], keptEdges: [], negatives: [], rateExpr, rate: rateExpr ? undefined : 1 });
     siteMaps.push(sites);

@@ -1048,3 +1048,62 @@ Benchmark (incremental ms/step): MAPK 0.36, Growth 0.28, lac 0.22, yin yang 0.44
 **For the spec:** none; an implementation matter. Implementations should index or pre-filter anchors by payload and
 member as well as type. A program written per position (residue-level elongation; any positional state as literals)
 otherwise costs per event in proportion to its number of rules.
+
+### F59. A factored rate regrouped two whole-number factors, and their quotient floored
+
+**Came up (Boundary, 2026-10-15, plan step E2a):** the cell's concentrations inside now read a live volume, so a
+mass-action rate became `0.327058 * ?x0 * ?x1 / ((?x4 / 61131000.0) * sqrt[(?x4 / 61131000.0)])`. As written it
+divides a fractional product. F57 holds an encounter rule as its components, each with the rate's factors that read
+it. That regrouped `?x1` and `?x4` (both whole numbers) into `?x1 / ?x4`, and the language divides two whole numbers as
+whole numbers (floored, `expr.ts`). Every factored PTS rule then had rate 0, against 5,127/s listed.
+
+**Engine change (`web/src/engine/encounter.ts`):** each component's product is seeded with `1.0`, so it stays a real
+product, as the rule's rate is. A new test (`test/encounter.test.ts`): `2.0 * ?x / ?y` at x = 3, y = 4 is 1.5 per
+match, listed and factored (it was 0 factored). The suite passes 109/109.
+Benchmark (incremental ms/step): MAPK 0.41, Growth 0.22, lac 0.27, yin yang 0.40, ×10 3.87, MAPK ×10 0.58, MAPK ×40
+3.95, embryo 2.61, level with F58 (one earlier run under load read MAPK ×40 at 7.7).
+
+**For the spec:** a rate is a real number. Whole-number division in rate expressions is a trap: it makes a rate's value
+depend on how its factors are grouped, so any rewriting (factoring, folding, simplification) must keep the grouping
+or work in reals. Either rate expressions are evaluated in reals throughout, or the spec says where whole-number
+division applies (attributes, not propensities).
+
+### F60. No join on a value: a variable written at two sites is refused
+
+**Came up (Boundary, 2026-10-16, plan step F1b):** a replication fork at segment k should step over the gene node whose
+index is k. The natural rule is one rule for every segment:
+`(?f = Fork[at = ?k] | ?s = Seg[seg = ?k | rep = 0]) => (?f = Fork[at = ?k + 1] | ?s = Seg[seg = ?k | rep = 1] | …)`.
+The reader refuses it: "a redex site is written twice". A minimal program reproduces it (two node types, that rule,
+three segments).
+
+**Worked around, no engine change:** one rule per segment, each matching its gene by a literal index
+(`Fork[dir = 1 | at = 12]`, `Gene[seg = 12 | rep = 0 | …]`). F58's payload filter keeps the 486 literal-anchored rules
+cheap. The cost is rule count: one per position, as R3's elongation has.
+
+**For the spec:** whether a variable may name two sites in one redex, meaning equal values (a join on a value), as a
+link name already joins nodes. If yes, its matching semantics: an equality constraint checked after binding, or an
+index on the value. Without it, a positional process (a fork, a ribosome at codon k, a polymerase at base k) needs one
+rule per position.
+
+### F61. Division: a site divided between two places
+
+**Came up (Boundary, 2026-10-16, plan F2b; the requirement in Boundary's docs/32 R4 amendment):** a cell divides, and both
+daughters run on in one world. That needs one rule to turn a composite into two of its type, its contents partitioned,
+not copied.
+
+**Engine change (`web/src/engine/divide.ts`, `rule.ts`, `text.ts`, `program.ts`):**
+- A rule attribute `split = "r"` names a redex site that the reactum writes exactly twice (refused otherwise). Written
+  twice a site is copied, as before. `divide(state, sig, roots, copied, random)` turns that copy into a partition, using
+  the transition's own `copied` pairs:
+  - a node holding counts (an int attribute whose type, or a supertype, declares `divide`) stands in both places, each
+    count split by its policy: `binomial` (p = 1/2; exact below 64, the normal approximation above, held in [0, n]) or
+    `half` (⌊n/2⌋ and ⌈n/2⌉, the odd one at random);
+  - any other node goes whole to one place, uniformly at random, with all it holds; an edge left on no node goes too.
+- The runner applies it after the reaction (it needs the site worked out, `Discovery.fresh`) and rebuilds what it caches.
+- Tests (`test/divide.test.ts`): over five seeds, a pool's binomial count sums exactly, a `half` count of 11 is 5 and 6,
+  and 20 tokens land once each; a split site written once or three times is refused. Suite 111/111; bench level with
+  F59 (MAPK ×40 3.78, embryo 2.54 ms/step).
+
+**For the spec:** the semantics of a divided site (the policies and what counts as a count) and its spelling. A rule
+attribute is kaleidoscope's provisional spelling; Boundary's docs/32 proposes `?r/1`, `?r/2`. Conservation across a
+division is a theorem of the definition: each count's parts sum to it, and each other node lands once.

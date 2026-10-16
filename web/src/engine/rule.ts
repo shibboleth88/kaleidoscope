@@ -35,6 +35,11 @@ export interface Rule {
   guard?: Expr;
   /** PROVISIONAL (operations answered in place): reactum scalar nodes whose value is computed from the sites. */
   computed?: { node: Id; expr: Expr; kind: ScalarKind }[];
+  /**
+   * PROVISIONAL (division; spec finding F61): a redex site the reactum writes twice, partitioned between its two places
+   * rather than copied (`divide.ts`). Applied by whoever runs the reaction, after it.
+   */
+  split?: number;
 }
 
 const nodup = (xs: number[]) => new Set(xs).size === xs.length;

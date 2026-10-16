@@ -926,6 +926,8 @@ export const readState = (src: string, sig: Signature): Carrier => buildState(pa
 export interface RuleOptions {
   /** A number, or an expression over the redex's sites, evaluated at each spot (as text). */
   rate?: number | string;
+  /** A redex site, by name, that the reactum writes twice and divides between its places (F61). */
+  split?: string;
 }
 
 /** A rule, `redex => reactum unless negative …`. */
@@ -976,6 +978,16 @@ export function buildRule(
     return i;
   });
 
+  // a site divided between its two places (F61): written exactly twice in the reactum
+  let split: number | undefined;
+  if (opts.split !== undefined) {
+    const name = opts.split.replace(/^"|"$/g, '').replace(/^\?/, '');
+    split = redexSite.get(name);
+    if (split === undefined) throw new ReadError(`split: ?${name} is no redex site`);
+    const uses = sites.filter((i) => i === split).length;
+    if (uses !== 2) throw new ReadError(`split: ?${name} is written ${uses} times in the reactum, not twice`);
+  }
+
   // kept by name, nodes and edges
   const kept: [Id, Id][] = [];
   for (const [n, b] of reactum.named) {
@@ -1011,7 +1023,7 @@ export function buildRule(
 
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
-    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr, guard, computed: reactum.computed },
+    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr, guard, computed: reactum.computed, ...(split !== undefined ? { split } : {}) },
     redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
     reactum: {
       nodes: reactum.source,

@@ -133,10 +133,10 @@ export function buildProgram(ast: ProgramAst, types: (TypeAst & { module: string
     if (ruleAttrs.has(r.name)) throw new ReadError(`the rule ${r.name} is declared twice`);
     const attrs: Record<string, string> = {};
     for (const it of r.attrs) if (it.k === 'member' && it.key && 'text' in it.key) attrs[it.key.text] = valueText(it.value);
-    const { rate, ...rest } = attrs;
+    const { rate, split, ...rest } = attrs;
     let rule: Rule;
     try {
-      rule = buildRule(r.name, r.rule, sig, rate !== undefined ? { rate } : {}).rule;
+      rule = buildRule(r.name, r.rule, sig, { ...(rate !== undefined ? { rate } : {}), ...(split !== undefined ? { split } : {}) }).rule;
     } catch (e) {
       throw new ReadError(`rule ${r.name}: ${(e as Error).message}`);
     }
