@@ -5,6 +5,7 @@
  * - a node holding counts (an int attribute whose type, or a supertype, declares `divide`) stands in both places, each
  *   count partitioned by its type's policy: `binomial` (each molecule independently, p = 1/2) or `half` (⌊n/2⌋ and
  *   ⌈n/2⌉, the odd one at random);
+ * - a node whose type declares `divide = "copy"` (a constant of the composite, holding no material) stands in both;
  * - any other node goes whole to one place or the other, uniformly at random, with all it holds.
  * Every count's two parts sum to it and every other node lands in exactly one place, so conservation holds as it did.
  *
@@ -50,6 +51,8 @@ export function divide(g: Carrier, sig: Signature, roots: Id[], copied: [Id, Id]
   for (const root of roots) {
     const copy = copyOf.get(root);
     if (copy === undefined || !byId.has(root)) throw new Error(`divide: site root ${root} has no copy`);
+    // a constant of the composite (its type declares `divide = "copy"`) stands in both places, as the copy left it
+    if (sig.types.find((t) => t.id === byId.get(root)!.type)?.style?.divide === 'copy') continue;
     const held = counts(root);
     if (held.length) {
       // a count holder stands in both places: each count partitioned between the original and its copy

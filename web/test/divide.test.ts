@@ -15,9 +15,10 @@ Program(
     Token = Type()
     Box = Type()
     Mark = Type()
+    Template = Type[divide = "copy"]()
     split[rate = 1.0 | split = "r"] = (?m = Mark | ?x = Box(?r)) => (${uses})
   )
-  world = (Mark | Box(Pool[a = 1000 | b = 11] | ${Array(20).fill('Token').join(' | ')}))
+  world = (Mark | Box(Pool[a = 1000 | b = 11] | Template | ${Array(20).fill('Token').join(' | ')}))
 )`;
 
 describe('division', () => {
@@ -43,6 +44,8 @@ describe('division', () => {
       const tokens = boxes.map((b) => inBox(b.id, 'Token').length);
       expect(tokens[0] + tokens[1], `seed ${seed}`).toBe(20);
       expect(g.nodes.filter((n) => p.sig.name(n.type) === 'Token').length).toBe(20);
+      // a constant stands in both
+      expect(boxes.map((b) => inBox(b.id, 'Template').length)).toEqual([1, 1]);
     }
   });
 

@@ -1107,3 +1107,16 @@ not copied.
 **For the spec:** the semantics of a divided site (the policies and what counts as a count) and its spelling. A rule
 attribute is kaleidoscope's provisional spelling; Boundary's docs/32 proposes `?r/1`, `?r/2`. Conservation across a
 division is a theorem of the definition: each count's parts sum to it, and each other node lands once.
+
+### F62. Division: a constant kept in both halves
+
+**Came up (Boundary, 2026-10-16, plan F2d):** a cell holds constants of its own, its stable RNAs' templates (each
+RNA's base counts, which the rule that breaks it down reads). Divided as molecules, each template went to one daughter
+only, and the other could no longer break that RNA down.
+
+**Engine change (`divide.ts`):** a node whose type declares `divide = "copy"` stands in both places, as the copy left it.
+It is for constants that hold no material, so copying conserves everything; the engine does not check that, its
+declarer does. Test: a `Template` in a divided box is in both halves. Suite as before.
+
+**For the spec:** division policies at the node level beside the count level (F61): `copy` for a composite's
+constants.
