@@ -19,6 +19,7 @@
  * - a module is a text of declarations; `Module["p"]` is answered as it is read, by the caller's `load`.
  */
 
+import { splitKeyed } from './keyed';
 import type { Carrier, Scalar } from './carrier';
 import { type Rule, checkRule } from './rule';
 import { Signature, type TypeSpec } from './signature';
@@ -134,15 +135,25 @@ export function buildProgram(ast: ProgramAst, types: (TypeAst & { module: string
     const attrs: Record<string, string> = {};
     for (const it of r.attrs) if (it.k === 'member' && it.key && 'text' in it.key) attrs[it.key.text] = valueText(it.value);
     const { rate, split, ...rest } = attrs;
-    let rule: Rule;
-    try {
-      rule = buildRule(r.name, r.rule, sig, { ...(rate !== undefined ? { rate } : {}), ...(split !== undefined ? { split } : {}) }).rule;
-    } catch (e) {
-      throw new ReadError(`rule ${r.name}: ${(e as Error).message}`);
+    // draws of a class (F72): `draw`, `draw2`, … each `take[?p Class ?k Rewrite]`
+    const draws = Object.keys(rest).filter((k) => /^draw\d*$/.test(k)).sort((a, b) => Number(a.slice(4) || 1) - Number(b.slice(4) || 1));
+    const drawTexts = draws.map((k) => rest[k]);
+    for (const k of draws) delete rest[k];
+    const opts = { ...(rate !== undefined ? { rate } : {}), ...(split !== undefined ? { split } : {}), ...(drawTexts.length ? { draws: drawTexts } : {}) };
+    // a rule making one keyed entry is read as its merge and its make (F73), so the merge can flow
+    const two = split === undefined ? splitKeyed(r.rule, sig) : null;
+    const readings: [string, typeof r.rule][] = two ? [[r.name, two.merge], [`${r.name}+`, two.make]] : [[r.name, r.rule]];
+    for (const [name, ast] of readings) {
+      let rule: Rule;
+      try {
+        rule = buildRule(name, ast, sig, opts).rule;
+      } catch (e) {
+        throw new ReadError(`rule ${name}: ${(e as Error).message}`);
+      }
+      const problems = checkRule(rule, sig);
+      if (problems.length) throw new ReadError(`rule ${name}: ${problems.join('; ')}`);
+      rules.push(rule);
     }
-    const problems = checkRule(rule, sig);
-    if (problems.length) throw new ReadError(`rule ${r.name}: ${problems.join('; ')}`);
-    rules.push(rule);
     ruleAttrs.set(r.name, rest);
   }
 

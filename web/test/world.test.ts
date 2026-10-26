@@ -248,3 +248,40 @@ Program(
     expect(view(d.live(w.g))).not.toEqual(view(spots(w.g, p.rules, p.sig)));
   });
 });
+
+describe('a world resumed from its snapshot', () => {
+  // (the live spots taken in the order the search meets them, not sorted: an order the state's history made would show)
+  const choose = (w: World, rules: Rule[], sig: Signature, random: () => number) => {
+    const live = spots(w.g, rules, sig);
+    if (!live.length) return null;
+    const total = live.reduce((x, s) => x + s.rate, 0);
+    let u = random() * total;
+    let chosen = live[live.length - 1];
+    for (const s of live) if ((u -= s.rate) < 0) { chosen = s; break; }
+    return { rule: chosen.rule, occ: chosen.occurrences[Math.floor(random() * chosen.occurrences.length)] };
+  };
+  for (const [name, sig, rules, start] of systems())
+    it(`goes on as the world that made it does, list for list (F82): ${name}`, () => {
+      const world = new World(start, sig), random = rng(7);
+      for (let k = 0; k < 120; k++) {
+        const c = choose(world, rules, sig, random);
+        if (!c) break;
+        world.apply(c.rule, c.occ, sig, { inPlace: true });
+      }
+      // (its next identities carried with it, as a checkpoint carries them: those of nodes since removed stay used)
+      const resumed = new World(world.snapshot(), sig), a = rng(11), b = rng(11);
+      resumed.next = { ...world.next };
+      let steps = 0;
+      for (; steps < 120; steps++) {
+        const x = choose(world, rules, sig, a), y = choose(resumed, rules, sig, b);
+        expect(!!y, `step ${steps}`).toBe(!!x);
+        if (!x || !y) break;
+        expect(y.rule.name, `step ${steps}`).toBe(x.rule.name);
+        expect(y.occ.nodes, `step ${steps} (${x.rule.name})`).toEqual(x.occ.nodes);
+        world.apply(x.rule, x.occ, sig, { inPlace: true });
+        resumed.apply(y.rule, y.occ, sig, { inPlace: true });
+        expect(JSON.stringify(resumed.g), `state after step ${steps} (${x.rule.name})`).toBe(JSON.stringify(world.g));
+      }
+      expect(steps).toBeGreaterThan(5);
+    });
+});

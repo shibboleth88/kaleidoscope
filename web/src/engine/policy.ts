@@ -49,7 +49,7 @@ export function spots(g: Carrier, rules: Rule[], sig: Signature): Spot[] {
       let rate = rule.rate ?? 1;
       if (rule.rateExpr) {
         try {
-          rate = (evaluate(rule.rateExpr, siteEnv(ix, occurrences[0].sites, sig, occurrences[0].rests), 'float') as { float: number }).float;
+          rate = (evaluate(rule.rateExpr, siteEnv(ix, occurrences[0].sites, sig, occurrences[0].rests, occurrences[0].nodes), 'float') as { float: number }).float;
         } catch {
           rate = 0;
         }
@@ -89,7 +89,7 @@ export function step(g: Carrier, rules: Rule[], sig: Signature, random: () => nu
   }
   const picked = chosen.occurrences[Math.floor(random() * chosen.occurrences.length)];
   const occ = discovery ? discovery.fresh(g, chosen.rule, picked) : picked;
-  const { state, transition } = react(g, chosen.rule, occ, sig);
+  const { state, transition } = react(g, chosen.rule, occ, sig, { random });
   discovery?.advance(g, state, transition);
   const dt = -Math.log(1 - random()) / total;
   return { state, transition, dt, live: live.length };

@@ -40,6 +40,28 @@ export interface Rule {
    * rather than copied (`divide.ts`). Applied by whoever runs the reaction, after it.
    */
   split?: number;
+  /**
+   * PROVISIONAL (chrysalis D-a-rate-is-per-spot: a library draw without replacement; boundary's B2; F72): draws of
+   * several molecules of a class in one event. Each takes `count` molecules from the keyed entries of `type` that the
+   * redex's node `place` holds and whose attributes equal `filters`, by the multivariate hypergeometric over those
+   * entries, and puts each back with its attributes `set` rewritten (merged by key, F69). The rule meets only where the
+   * class holds `count`.
+   */
+  draws?: Draw[];
+  /** PROVISIONAL (F73): for each negative, an equality its own sites must meet with the redex's (a join), if any. */
+  negativeGuards?: (Expr | undefined)[];
+}
+
+export interface Draw {
+  place: Id;
+  type: string;
+  filters: [string, Expr][];
+  count: Expr;
+  set: [string, Expr][];
+  /** The keyed type the molecules are put back as, where it is not the class's own (each keeping its attributes). */
+  into?: string;
+  /** Or: the style key each drawn entry's type names its put-back type by (F77). */
+  intoBy?: string;
 }
 
 const nodup = (xs: number[]) => new Set(xs).size === xs.length;

@@ -1120,3 +1120,399 @@ declarer does. Test: a `Template` in a divided box is in both halves. Suite as b
 
 **For the spec:** division policies at the node level beside the count level (F61): `copy` for a composite's
 constants.
+
+### F63. A supertype pattern filtered by a literal attribute value is very slow to keep current (observed; no change)
+
+**Came up (Boundary, 2026-10-17, plan C5):** two rules matched `Protein[client = 1 | n = ?n | u = ?u]`, meaning every
+`Protein` subtype node, about 455 of them, filtered by a literal value of one of its attributes. The whole organism then
+ran a 2 s window in 358 s of wall time, against 13 s for the same tree before. With the clients given a subtype of
+their own (`ClientProtein <: Protein`) and the rules matching `ClientProtein[n = ?n | u = ?u]`, the same window took
+13.4 s, with the same number of events.
+
+**Not yet reduced to a small case.** The guess is that a literal-valued site on a supertype pattern defeats the
+incremental discovery's indexed path, so the rule's occurrences are searched again across all subtype nodes on each
+change. A fixture with a few hundred subtype nodes, one rule filtered by a literal and one by a subtype, timed against
+each other, is the reproduction to write before any engine change.
+
+**For the spec:** a literal attribute value in a redex is a filter that a matcher may index or may not. If the spec
+promises nothing, a model author needs to know which spelling is cheap. Boundary now uses subtypes for such
+classifications.
+
+### F64. Integer division in a rate: floored on the graph, real on the flow (observed; no change)
+
+**Came up (Boundary, 2026-10-17, plan H14c):** a rate held a ratio of counts, `?w / (?w + ?s1 + … )`, water over water
+and solutes. On the graph v004 reads integer over integer as floor division, so the rate was exactly 0 and Discovery
+dropped the spot. The PDMP flow, though, evaluates the same expression on its real-valued state, where the ratio is a
+fraction, so the water flowed: about 10¹¹ per second each way. The same rule had two meanings in the two regimes, and
+nothing said so. The model now writes `1.0 * ?w / (…)`.
+
+**Reproduction to write:** a rule `r[rate = ?a / (?a + ?b)] = (P[a = ?a | b = ?b]) => (P[a = ?a - 1 | b = ?b + 1])`
+with a = 3 and b = 1. Discovery gives rate 0. A run with the rule forced to flow moves `a`.
+
+**For the spec:** either the flow keeps integer semantics where the spec has them (floor on the relaxed state), or the
+spec says a rate is real-valued and `/` in a rate is real division. Integer floor in a reactum (a count's step) is
+another matter, where the floor is meant (`?l / 10`). A checker could at least flag an integer ratio in a rate.
+
+### F65. A supertype's pattern meets no node of a subtype declaring more attributes (observed; no change)
+
+**Came up (Boundary, 2026-10-18, plan H8):** boundary's turnover of inserted membrane proteins matched
+`InsertedProtein[n = ?n | …]`, a supertype. Its subtypes (`Ins_<gene>`) declare attributes the supertype does not, their
+codon counts. The rule found no occurrence at all, though the signature holds each `Ins_<gene> <: InsertedProtein`. So
+inserted proteins were never turned over, from boundary's H12c until a census test found it. Lipoproteins' uncut forms
+(`Dag_<gene>`, declaring their signal peptides' residues) were missed by `Lipoprotein[…]` the same way.
+
+**Reproduction:** `Sup[n :: Count = 0] = Type()`, `A[n :: Count = 0 | y :: Int = 1] = Type(<: Sup)`, the world `A[n = 3]`,
+and `t[rate = 1.0] = (?k = Sup[n = ?n]) => (?k = Sup[n = ?n])`.
+- **Observed:** Discovery finds no occurrence.
+- **With `y` declared on `Sup` too, or not on `A`:** it finds 1.
+- **A supertype attribute without a default, defaulted on the subtype:** it matches. Only an attribute the supertype
+  does not know defeats it.
+
+**Worked around, no engine change:** each supertype now declares every attribute its subtypes do, with defaults.
+
+**For the spec:** whether a pattern on a supertype ignores the attributes a subtype adds, as partial attribute matching
+ignores the declared attributes it does not name. That is open-world record subtyping, the reading boundary assumed.
+Today they make the match fail silently. Either way, a refusal at read time ("this pattern can meet no node of these
+subtypes") would have caught it at once.
+
+### F66. Division: a node holding one count is copied whole, its other attributes with it (observed; no change)
+
+**Came up (Boundary, 2026-10-18, plan H1/F2d):** boundary gave each message `Mrna[… | C :: Int | … | load :: Count]`, the
+ribosomes on it. Because `Count` declares `divide = "binomial"`, `divide` (F61) took every message for a count holder:
+it stood in both daughters, its `load` partitioned and its plain `Int` attributes (its atoms, `C`, `H`, …) copied. The
+daughters held about 1.3 M more carbon than the mother. Boundary's division law caught it; `load` is now a plain `Int`.
+
+**Reproduction:** `Count = Type[kind = "int" | divide = "binomial"](<: Int)`, `M[x :: Int | k :: Count = 0] = Type()`,
+a world `Cell(M[x = 5 | k = 2])` and a rule splitting `Cell`. **Observed:** both daughters hold an `M` with `x = 5`.
+
+**For the spec:** a node is either a pool (all of its counts divide) or a thing (it goes whole to one side). A node mixing
+dividing counts with other int attributes is ambiguous, and today it is resolved by copying, which conserves nothing.
+A checker could refuse such a type at read time, or `divide` could refuse to copy a non-dividing int attribute.
+
+**Related, also observed:** nodes joined by a link (a ribosome and its message, on one `Message` bond) go to the two
+daughters independently, so a bond can end up spanning them. Whether `split` keeps a linked group together is open.
+
+### F67. A rate is real-valued: division in a rate is the true quotient (changed; closes F64 here)
+
+**Decided upstream:** chrysalis `D-a-rate-is-real` (2026-10-18, boundary's B6): a rate is real, its division the true
+quotient, never floored, the same under exact and hybrid policies; a reactum's Integer arithmetic keeps its floor.
+
+**Changed:** `realDivision` (`expr.ts`) rewrites each division in a rule's rate as `(1.0 * a) / b` when the rule is read
+(`text.ts`), so every evaluator, the engine's and a policy's own compiled form, reads it as real. Guards and reactum
+computations are untouched: their whole-number division still floors. A rate meaning a floor writes `floor[a / b]`.
+
+**Test:** `test/rate.test.ts`: `?a / (?a + ?b)` at 3, 1 is 0.75 (was 0); nested divisions too; a reactum's `?l / 2` at 7
+writes 3. **Bench:** unchanged within noise (MAPK×40 incremental 3.70 → 3.58 ms/step; embryo 2.62 → 2.72 ms/step).
+
+**Boundary:** six rate families that meant a floor (subunits available per copy, the ribosome footprint, the unfold
+threshold) now write `floor[...]`; its water law's `1.0 *` workaround is now redundant.
+
+### F68. A join on a value: a variable written at two attribute sites (changed; closes F60)
+
+**Changed:** the reader (`text.ts` `buildRule`) takes a variable written at a second attribute site of a redex as a join:
+the later site is its own, renamed (`?k#i`), and the rule's guard gains `?k == ?k#i`. The reactum, the rate and the
+guard read the first. A structural site (one holding nodes) written twice is still refused.
+
+**Semantics and cost:** the equality is tested on the occurrences the redex's structure meets, after binding, as
+chrysalis `interp.patterns` (docs/QUERIES.md C4) has it. There is no index by value (B5's open question): a join over
+N × M candidates costs N × M where the structure alone meets them all. Incremental discovery keeps it current, since a
+guard's sites are read sites (a change of value at either side re-rates the occurrence).
+
+**Test:** `test/join.test.ts`: a fork at segment k meets only the segment whose index is k, one rule for all segments,
+the fork stepping along all three in order; incremental discovery equal to a full search over 200 steps of a two-
+attribute join whose values move on both sides; a structural site written twice refused.
+
+### F69. Keyed counts: one entry per place, type and key; find or make, merge, a zero leaving (changed)
+
+**Decided upstream:** chrysalis `D-keyed-counts-are-a-place-keyed-by-a-record` (2026-10-18, boundary's B1).
+
+**Changed (PROVISIONAL surface):** a type declares `Type[keyed = "n"]`: its nodes are entries, keyed by their type and
+every attribute but `n`, their count. After every reaction (`World.reconcile`, from `World.apply` and from `react`),
+an entry the reaction made, moved, copied or rewrote merges into its place's entry of the same key, the counts summed,
+and an entry at count 0 leaves. So a reactum writes `Rna[a = 1 | b = ?y | n = 1]` to add one molecule at that key,
+whether or not the place holds it. The transition names the merged entry as removed and the survivor's count scalar as
+removed and made, so discovery is told exactly what changed. Each place's entries are mapped by key once, kept as
+entries are reconciled and checked on use; a key held twice when the map is built (a state not yet reconciled) is looked
+up in the place. Division needs nothing new: an entry's count is a `Count` (F61's count holder, F66), so it is split
+between the daughters and its key kept in both.
+
+**The spec's shape and this one:** the decision is a map place keyed by an attribute record, its values counts. Here the
+entries are ordinary nodes and the key is their attributes; matching is the engine's partial attribute match. The
+equivalence with the molecule-per-node form is stated, not yet checked as a fold (B4).
+
+**Not done:** an entry at 0 under a flow (a PDMP's relaxed count) stays until a reaction touches it; uniqueness is not
+affected. A redex cannot take two molecules from one entry (matching is injective); write the count down by 2.
+
+**Test:** `test/keyed.test.ts` (boundary's suite case B1): an RNA with sites a and b, an enzyme for each, degradation of
+any; over seeds, in place with incremental discovery and as pure reactions: the books exact, one entry per key, none at
+0, discovery equal to a fresh search after every merge; the mean count with a made at t = 10 against the closed form
+within three standard errors.
+
+### F70. A rate is per spot: a keyed entry of count n is n spots (changed)
+
+**Decided upstream:** chrysalis `D-a-rate-is-per-spot` (2026-10-18, boundary's B2; F22): a rule's rate is each
+occurrence's propensity, a rule meeting a count of n molecules being n spots, each molecule equally likely.
+
+**Changed:** for each keyed node in a redex, the reader multiplies the rule's rate by that node's count (the site at
+its count, written or implicit, or the literal written there). The rate as written is per molecule; every evaluator
+reads the product, a policy's compiled form and a flow's relaxed counts included. Non-keyed counts are untouched: a
+pool's attribute (`Metabolites[atp = ?a]`) is a value, and its mass action stays written in the rate.
+
+**Not done:** a draw of several molecules of a class in one event (a library draw without replacement, multivariate
+hypergeometric, per the decision). One event meets one entry per keyed redex node.
+
+**Test:** `test/keyed.test.ts`: entries of 30 and 70, a consumer at rate 1 per molecule: propensities 30 and 70 (35 for
+a rule at 0.5 not writing the count); the first molecule taken over 400 seeds from the larger entry 0.7 of the time
+within three standard errors.
+
+### F71. An amount of a class in an expression: a keyed class's counts summed (changed; part of B3)
+
+**Asked:** boundary's B3 (`docs/36`; chrysalis R-aggregates-in-rates-maintained, planned). The spec's form is a fold,
+`sum[P(n = ?c) -> ?c]`; boundary needed the case of a keyed class first: how many charged tRNAs of a species there are,
+over every modification state.
+
+**Changed (PROVISIONAL surface):** `amount[?p Type[k = v | …]]` in a rate, guard or computed value: the counts of the
+keyed entries (F69) of Type, or a subtype, that the redex's node `?p` holds, whose attributes `k` equal `v` (literals or
+the redex's values), summed. It is worked out where it is read, over what `?p` holds (keep a class's entries in a place
+of their own, so the scan is the class's size). Incremental discovery keeps it current: a rule reading an amount is
+never lazy, and a change to any keyed entry is a change that touches it (its place, holding the change, is affected).
+
+**Fixed beside it:** an occurrence's rate was evaluated with no map from redex nodes to the state's (`siteEnv` without
+`nodes`, in discovery and the policy, and in boundary's runtime), so a rate could read no named node; it can now.
+
+**Not done:** the general fold (`sum[P(…) -> E]` over any pattern), and a maintained sum (O(1) per change): the amount
+is a scan of the place, B3's cost question open. Under a flow, an amount reads the world's values unless the flow's
+environment gives its own `attr`.
+
+**Test:** `test/keyed.test.ts`: a reader's rate 0.01 × the charged of its species over every mark, equal to the law at
+every one of 300 steps while entries are made, merged and drawn down, and discovery equal to a fresh search throughout.
+
+### F72. A draw of several molecules of a class in one event (changed; closes B2)
+
+**Decided upstream:** chrysalis `D-a-rate-is-per-spot`: drawing several molecules of a class in one event is a library
+draw without replacement (multivariate hypergeometric over the class's entries).
+
+**Changed (PROVISIONAL surface):** a rule option `draw = take[?p Type[filters] count Type[rewrites]]` (and `draw2`, …):
+when the rule fires, `count` molecules are taken from the keyed entries of Type that `?p` holds and whose attributes equal
+the filters, one at a time without replacement, each equally likely, and put back beside their entries with the rewrites
+applied, then merged by key (F69). The values are read before the reaction. The rule meets only where the class holds
+`count` (an implicit guard on its amount, F71). `World.apply` and `react` take a source of chance for it (`random`);
+`step` passes its own.
+
+**Test:** `test/keyed.test.ts` (boundary's B2 E3): three charged tRNAs of a species drawn from marks 0 and 1 (30 and 70)
+and put back uncharged: the books exact, one entry per key, another species untouched; over 400 seeds the number from
+mark 1 has the hypergeometric mean 2.1 and variance 3 · 0.7 · 0.3 · 97/99 within three standard errors; in place, with
+discovery current; a class holding fewer than the draw is not met.
+
+### F73. A keyed move read as its merge and its make, so the merge can flow; joins in negatives (changed)
+
+**Came up (Boundary, plan H9a):** a rule writing a keyed entry (F69) finds it or makes it. Read as one rule it makes a
+node every time, so it is never affine (`affine`), and a runtime integrating affine rules as a flow (boundary's PDMP)
+must jump it. tRNA charging, written on keyed entries, is ~10⁵ firings a second: it has to flow.
+
+**Changed:** `keyed.ts` `splitKeyed`, from the program reader. A rule whose reactum makes one keyed entry, its key
+written in literals and the redex's values, is read as two rules:
+- **merge** (its own name): the entry at that key is in the redex (`?__t`, each value of its key a variable of its
+  own joined to the redex's by `where`, F68), and the reactum adds the count to it. Every node kept, only counts
+  changed: affine where the rest of the rule is.
+- **make** (`name+`): the rule as written, `unless` an entry stands at that key.
+Exactly one meets where the rule as written would, and does what it would. The target is no reactant: its count does
+not multiply the rate (F70). A rule making more than one keyed entry, or one whose key is an expression, is not split.
+
+**Two engine changes it needed:**
+- **A join in a negative:** a negative naming a redex value at an attribute of what it adds (`unless Rna[a = 1 |
+  b = ?y]`) took no constraint from it (the site was skipped), so it blocked wherever any such node stood, or nowhere.
+  It is now its own site, joined by an equality checked when the negative is met (`negativeGuards`).
+- **`affine` and literals:** a rule matching a literal at a kept node's attribute (`Rna[a = 0 | …]`) writes it back in
+  its reactum, a fresh scalar node, and its redex holds that literal as an unkept node; so no such rule was affine.
+  Now a literal written back unchanged at the same key of a kept node is no change. (Boundary's organism: no rule
+  changes regime, 545 of 1396 affine before and after; it has no negatives.)
+
+**Test:** `test/keyed.test.ts`: the B1 program reads as five rules, the two merges affine and the makes not; at the
+seed only the makes meet (rates per molecule of the source: 10 and 5), and once the entry stands only the merge meets,
+at the same rate; the laws and the closed-form marginal hold as before.
+
+### F74. An amount in a rate is re-rated, not found again; a draw's availability is a rate factor (changed)
+
+**Came up (Boundary, plan H9b):** coarse translation, the rescue and the stringent response read every tRNA species'
+charged amount, at every ribosome at work (hundreds of occurrences), while charging changes those entries ~10⁵ times
+a second. F71 kept amounts current by making every keyed type value-sensitive, so each change found every occurrence
+meeting the place again: a search where a pool's value change costs a re-rating.
+
+**Changed:**
+- **An amount in a rate** is read as the rate reading everything its place holds (`readsAt`: 'all' at that redex
+  node). Where a keyed entry is made, removed or its count changes (a reaction, or values moved in place), what meets
+  its place is rated again, not found again. Only an amount in a guard or a computed value (which decides what meets)
+  keeps the full search, and its rule is never lazy.
+- **A draw's "the class holds k"** (F72) is now a factor of the rate, `if[amount >= k 1.0 0.0]`, not a guard: the
+  occurrence stands whatever the counts, at rate 0 while the class is short. A policy firing it must still see the
+  class hold k (boundary's runtime checks the graph's entries before a jump, as it does a jump's decrements).
+
+**Test:** `test/keyed.test.ts` (F71's: the amount equal to the law at each of 300 steps, discovery equal to a fresh
+search after every merge, make and draw-down; a short class met at rate 0).
+
+### F75. A rate reading an entry's count is that entry's propensity as written (changed; amends F70)
+
+**Came up (Boundary, plan H9b):** every tRNA law boundary had was written over a pool's count, saturating in it
+(`?f / (K + ?f)`). Made keyed entries, F70 multiplied each again by the entry's count, `f²`.
+
+**Changed:** the per-spot multiplication (F70) applies to a keyed redex node only where the rate does not read that
+node's count. A rate reading it is the entry's whole propensity, as its author wrote it: a saturating law over a class
+is `?f / (K + amount[…])`, the entry's count over the class's (F71). A rate not reading it is per molecule.
+
+**Test:** `test/keyed.test.ts`: at an entry of 30, `rate = 0.5` meets at 15, `rate = 2.0 * ?k / (10 + ?k)` at 1.5.
+
+### F76. Value sensitivity by attribute key; keyed counts rewritten in place (changed; performance)
+
+**Came up (Boundary, plan H9b):** with its tRNAs as keyed entries, boundary's organism ran 2× slower than with them as a
+pool, then (after F74) still ~5× in its discovery: every structural event found ~65 single-occurrence rules again whole.
+Two causes:
+- **Reconcile and draw replaced count scalars** with fresh nodes, so a merge was a structural change. Now they write
+  the count where it stands, named `revalued` (as `World.apply`'s `inPlace` does): a merge is a change of value.
+- **Whether a value change can change what meets was decided by type:** any rule with a negative (each keyed make,
+  F73: 111 in the organism) made every type its redex meets value-sensitive, `Metabolites` and `Machines` among them,
+  so every count changed there was structural, and every lazy rule meeting them was dropped. Now each rule's value
+  dependence is read by attribute key (`valueKeys`): its literals' hosts and keys, the sites its guard and joined
+  negatives read, and every node of a rule reading across links or an amount in a guard. A negative that only adds
+  nodes tests presence, not values. `sensitive(type)` reads the same map. (A first version also counted every
+  attribute literal's own type, `Int`, which made every count sensitive: a literal's own type counts only where it
+  stands as no node's attribute.)
+
+**Measured (boundary's organism, seed 3, 3 s, PDMP, one engine):** pool-form tRNAs 33.2 s (searches 0.3 s);
+keyed, before: 170 s per 0.3 s at first, then 64–66 s (searches 15.7 s); after: 40.3 s (searches 1.1 s). The rest is
+in the flow: the same 870 steps, each law reading its class's entries (charging's amounts), 1.3–1.4× the rate
+evaluations' cost. **Bench:** unchanged (MAPK×40 incremental 3.52 ms/step, embryo 2.58).
+
+**Test:** the engine's incremental-against-full tests (`incremental.test.ts`, `keyed.test.ts`, `join.test.ts`).
+
+### F77. A draw across types, each molecule put back by its own type (changed; boundary H9c)
+
+**Asked upstream:** boundary `docs/37` §C; chrysalis `R-a-draw-across-types-puts-back-by-type` (open; the provisional
+form's test sent as `boundary/upstream-contracts/spec5-asks/h9c-draw-across-types.ys`).
+
+**Changed (PROVISIONAL surface):** a draw's class is any type, its keyed subtypes its entries (a codon class: a supertype
+each reading tRNA species declares, `<: ReadsGGA`; a type may declare several). Its rewrite may name, in place of a type,
+a style key no type has (`uncharged[]`): each drawn molecule is put back as the keyed type its own type's style names
+there (`Type[… | uncharged = "T_freeA"]`), keeping its other attributes, and merged by key (F69). The reader refuses a
+class one of whose keyed types names no keyed type at that key.
+
+**Test:** `test/keyed.test.ts`: 10 drawn from readers A (30) and B (70, mark 1): each species conserved, B's put back at
+mark 1, one entry per key; over 300 seeds the number from B has the hypergeometric mean 7 within three standard errors.
+
+### F78. An amount read once per pass of rating, from its class's entries (changed; performance)
+
+**Found (boundary, 2026-10-20):** the organism's cost per simulated second grew with the number of translating
+ribosomes, 7.6 s at 2 s to 24 s at 5 s, and a 60 s test run had not finished after 90 minutes. Each translating
+ribosome has three occurrences (finishing, the tmRNA rescue, the stringent response). Each reads the amounts of
+the 28 codon classes, in its rate or its draws' availability (F74). Charging changes the tRNA entries at every flow
+step, so every one of those occurrences was rated again at every step. Each amount walked every child of its place,
+a few hundred entries, to find its class's few.
+
+**Changed (no surface):**
+- `Index.childrenOf(place, owner, class, keep)` lists a place's children of one class once, and again only after a
+  node joins or leaves the place (a version per place, bumped in `rekey`, which every add and drop calls).
+- `withinPass(fn)` (expr.ts) runs one pass of rating, in which the state does not change. Each `amount` expression
+  keeps its readings for that pass, by place and its filters' values. Both of discovery's re-rating loops
+  (`advanceValues`, and the values pass of `update`) run in one. Outside a pass, nothing is kept.
+- Exact: the same trajectory, step for step (boundary, seed 7, 6 s: 833,657,327 steps before and after).
+
+**Measured (boundary's organism, seed 7, PDMP, one engine):**
+- 6 s: 110.5 s before, 78.4 s after.
+- Rate evaluation from 4 s to 5 s, with 43 ribosomes translating: 9.4 s before (47,000 calls), 1.1 s after (81,000
+  calls). What remains is the flow's integration.
+- 10 s on a quiet machine: flat at 9–13 s a simulated second from 2 s on, where before the fix it grew past 24 s by
+  5 s. (A 30 s run under heavy load from other jobs on the shared machine looked as if it climbed again. Repeated on a
+  quiet machine, it did not.)
+
+**Bench:** unchanged (MAPK×40 incremental 3.52 ms/step). **Engine tests:** 127/127.
+
+**Test:** the engine's incremental-against-full tests, which compare every rate after every step with a full
+re-evaluation (`incremental.test.ts`, `keyed.test.ts`).
+
+### F79. A change of value's sensitivity, answered once per type and key (changed; performance)
+
+**Found (boundary, profiling, 2026-10-20):** of 10 simulated seconds of the organism (110.7 s), the flow's realization
+took 43.4 s. Nearly all of that was discovery's check of whether a change of value could change what meets
+(`sensitiveAt`, F76). A realization moves hundreds of keys on the metabolite pool every flow step. For each one, the
+check scanned every rule's value key with a subtype test.
+
+**Changed (no surface):** the answer for a type and a key is kept for the run. The rules, and so the keys they read,
+are fixed once read.
+
+**Measured (boundary's organism, seed 7, PDMP, 10 s):**
+- 110.7 s before, 70.0 s after (11.1 → 7.0 s per simulated second); the realization 43.4 → 6.6 s.
+- Exact: the same 3,284 flow steps, the books exact.
+
+**Bench:** MAPK×40 incremental 3.59 ms/step (3.52 before, within the shared machine's noise; it does not realize a
+flow). **Engine tests:** 127/127.
+
+### F80. Discovery counts the changes to which spots are live (changed; performance)
+
+**Found (boundary, profiling, 2026-10-20):** the organism orders its live spots for its events, and kept that order only
+until the next write into the graph. A flow writes every step, so the order was listed again before almost every event:
+`live()` alone took 4.2 s of 65 s (10 simulated seconds), and the hazard's cache, keyed on the order, was rebuilt as
+often.
+
+**Changed (an addition):**
+- `Discovery.version` counts each change to the set `live()` returns: a spot made or dropped, a rate crossing what
+  `live` takes (positive and finite), the rebuild, and, through the parts' discovery, a factored spot's.
+- While it stands, `live()` lists the same spots. A policy may keep its ordering of them.
+- Every rate discovery assigns goes through `setRate`, which checks the crossing.
+
+**Measured (boundary, seed 7, PDMP, 10 s):** 65.2 s before, 58.1 s after (5.8 s per simulated second); the hazard's
+evaluation 14.0 → 10.9 s, its cache now kept across realizations. Exact: the same 3,284 flow steps and 840,486,988
+steps.
+
+**Bench:** MAPK×40 incremental 3.64–3.81 ms/step over three runs, against 3.52–3.59 earlier today. The same code runs
+±5% apart on the shared machine. `setRate` adds two comparisons to each rate assigned. **Engine tests:** 127/127.
+
+### F81. A scalar's and a member's key built on the spot, not cached by object (changed; performance)
+
+**Found (boundary, profiling, 2026-10-20):** a test file of four tests took over 12 minutes, though each test alone
+took 8–120 s. The fourth test's run did the same work after the others (the same firings per simulated second) at a
+fifth to an eighth of the speed. Profiled, `memberKey` took 92.5 s of 145 s (1.5 s when the test ran alone) and
+`scalarKey` 16.6 s (1.2 s). Both cached their key in a `WeakMap` keyed by the scalar or member object. Every cloned
+carrier (`structuredClone`, a `World`, every withdrawal a test builds) brings a million new member objects, and their
+dead entries stay in the table until a full collection. Measured alone, a `WeakMap` cache cost more than building the
+key at any size (2 M objects: 1,591 ms, against 199 ms with no cache), and it grew slower with size.
+
+**Changed:** `scalarKey` and `memberKey` build their string each time. A text scalar's key alone is kept, in a `Map`
+keyed by the text itself (a program's texts are few and fixed). Keys are unchanged, so nothing that indexes by them
+changes.
+
+**Measured (boundary):** after F81, `test/replication.test.ts`'s four tests run as their parts do (see boundary's
+PROGRESS, 2026-10-20). **Bench:** MAPK×40 incremental, old and new back to back, twice each: old 3.93, 3.96, 3.73,
+3.79 ms/step; new 3.92, 3.51, 4.00, 3.84 (parity, within the shared machine's ±5%). Without the text cache, new read
+3.82–4.35, perhaps 5% slower, hence the text cache. **Engine tests:** 127/127.
+
+### F82. A world's lists kept by node id, so a resumed world is the world that made it (changed; determinism)
+
+**Found (boundary, C4a, 2026-10-21):** boundary's `test/parallel.test.ts` resumes a run from a worker's checkpoint and
+asks that it go on exactly as the uninterrupted run does. Seed 4 (with the Jacobian reused) began to fail after a
+model change, though the checkpoint was exact (state, clock, random state, tallies all equal). Stepped side by side, the
+two runs fired the same events with the same occurrences; after a keyed make (`rnaseP_IleCAU+`, F73) the states held the
+same nodes with the same identities, in a different order in `g.nodes`, and the order then decided later matches.
+
+**Cause:** a `World` changes its state in place. It appends each made node to `g.nodes` and to its index's lists (a
+type's nodes, `byType`; a place's children, `kids`; a handle's points), and removes a node by swapping the last into its
+place in `g.nodes`. So its lists follow its history, and after removals they no longer follow `g.nodes`. A world built
+from a snapshot of that state builds its lists from `g.nodes`, in another order. Discovery meets a place's children,
+and a type's candidates, in list order, so the two worlds met occurrences, and removed subtrees (a keyed merge drops an
+entry's children in list order), in different orders: the same graph, written differently, and in time different draws.
+The model change only made a run meet it within the test's window. Every resumed world was open to it.
+
+**Changed:** a world keeps each of its lists in node-id order, which is the state's alone (`Index.orderById` when the
+world is made; `insertById` as it makes a node: at the end, as a new node's id is the newest, else in its place, as for
+a node made again under its own id). A carrier's own index, as functional reaction builds it, is unchanged: its lists
+follow `g.nodes`, which a snapshot carries exactly. (Ordering every index by id was tried first: the embryo bench slowed
+1.83 → 2.4 ms/step, sorting each functional step's fresh index, for nothing, so it is the world's alone.)
+
+**Tests:** `test/world.test.ts`, "a world resumed from its snapshot": each library system, 120 steps in place, then a
+world made from its snapshot (its next identities carried, as a checkpoint carries them) and the original step on with
+the same draws, taking the live spots in the order the search meets them, unsorted; same rule, same occurrence, the
+same state, list for list, at every step. Before F82, 7 of 8 systems fail at their first step; after, 8 of 8 pass.
+**Engine tests:** 135/135. **Bench**, three runs each: embryo old 1.82, 1.83, 1.85 ms/step, new 1.81, 1.85, 1.78;
+MAPK×40 incremental old 3.72, 3.94, 5.04, new 3.65, 3.79, 3.74 (parity).
+
+**For the spec:** a checkpoint must determine the run that follows it, so nothing an implementation orders by its own
+history may decide which occurrence a draw takes. A state's canonical order (here, identities) is one way to say so.

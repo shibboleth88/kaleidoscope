@@ -37,8 +37,9 @@ import {
   isAttr,
   memberScalar,
 } from './carrier';
-import type { Rule } from './rule';
-import { type Expr, FUNCTIONS, NO_SITES, type ScalarKind, evaluate, kindOf } from './expr';
+import type { Draw, Rule } from './rule';
+import { TARGET } from './keyed';
+import { type Expr, FUNCTIONS, NO_SITES, type ScalarKind, evaluate, keyedCountOf, kindOf, realDivision, sitesOf } from './expr';
 import type { Signature } from './signature';
 
 // ── tokens ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -608,6 +609,17 @@ function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> 
       return { site: i };
     }
     case 'expr':
+      if (v.op === 'amount') {
+        // amount[?p Type[k = v | …]] (F71): a node the redex names, and a class written as a pattern of literals and sites
+        const [p, cls] = v.args;
+        if (!p || p.k !== 'site' || !named?.has(p.name)) throw new ReadError('amount[?p Type[…]]: ?p is a node the redex names');
+        if (!cls || cls.k !== 'term' || cls.body !== null) throw new ReadError('amount[?p Type[…]]: a type and its attributes');
+        const filters: Expr[] = cls.attrs.map((it) => {
+          if (it.k !== 'member' || !it.key || !('text' in it.key)) throw new ReadError('amount: each filter is `key = value`');
+          return { op: 'is', args: [{ lit: { text: it.key.text } }, toExpr(it.value, sites, rests, named)] };
+        });
+        return { op: 'amount', args: [{ node: named.get(p.name)! }, { op: 'class', args: [{ type: cls.head }, ...filters] }] };
+      }
       return { op: v.op, args: v.args.map((a) => toExpr(a, sites, rests, named)) };
     case 'term':
       // a bare type name: what count[?x Type] counts
@@ -641,6 +653,8 @@ class Builder {
   computed: { node: Id; expr: Expr; kind: ScalarKind }[] = [];
   /** The item each site was read from (null for an unwritten attribute's). */
   siteSource: (MemberItem | null)[] = [];
+  /** In a negative: its sites joined to a redex value by name (its own index, the redex site's name). */
+  negJoins: [number, string][] = [];
   constructor(
     readonly sig: Signature,
     readonly mode: Mode,
@@ -698,7 +712,14 @@ class Builder {
     const member: Member = attr ? { attr: it.key } : { held: it.key };
     const v = it.value;
     if (v.k === 'site') {
-      if (this.mode === 'negative' && this.referSites.has(v.name)) return;
+      if (this.mode === 'negative' && this.referSites.has(v.name)) {
+        // a redex value named at an attribute of what a negative adds: a join (F68, F73), its own site equal to it
+        if (!attr || it.key === null) return;
+        this.negJoins.push([this.sites.length, v.name]);
+        this.sites.push({ parent, key: member, name: `${v.name}#neg${this.sites.length}` });
+        this.siteSource.push(it);
+        return;
+      }
       this.sites.push({ parent, key: it.key === null ? ANON : member, name: v.name });
       this.siteSource.push(it);
       return;
@@ -928,6 +949,8 @@ export interface RuleOptions {
   rate?: number | string;
   /** A redex site, by name, that the reactum writes twice and divides between its places (F61). */
   split?: string;
+  /** Draws of a class (F72), each `take[?p Type[filters] ?count Type[rewrites]]` (as text). */
+  draws?: string[];
 }
 
 /** A rule, `redex => reactum unless negative …`. */
@@ -944,12 +967,28 @@ export function buildRule(
 
   const redex = new Builder(sig, 'redex', ids, outer);
   lhs.forEach((items, r) => redex.region(items, r));
+  // a join on a value (F60, F68): a variable written at two attribute sites of the redex meets only where they hold
+  // equal values. Each later writing is its own site, renamed, and an equality joins it to the first; the reactum and
+  // the rate read the first. (No index by value: the equality is tested on what the redex's structure meets, B5.)
+  const joins: [number, number][] = [];
+  const first = new Map<string, number>();
+  redex.sites.forEach((x, i) => {
+    const j = first.get(x.name);
+    if (j === undefined) return void first.set(x.name, i);
+    if (!('attr' in x.key) || !('attr' in redex.sites[j].key)) throw new ReadError('a redex site is written twice');
+    joins.push([j, i]);
+    x.name = `${x.name}#${i}`;
+  });
   const reactum = new Builder(sig, 'reactum', ids, outer);
   reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
   reactum.readRests = redex.rests;
   reactum.readNamed = redex.named;
   rhs.forEach((items, r) => reactum.region(items, r));
-  const guard = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests, redex.named) : undefined;
+  const written = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests, redex.named) : undefined;
+  const guard = joins.reduce<Expr | undefined>((g, [a, b]) => {
+    const eq: Expr = { op: '==', args: [{ site: a }, { site: b }] };
+    return g ? { op: 'and', args: [g, eq] } : eq;
+  }, written);
   let rate: number | undefined;
   let rateExpr: Expr | undefined;
   if (typeof opts.rate === 'number') rate = opts.rate;
@@ -958,11 +997,83 @@ export function buildRule(
     if (Number.isFinite(n)) rate = n;
     else {
       try {
-        rateExpr = toExpr(parseValue(opts.rate), reactum.readSites, redex.rests, redex.named);
+        rateExpr = realDivision(toExpr(parseValue(opts.rate), reactum.readSites, redex.rests, redex.named));
       } catch (e) {
         throw new ReadError(`rate: ${(e as Error).message}`);
       }
     }
+  }
+
+  // a rate is per spot (chrysalis D-a-rate-is-per-spot; boundary's B2; F70): a keyed entry of count n met by the redex
+  // is n spots, so the rate as written is per molecule, multiplied here by each keyed node's count
+  const perSpot: Expr[] = [];
+  const target = redex.named.get(TARGET);
+  // (a rate reading an entry's count is that entry's whole propensity as written, F75: not multiplied again)
+  const readByRate = new Set(rateExpr ? sitesOf(rateExpr) : []);
+  for (const nd of redex.nodes) {
+    const ck = keyedCountOf(sig, nd.type);
+    // (the entry a merge adds to is no reactant, F73)
+    if (ck === null || nd.id === target) continue;
+    const i = redex.sites.findIndex((x) => 'node' in x.parent && x.parent.node === nd.id && 'attr' in x.key && x.key.attr !== null && 'text' in x.key.attr && x.key.attr.text === ck);
+    if (i >= 0 && readByRate.has(i)) continue;
+    if (i >= 0) perSpot.push({ site: i });
+    else {
+      const lit = redex.nodes.find((c) => 'node' in c.parent && c.parent.node === nd.id && 'attr' in c.member && c.member.attr !== null && 'text' in c.member.attr && c.member.attr.text === ck);
+      if (lit && typeof lit.payload === 'object') perSpot.push({ lit: lit.payload.scalar });
+    }
+  }
+  if (perSpot.length) {
+    const base: Expr = rateExpr ?? { lit: { float: rate ?? 1 } };
+    rateExpr = perSpot.reduce<Expr>((a, x) => ({ op: '*', args: [a, x] }), base);
+    rate = undefined;
+  }
+
+  // draws of a class (F72): each read as `take[?p Type[filters] count Type[rewrites]]`; the rule meets only where the
+  // class holds the count (its amount, F71, guards it)
+  const draws: Draw[] = [];
+  let drawGuard: Expr | undefined;
+  for (const text of opts.draws ?? []) {
+    let v: Value;
+    try {
+      v = parseValue(text);
+    } catch (e) {
+      throw new ReadError(`draw: ${(e as Error).message}`);
+    }
+    if (v.k !== 'expr' || v.op !== 'take' || v.args.length !== 4) throw new ReadError('draw: take[?p Type[…] count Type[…]]');
+    const [pv, cls, kv, rw] = v.args;
+    if (pv.k !== 'site' || !redex.named.has(pv.name)) throw new ReadError('draw: ?p is a node the redex names');
+    if (cls.k !== 'term' || rw.k !== 'term' || cls.body !== null || rw.body !== null) throw new ReadError('draw: a class and its rewrite, each Type[…]');
+    // (put back as the class's type, or another keyed type: each attribute it keeps, and its rewrites)
+    const pairs = (t: Term) => t.attrs.map((it): [string, Expr] => {
+      if (it.k !== 'member' || !it.key || !('text' in it.key)) throw new ReadError('draw: each attribute is `key = value`');
+      return [it.key.text, toExpr(it.value, reactum.readSites, redex.rests, redex.named)];
+    });
+    // (put back by each molecule's own type, where the rewrite names a style key no type has: `uncharged[]` puts a
+    // molecule back as the keyed type its type's `uncharged` names, F77; every keyed type of the class must name one)
+    let intoBy: string | undefined;
+    if (!sig.has(rw.head)) {
+      if (!sig.has(cls.head)) throw new ReadError(`draw: no type ${cls.head}`);
+      const C = sig.id(cls.head);
+      for (const t of sig.types.filter((x) => sig.sub(x.id, C) && keyedCountOf(sig, x.id) !== null)) {
+        const to = t.style?.[rw.head];
+        if (typeof to !== 'string' || !sig.has(to) || keyedCountOf(sig, sig.id(to)) === null) throw new ReadError(`draw: ${t.name} names no keyed type as its ${rw.head}`);
+      }
+      intoBy = rw.head;
+    } else if (keyedCountOf(sig, sig.id(rw.head)) === null) throw new ReadError(`draw: ${rw.head} is no keyed type`);
+    const d: Draw = {
+      place: redex.named.get(pv.name)!, type: cls.head, filters: pairs(cls), count: toExpr(kv, reactum.readSites, redex.rests, redex.named), set: pairs(rw),
+      ...(intoBy ? { intoBy } : rw.head !== cls.head ? { into: rw.head } : {}),
+    };
+    draws.push(d);
+    const amount: Expr = { op: 'amount', args: [{ node: d.place }, { op: 'class', args: [{ type: d.type }, ...d.filters.map(([k, x]): Expr => ({ op: 'is', args: [{ lit: { text: k } }, x] }))] }] };
+    const enough: Expr = { op: '>=', args: [amount, d.count] };
+    drawGuard = drawGuard ? { op: 'and', args: [drawGuard, enough] } : enough;
+  }
+  // (the class holding enough is a factor of the rate, not a guard: an occurrence stands whatever the counts, so a change
+  // of count re-rates it rather than finding it again, F74)
+  if (drawGuard) {
+    rateExpr = { op: '*', args: [rateExpr ?? { lit: { float: rate ?? 1 } }, { op: 'if', args: [drawGuard, { lit: { float: 1 } }, { lit: { float: 0 } }] }] };
+    rate = undefined;
   }
 
   const outerNames: [Id, Id][] = [...outer.values()].map((x) => [x, sig.id('Link')]);
@@ -1005,11 +1116,18 @@ export function buildRule(
   // spec has a negative keep the redex's faces exactly; here it may add sites and names of its own, so what it
   // adds can leave attributes and ports unwritten (anything there), as a redex can.
   const negSources: Sources[] = [];
+  const negGuards: (Expr | undefined)[] = [];
   const negatives = negs.map((regions) => {
     const nb = new Builder(sig, 'negative', ids, outer, redex.named, new Set(redex.sites.map((s) => s.name)));
     nb.edgeNames = new Map(redex.edgeNames);
     regions.forEach((items, r) => nb.region(items, r));
     negSources.push({ nodes: nb.source, sites: [...R.sites.map(() => null), ...nb.siteSource], names: new Map([...nb.negOuter].map(([n, x]) => [x, n])) });
+    negGuards.push(
+      nb.negJoins.reduce<Expr | undefined>((g, [i, name]) => {
+        const eq: Expr = { op: '==', args: [{ site: R.sites.length + i }, { site: redexSite.get(name)! }] };
+        return g ? { op: 'and', args: [g, eq] } : eq;
+      }, undefined),
+    );
     return {
       ...R,
       inner: { ...R.inner, places: [...R.inner.places, ...nb.sites.map(() => sig.id('Place'))] },
@@ -1023,7 +1141,14 @@ export function buildRule(
 
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
-    rule: { name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr, guard, computed: reactum.computed, ...(split !== undefined ? { split } : {}) },
+    rule: {
+      name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr,
+      guard,
+      computed: reactum.computed,
+      ...(split !== undefined ? { split } : {}),
+      ...(draws.length ? { draws } : {}),
+      ...(negGuards.some(Boolean) ? { negativeGuards: negGuards } : {}),
+    },
     redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
     reactum: {
       nodes: reactum.source,

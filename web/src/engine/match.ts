@@ -143,7 +143,10 @@ export function discoverReference(g: Carrier, rule: Rule, sig: Signature): Occur
 function blockedReference(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
   const seed = new Map(occ.nodes);
   const seedEdges = new Map(occ.edges);
-  for (const ng of rule.negatives) if (!search(ix, ng, sig, seed, seedEdges).next().done) return true;
+  for (const [k, ng] of rule.negatives.entries()) {
+    const g = rule.negativeGuards?.[k];
+    for (const n of search(ix, ng, sig, seed, seedEdges)) if (!g || holds(g, siteEnv(ix, [...occ.sites, ...n.sites.slice(occ.sites.length)], sig, n.rests, n.nodes))) return true;
+  }
   return false;
 }
 
@@ -207,9 +210,12 @@ function blocked(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Sign
   if (!rule.negatives.length) return false;
   const seed = new Map(occ.nodes);
   const seedEdges = new Map(occ.edges);
-  for (const ng of rule.negatives) {
+  for (const [k, ng] of rule.negatives.entries()) {
     let hit = false;
-    runPlan(ix, ng, sig, () => ((hit = true), false), seed, seedEdges);
+    const g = rule.negativeGuards?.[k];
+    // (a negative joined to the redex's values meets only where they agree: its own sites against the occurrence's)
+    const holdsHere = (n: Omit<Occurrence, 'rule'>) => !g || holds(g, siteEnv(ix, [...occ.sites, ...n.sites.slice(occ.sites.length)], sig, n.rests, n.nodes));
+    runPlan(ix, ng, sig, (n) => (holdsHere(n) ? ((hit = true), false) : undefined), seed, seedEdges);
     if (hit) return true;
   }
   return false;

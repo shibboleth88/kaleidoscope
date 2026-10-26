@@ -44,6 +44,22 @@ export interface Env {
   sig?: import('./signature').Signature;
 }
 
+/** The pass of rating now under way (`withinPass`), numbered, or 0 outside one: an amount read in it is kept for it. */
+let pass = 0, passes = 0;
+/**
+ * Runs `fn`, a pass of rating in which the state does not change, with each amount it reads worked out once: thousands
+ * of occurrences reading the same place's classes (every translating ribosome's draws) then cost one reading (F78).
+ */
+export function withinPass<T>(fn: () => T): T {
+  if (pass) return fn();
+  pass = ++passes;
+  try {
+    return fn();
+  } finally {
+    pass = 0;
+  }
+}
+
 /** What `?ps.x` reads: the far node being summed over, for each rest (set by `sum`). */
 const current = new Map<string, number>();
 /**
@@ -90,6 +106,33 @@ const num = (v: V, op: string): number => {
   throw new EvalError(`${op} takes numbers, not "${v}"`);
 };
 
+/**
+ * A rate is real-valued (chrysalis D-a-rate-is-real, kaleidoscope F64): division in a rate is the true quotient, never
+ * floored, the same on the graph as on a flow's relaxed counts. Each division's dividend is made real (`1.0 * a`), so
+ * every evaluator (this one, a policy's compiled form) reads it so; a reactum's integer arithmetic keeps its floor.
+ */
+export function realDivision(e: Expr): Expr {
+  if (!('op' in e)) return e;
+  const args = e.args.map(realDivision);
+  if (e.op === '/') return { ...e, args: [{ op: '*', args: [{ lit: { float: 1 } }, args[0]] }, args[1]] };
+  return args.every((a, i) => a === e.args[i]) ? e : { ...e, args };
+}
+
+/** The count attribute of a keyed type (`Type[keyed = "n"]`, on it or a supertype), or null (F69). */
+export function keyedCountOf(sig: import('./signature').Signature, type: number): string | null {
+  for (const t of sig.ups(type)) {
+    const k = sig.types.find((x) => x.id === t)?.style?.keyed;
+    if (typeof k === 'string') return k;
+  }
+  return null;
+}
+
+/** Whether an expression reads an amount of a class (F71): what its place holds, beyond its sites. */
+export function readsAmount(e: Expr | undefined): boolean {
+  if (!e || !('op' in e)) return false;
+  return e.op === 'amount' || e.args.some(readsAmount);
+}
+
 /** Each function and how many values it takes (count: a site, and perhaps a type). */
 export const FUNCTIONS: Record<string, [number, number]> = {
   min: [2, 2], max: [2, 2], abs: [1, 1], sqrt: [1, 1], floor: [1, 1], round: [1, 1], exp: [1, 1], log: [1, 1], count: [1, 2],
@@ -103,6 +146,14 @@ export const FUNCTIONS: Record<string, [number, number]> = {
   sum: [2, 2],
   /** shared[?ps ?qs]: how many links two rests of points have in common. */
   shared: [2, 2],
+  /**
+   * amount[?p Type[k = v | …]]: the molecules of a class (F71; chrysalis R-aggregates-in-rates-maintained, boundary's
+   * B3): the counts of the keyed entries of Type (or a subtype) that the redex's node ?p holds, whose attributes k equal
+   * v, summed. Entries are `Type[keyed = "n"]` (F69).
+   */
+  amount: [2, 2],
+  /** take[?p Type[…] k Type[…]]: a draw of a class, written only as a rule's `draw` (F72); no value. */
+  take: [4, 4],
 };
 export const BINARY = ['or', 'and', '==', '!=', '<', '<=', '>', '>=', '++', '+', '-', '*', '/', '%'];
 
@@ -192,6 +243,44 @@ function compileExpr(e: Expr): Compiled {
       }
       return total;
     };
+  } else if (e.op === 'amount') {
+    const [p, cls] = e.args;
+    if (!('node' in p) || !('op' in cls) || cls.op !== 'class') throw new EvalError('amount[?p Type[…]]: a node the redex names, and a class');
+    const [t, ...filters] = cls.args as [{ type: string }, ...{ op: string; args: Expr[] }[]];
+    const keys = filters.map((x) => (x.args[0] as { lit: { text: string } }).lit.text);
+    const vals = filters.map((x) => compileExpr(x.args[1]));
+    // (this amount's readings in the pass under way, by place and its filters' values)
+    const kept = Object.assign(new Map<number | string, number>(), { pass: 0 });
+    f = (env) => {
+      const ix = env.index, sig = env.sig;
+      if (!ix || !sig || !env.nodeOf || !env.attr) throw new EvalError('amount: no state here');
+      if (!sig.has(t.type)) return 0;
+      const T = sig.id(t.type), want = vals.map((v) => v(env)), place = env.nodeOf(p.node);
+      // (within a pass of rating that changes nothing, a place's amount of a class is read once, F78)
+      const mk = pass && (keys.length ? `${place}|${want.map(String).join('|')}` : place);
+      if (pass) {
+        const hit = kept.get(mk);
+        if (kept.pass === pass && hit !== undefined) return hit;
+        if (kept.pass !== pass) kept.clear(), (kept.pass = pass);
+      }
+      let total = 0;
+      // (the class's entries in the place, listed once until one joins or leaves it, F78)
+      for (const c of ix.childrenOf({ node: place }, sig, t.type, (c) => sig.sub(c.type, T) && keyedCountOf(sig, c.type) !== null)) {
+        const ck = keyedCountOf(sig, c.type)!;
+        let ok = true;
+        for (let i = 0; i < keys.length && ok; i++) {
+          const v = env.attr(c.id, keys[i]);
+          ok = !!v && toV(v) === want[i];
+        }
+        if (!ok) continue;
+        const n = env.attr(c.id, ck);
+        if (n) total += num(toV(n), 'amount');
+      }
+      if (pass) kept.set(mk, total);
+      return total;
+    };
+  } else if (e.op === 'take' || e.op === 'class' || e.op === 'is') {
+    throw new EvalError(`${e.op}[…] is no value: a draw is a rule's \`draw\` (F72)`);
   } else if (e.op === 'shared') {
     const [a, b] = e.args;
     if (!('rest' in a) || !('rest' in b)) throw new EvalError('shared[?ps ?qs] takes two rests of points');

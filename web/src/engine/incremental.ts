@@ -16,8 +16,8 @@
  * The spec's `discover_local` asks this of an implementation; the tests hold it to the full search.
  */
 
-import { type Carrier, type Id, Index, isAttr, keyed, memberKey, parentKey, scalarKey } from './carrier';
-import { evaluate, readsAcross, sitesOf } from './expr';
+import { type Carrier, type Id, Index, type Node, isAttr, keyed, memberKey, parentKey, scalarKey } from './carrier';
+import { type Expr, evaluate, keyedCountOf, readsAcross, readsAmount, sitesOf, withinPass } from './expr';
 import { type Occurrence, discover, siteEnv, spotKey } from './match';
 import type { Transition } from './react';
 import type { View, World } from './world';
@@ -110,13 +110,6 @@ export class Discovery {
    * only their rates need working out again.
    */
   private readonly valueFree: boolean[];
-  /**
-   * For a rule whose only dependence on values is literal attributes in its redex (`Mol[P = 0]`): the types of the
-   * redex nodes holding them. A value changing under a node no such redex node could meet changes only the rates of
-   * what meets it, not whether the rule meets there. Null where its dependence is not confined so (a guard, a negative,
-   * reading across links, a literal standing anywhere but under a redex node).
-   */
-  private readonly literalHosts: (Id[] | null)[];
   /** How many occurrences each rule has: kept as they are added and removed. */
   private readonly held = new Map<Rule, number>();
 
@@ -145,34 +138,92 @@ export class Discovery {
     }
     this.rules = rules;
     this.isLocal = rules.map(local);
-    this.lazy = rules.map(lazySites);
+    // a rule reading an amount (F71) reads its place's entries beyond its sites: never lazy, and a change to any keyed
+    // entry is a change that can touch it (so its place, holding the change, is affected and searched again)
+    // (an amount in a rate is re-rated where its place's entries change, F74; one in a guard or a computed value decides
+    // what meets, and is found again)
+    this.amountRates = rules.some((r) => readsAmount(r.rateExpr));
+    this.amounts = rules.some((r) => [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount));
+    this.lazy = rules.map((r) => ([r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount) ? null : lazySites(r)));
     this.across = rules.map((r) => [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(readsAcross));
     this.valueFree = rules.map((r, i) => !r.guard && !r.negatives.length && !this.across[i] && !r.redex.nodes.some((n) => typeof n.payload === 'object'));
-    this.literalHosts = rules.map((r, i) => {
-      if (this.valueFree[i]) return [];
-      if (r.guard || r.negatives.length || this.across[i]) return null;
-      const byId = new Map(r.redex.nodes.map((n) => [n.id, n]));
-      const hosts: Id[] = [];
-      for (const n of r.redex.nodes) {
-        if (typeof n.payload !== 'object') continue;
-        const host = 'node' in n.parent ? byId.get(n.parent.node) : undefined;
-        if (!host || !isAttr(n.member)) return null;
-        hosts.push(host.type);
+  }
+
+  /** The places holding these keyed entries, or the entries holding these scalars (an amount reads them there, F74). */
+  private placesOf(ns: (Node | undefined)[], ix: { node: { get(id: Id): Node | undefined } }): Id[] {
+    const out = new Set<Id>();
+    for (let n of ns) {
+      if (n && typeof n.payload === 'object' && 'node' in n.parent) n = ix.node.get(n.parent.node);
+      if (n && keyedCountOf(this.sig, n.type) !== null && 'node' in n.parent) out.add(n.parent.node);
+    }
+    return [...out];
+  }
+
+  /**
+   * Whether a change of value at key `key` of a node of this type could change what meets (F76): a rule's literal at
+   * that key, a guard's or a joined negative's site there, or a rule whose dependence on values is not confined to
+   * keys (one reading across links, or an amount in a guard). A negative that only adds nodes tests presence, not
+   * values, and a count no rule tests but in its rate only re-rates.
+   */
+  private keyed?: { type: Id; key: string | 'all' }[] | 'all';
+  // (each type and key answered once: the rules, and so the keys they read, are fixed; a flow's realization asks it for
+  // every key it moved at every step, F79)
+  private sensitiveAtCache = new Map<string, boolean>();
+  private sensitiveAt(type: Id, key: string): boolean {
+    if (this.keyed === undefined) this.keyed = this.valueKeys();
+    if (this.keyed === 'all') return this.sensitive(type);
+    const k = `${type}|${key}`;
+    let v = this.sensitiveAtCache.get(k);
+    if (v === undefined) {
+      const keyed = this.keyed;
+      v = keyed.some((x) => this.sig.sub(type, x.type) && (x.key === 'all' || x.key === key));
+      this.sensitiveAtCache.set(k, v);
+    }
+    return v;
+  }
+  private valueKeys(): { type: Id; key: string | 'all' }[] | 'all' {
+    const out: { type: Id; key: string | 'all' }[] = [];
+    for (const [i, r] of this.rules.entries()) {
+      if (this.valueFree[i]) continue;
+      // a rule whose dependence on values is not confined to keys: every value of every node it meets
+      if (this.across[i] || (this.amounts && [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount))) {
+        for (const pn of [r.redex, ...r.negatives].flatMap((P) => P.nodes)) out.push({ type: pn.type, key: 'all' });
+        continue;
       }
-      return hosts;
-    });
+      const patterns: [Carrier, Expr | undefined][] = [[r.redex, r.guard], ...r.negatives.map((ng, k): [Carrier, Expr | undefined] => [ng, r.negativeGuards?.[k]])];
+      for (const [P, g] of patterns) {
+        const byId = new Map(P.nodes.map((n) => [n.id, n]));
+        // literals at a node's attributes
+        for (const n of P.nodes) {
+          if (typeof n.payload !== 'object') continue;
+          const host = 'node' in n.parent ? byId.get(n.parent.node) : undefined;
+          if (host) out.push({ type: host.type, key: isAttr(n.member) && keyed(n.member) ? memberKey(n.member) : 'all' });
+          // (a literal standing on its own, no node's attribute: a value rewritten at a node of its type)
+          else out.push({ type: n.type, key: 'all' });
+        }
+        // what a guard reads
+        for (const si of g ? sitesOf(g) : []) {
+          const p = P.sites[si], k = P.siteKeys[si];
+          const host = p && 'node' in p ? byId.get(p.node) : undefined;
+          if (host) out.push({ type: host.type, key: k && keyed(k) ? memberKey(k) : 'all' });
+          else for (const pn of P.nodes) out.push({ type: pn.type, key: 'all' });
+        }
+      }
+    }
+    return out;
   }
 
   /** Whether a rule that is not value-free could meet a node of this type: then a change to its values may change it. */
   private sensitiveTo = new Map<Id, boolean>();
+  private amounts = false;
+  private amountRates = false;
   private sensitive(type: Id): boolean {
     let v = this.sensitiveTo.get(type);
     if (v === undefined) {
-      v = this.rules.some((r, i) => {
-        const hosts = this.literalHosts[i];
-        if (hosts) return hosts.some((h) => this.sig.sub(type, h));
-        return r.redex.nodes.some((pn) => this.sig.sub(type, pn.type));
-      });
+      // (by the values each rule reads, F76: a negative that only adds tests presence, not a value)
+      if (this.keyed === undefined) this.keyed = this.valueKeys();
+      const k = this.keyed;
+      v = (this.amounts && keyedCountOf(this.sig, type) !== null) || (k === 'all' ? this.rules.some((r) => r.redex.nodes.some((pn) => this.sig.sub(type, pn.type))) : k.some((x) => this.sig.sub(type, x.type)));
       this.sensitiveTo.set(type, v);
     }
     return v;
@@ -191,19 +242,28 @@ export class Discovery {
     this.parts?.advanceValues(world, before, t, hosts, unrated, changed);
     if (world.g !== this.state) return this.rebuild(world.g);
     const ix = world.ix;
-    if (hosts.some((h) => this.sensitive(ix.node.get(h)!.type))) return this.update(before, ix, world.g, t);
+    // (where the keys that changed at a host are known, only a rule reading one of them there decides what meets, F76)
+    if (hosts.some((h) => {
+      const keys = changed?.get(h), type = ix.node.get(h)!.type;
+      return keys ? [...keys].some((k) => this.sensitiveAt(type, k)) : this.sensitive(type);
+    })) return this.update(before, ix, world.g, t);
     const done = new Set<string>();
-    for (const h of hosts) {
-      const keys = changed?.get(h);
-      for (const e of this.ratedAt(h, unrated)) {
-        if (done.has(e.spot)) continue;
-        // where the keys that changed at this host are known: a rate that reads none of them there is as it was
-        if (keys && (!e.reads || (e.reads !== 'all' && ![...keys].some((x) => (e.reads as Set<string>).has(x))))) continue;
-        done.add(e.spot);
-        const spot = this.spots.get(e.spot);
-        if (spot) spot.rate = this.rateOf(spot.rule, spot.occurrences[0], ix);
+    // a keyed entry's count changed: what reads an amount of its place is rated again (F74)
+    const all = this.amountRates ? [...hosts, ...this.placesOf(hosts.map((h) => ix.node.get(h)!), ix)] : hosts;
+    // (one pass, the state unchanged across it: each amount read once, F78)
+    withinPass(() => {
+      for (const h of all) {
+        const keys = hosts.includes(h) ? changed?.get(h) : undefined;
+        for (const e of this.ratedAt(h, unrated)) {
+          if (done.has(e.spot)) continue;
+          // where the keys that changed at this host are known: a rate that reads none of them there is as it was
+          if (keys && (!e.reads || (e.reads !== 'all' && ![...keys].some((x) => (e.reads as Set<string>).has(x))))) continue;
+          done.add(e.spot);
+          const spot = this.spots.get(e.spot);
+          if (spot) this.setRate(spot, this.rateOf(spot.rule, spot.occurrences[0], ix));
+        }
       }
-    }
+    });
   }
 
   /**
@@ -240,6 +300,9 @@ export class Discovery {
     if (!m) {
       m = new Map();
       const R = rule.redex;
+      // an amount reads what its place holds: everything there
+      const places = (e: Expr | undefined): Id[] => (!e || !('op' in e) ? [] : e.op === 'amount' && 'node' in e.args[0] ? [e.args[0].node] : e.args.flatMap(places));
+      for (const p of places(rule.rateExpr)) m.set(p, 'all');
       for (const i of rule.rateExpr ? sitesOf(rule.rateExpr) : []) {
         const parent = R.sites[i];
         if (!parent || !('node' in parent)) continue;
@@ -257,7 +320,7 @@ export class Discovery {
   private rateOf(rule: Rule, o: Occurrence, ix: Index): number {
     if (!rule.rateExpr) return rule.rate ?? 1;
     try {
-      return (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig, o.rests), 'float') as { float: number }).float;
+      return (evaluate(rule.rateExpr, siteEnv(ix, o.sites, this.sig, o.rests, o.nodes), 'float') as { float: number }).float;
     } catch {
       return 0;
     }
@@ -348,6 +411,7 @@ export class Discovery {
   }
 
   private rebuild(g: Carrier) {
+    this.liveVersion++;
     this.occs.clear();
     this.held.clear();
     this.spots.clear();
@@ -402,7 +466,7 @@ export class Discovery {
       if (!a || !b) continue;
       if (revalued.has(id)) {
         const host = 'node' in b.parent ? after.node.get(b.parent.node) : undefined;
-        if (!host || this.sensitive(host.type) || this.sensitive(b.type) || (host.ports.length && this.across.some(Boolean))) continue;
+        if (!host || this.sensitiveAt(host.type, memberKey(b.member)) || this.sensitive(b.type) || (host.ports.length && this.across.some(Boolean))) continue;
         changed.delete(id);
         rerate.add(host.id);
         continue;
@@ -533,16 +597,19 @@ export class Discovery {
         }
       }
     });
-    // where only values changed, what stands is rated again
+    // where only values changed, what stands is rated again; and what reads an amount of a place whose entries changed
+    if (this.amountRates) for (const ix of [before, after]) for (const p of this.placesOf([...t.removed, ...t.created, ...t.kept, ...(t.revalued ?? [])].map((c) => ix.node.get(c)), ix)) rerate.add(p);
     const done = new Set<string>();
-    for (const h of rerate)
-      for (const k of this.byNode.get(h) ?? []) {
-        const v = this.occs.get(k);
-        if (!v || done.has(v.spot) || unrated?.has(v.rule)) continue;
-        done.add(v.spot);
-        const spot = this.spots.get(v.spot);
-        if (spot) spot.rate = this.rateOf(spot.rule, spot.occurrences[0], after);
-      }
+    withinPass(() => {
+      for (const h of rerate)
+        for (const k of this.byNode.get(h) ?? []) {
+          const v = this.occs.get(k);
+          if (!v || done.has(v.spot) || unrated?.has(v.rule)) continue;
+          done.add(v.spot);
+          const spot = this.spots.get(v.spot);
+          if (spot) this.setRate(spot, this.rateOf(spot.rule, spot.occurrences[0], after));
+        }
+    });
   }
 
   /** Each redex node's literal attributes (`founder = "ab"`): what an anchor must have to be worth a search. */
@@ -581,6 +648,7 @@ export class Discovery {
     if (!spot) {
       spot = { rule, occurrences: [], rate: this.rateOf(rule, o, ix), keys: new Set(), key: sk };
       this.spots.set(sk, spot);
+      this.liveVersion++;
     }
     spot.occurrences.push(o);
     spot.keys.add(k);
@@ -599,6 +667,24 @@ export class Discovery {
     if (!spot) return;
     spot.keys.delete(k);
     spot.occurrences = spot.occurrences.filter((o) => o !== v.occ);
-    if (!spot.keys.size) this.spots.delete(v.spot);
+    if (!spot.keys.size) {
+      this.spots.delete(v.spot);
+      this.liveVersion++;
+    }
+  }
+
+  /**
+   * Counts the changes to which spots are live (F80): one made or dropped, or a rate crossing what `live` takes
+   * (positive and finite), here or in the parts' discovery a factored spot is made of. While it stands, `live` lists
+   * the same spots (their rates may differ): a policy ordering them need not list them again.
+   */
+  get version(): number {
+    return this.liveVersion + (this.parts?.version ?? 0);
+  }
+  private liveVersion = 0;
+  private setRate(spot: LiveSpot, rate: number) {
+    const was = spot.rate > 0 && Number.isFinite(spot.rate), now = rate > 0 && Number.isFinite(rate);
+    spot.rate = rate;
+    if (was !== now) this.liveVersion++;
   }
 }

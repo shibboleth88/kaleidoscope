@@ -79,31 +79,25 @@ export interface Carrier {
 
 // ── keys: canonical strings, so identities and scalars can index maps ──────────────────────────────────────
 
-// keys are asked for constantly while matching: each scalar's and member's, worked out once
-const scalarKeys = new WeakMap<Scalar, string>();
-const memberKeys = new WeakMap<Member, string>();
-
-export const scalarKey = (s: Scalar): string => {
-  let k = scalarKeys.get(s);
-  if (k === undefined) {
-    k = 'int' in s ? `i${s.int}` : 'text' in s ? `t${JSON.stringify(s.text)}` : 'bool' in s ? `b${s.bool}` : `f${s.float}`;
-    scalarKeys.set(s, k);
-  }
+// keys are asked for constantly while matching, and built on the spot: a cache keyed by the scalar or member object
+// (a WeakMap, once) cost more than building the string, and grew slower with every carrier cloned, its dead keys held
+// until a full collection (F81). A text's key alone is kept, by its value: a program's texts are few
+const textKeys = new Map<string, string>();
+const textKey = (t: string): string => {
+  let k = textKeys.get(t);
+  if (k === undefined) textKeys.set(t, (k = `t${JSON.stringify(t)}`));
   return k;
 };
+export const scalarKey = (s: Scalar): string =>
+  'int' in s ? `i${s.int}` : 'text' in s ? textKey(s.text) : 'bool' in s ? `b${s.bool}` : `f${s.float}`;
 
 export const parentKey = (p: Parent): string => ('node' in p ? `n${p.node}` : `r${p.region}`);
 
 export const handleKey = (h: Handle): string => ('edge' in h ? `e${h.edge}` : 'name' in h ? `x${h.name}` : `b${h.binder}`);
 
 export const memberKey = (m: Member): string => {
-  let key = memberKeys.get(m);
-  if (key === undefined) {
-    const k = 'attr' in m ? m.attr : m.held;
-    key = `${'attr' in m ? 'a' : 'h'}${k === null ? '_' : scalarKey(k)}`;
-    memberKeys.set(m, key);
-  }
-  return key;
+  const k = 'attr' in m ? m.attr : m.held;
+  return `${'attr' in m ? 'a' : 'h'}${k === null ? '_' : scalarKey(k)}`;
 };
 
 export const isAttr = (m: Member): boolean => 'attr' in m;
@@ -140,6 +134,25 @@ export interface PointRef {
 
 const indexes = new WeakMap<Carrier, Index>();
 
+/**
+ * Put `x` into `list` in its place by node id, ascending (a world's lists, F82): at the end when its id is the newest, as
+ * a made node's is; else where it belongs, as a node made again under its own id (a replacement) does.
+ */
+export function insertById<T>(list: T[], x: T, idOf: (y: T) => Id) {
+  const id = idOf(x);
+  if (!list.length || idOf(list[list.length - 1]) <= id) {
+    list.push(x);
+    return;
+  }
+  let lo = 0, hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (idOf(list[mid]) <= id) lo = mid + 1;
+    else hi = mid;
+  }
+  list.splice(lo, 0, x);
+}
+
 export class Index {
   /** The index of a carrier, built once: a carrier is never changed once made, so its index can be shared. */
   static of(g: Carrier): Index {
@@ -155,7 +168,10 @@ export class Index {
   readonly points = new Map<string, PointRef[]>();
   /** Each node's place in `g.nodes`. */
   readonly pos = new Map<Id, number>();
-  /** The nodes of each type (exactly), in `g.nodes` order: where a pattern's first root finds its candidates. */
+  /**
+   * The nodes of each type (exactly), in `g.nodes` order: where a pattern's first root finds its candidates. (A world's
+   * index keeps each of its lists by node id instead, `orderById`: F82.)
+   */
   readonly byType = new Map<Id, Node[]>();
 
   constructor(readonly g: Carrier) {
@@ -172,6 +188,22 @@ export class Index {
         }
     }
     for (const e of g.edges) this.edge.set(e.id, e);
+  }
+
+  /**
+   * Each list (a type's nodes, a place's children, a handle's points) put in node-id order, for a world that changes
+   * its state in place (F82). A world's lists would otherwise follow its history (each made node appended, each removal
+   * swapping the last node into its place in `g.nodes`), so a world resumed from a checkpoint, its lists built from
+   * `g.nodes`, would list them otherwise than the world that made the checkpoint, and meet its occurrences in another
+   * order. By id, they are the state's alone. (A stable sort keeps a node's own points in order; most lists already are.)
+   */
+  orderById() {
+    const byId = <T>(l: T[], id: (x: T) => Id) => {
+      for (let i = 1; i < l.length; i++) if (id(l[i - 1]) > id(l[i])) return void l.sort((a, b) => id(a) - id(b));
+    };
+    for (const l of this.byType.values()) byId(l, (n) => n.id);
+    for (const l of this.kids.values()) byId(l, (n) => n.id);
+    for (const l of this.points.values()) byId(l, (p) => p.node);
   }
 
   /** The nodes of these types, in `g.nodes` order: a pattern's first root's candidates, by its type's `downs`. */
@@ -203,8 +235,29 @@ export class Index {
     return this.points.get(handleKey(h)) ?? [];
   }
 
+  /** Each place's count of nodes joining or leaving it, so what is cached of its children knows it is stale. */
+  private kidsVersion = new Map<string, number>();
+  private classKids = new WeakMap<object, Map<string, { version: number; nodes: Node[] }>>();
+  /**
+   * A place's children of one class (`cls`, its name under `owner`, a signature), those `keep` takes: listed once, and
+   * again only once a node has joined or left the place. An amount reads its class's few entries this way, not every
+   * child of its place (F78).
+   */
+  childrenOf(p: Parent, owner: object, cls: string, keep: (n: Node) => boolean): readonly Node[] {
+    const pk = parentKey(p), version = this.kidsVersion.get(pk) ?? 0, key = `${pk}|${cls}`;
+    let m = this.classKids.get(owner);
+    if (!m) this.classKids.set(owner, (m = new Map()));
+    const hit = m.get(key);
+    if (hit && hit.version === version) return hit.nodes;
+    const nodes = this.children(p).filter(keep);
+    m.set(key, { version, nodes });
+    return nodes;
+  }
+
   /** A node joined or left its place (a world's in-place reaction): the place's map of keyed children follows. */
   rekey(n: Node, present: boolean) {
+    const pk = parentKey(n.parent);
+    this.kidsVersion.set(pk, (this.kidsVersion.get(pk) ?? 0) + 1);
     if (!keyed(n.member)) return;
     const m = this.keyedKids.get(parentKey(n.parent));
     if (!m) return;

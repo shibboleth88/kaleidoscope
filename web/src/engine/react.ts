@@ -32,6 +32,7 @@ import { type Occurrence, siteEnv } from './match';
 import { evaluate } from './expr';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
+import { Before, World, hasKeyed } from './world';
 
 export interface Decomposition {
   context: Carrier;
@@ -208,7 +209,7 @@ export interface Reacted {
 }
 
 /** The occurrence replaced: `apply_spec`, as composition. */
-export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, opts: { ids?: { node: Id; edge: Id } } = {}): Reacted {
+export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, opts: { ids?: { node: Id; edge: Id }; random?: () => number } = {}): Reacted {
   const { context, parameter, implicit } = decompose(g, rule, occ);
   // fresh identities from one past the largest in use, or from where a caller's own counters stand (a world's)
   const ids = opts.ids ?? nextIds(g);
@@ -347,6 +348,20 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
     ...parameter.edges.filter((e) => Index.of(parameter).pointsOn({ edge: e.id }).every((p) => droppedSet.has(p.node))).map((e) => e.id),
     ...idle,
   ];
+  // keyed counts (F69): an entry made or rewritten merges into its place's entry of the same key, as `World.apply` does
+  // and draws of a class (F72), their values read before the reaction
+  if (sig && (hasKeyed(sig) || rule.draws?.length)) {
+    const w = new World(state);
+    const t = { created: [...created], moved: [...moved], copied: [...copied], removed: [...removed] };
+    const before = new Before(w.ix);
+    if (rule.draws?.length) {
+      if (!opts.random) throw new Error(`${rule.name}: a draw needs a source of chance`);
+      const at = new Map(occ.nodes);
+      for (const d of rule.draws) w.draw(sig, w.drawPlan(d, at.get(d.place)!, env), opts.random, t, keptIds, new Set(), before);
+    }
+    w.reconcile(sig, t, keptIds, new Set(), before);
+    return { state: w.g, transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], ...t, edgesRemoved, edgesCreated } };
+  }
   return {
     state,
     transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], removed, created, moved, copied, edgesRemoved, edgesCreated },

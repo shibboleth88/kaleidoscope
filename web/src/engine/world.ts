@@ -30,7 +30,9 @@ import {
   type Parent,
   type PointRef,
   type PortGroup,
+  type Scalar,
   handleKey,
+  insertById,
   isAttr,
   keyed,
   memberKey,
@@ -38,11 +40,11 @@ import {
   parentKey,
   scalarKey,
 } from './carrier';
-import { evaluate } from './expr';
+import { type Env, type Expr, evaluate } from './expr';
 import { type Face, settleHosts, startHosts } from './host';
 import { type Occurrence, siteEnv } from './match';
 import type { Transition } from './react';
-import type { Rule } from './rule';
+import type { Draw, Rule } from './rule';
 import type { Signature } from './signature';
 
 /** What discovery needs to see of a state: its nodes by identity, and the points on each handle. */
@@ -104,6 +106,9 @@ export class World {
   constructor(start: Carrier, readonly sig?: Signature) {
     this.g = structuredClone(start);
     this.ix = Index.of(this.g);
+    // (its lists kept by id, as it changes them in place: so a world resumed from a checkpoint is the world that made
+    // it, F82)
+    this.ix.orderById();
     this.next = nextIds(this.g);
     this.g.edges.forEach((e, i) => this.edgePos.set(e.id, i));
     if (sig) startHosts(this.ix, sig, (id, face) => this.writeFace(sig, id, face));
@@ -146,14 +151,15 @@ export class World {
     this.ix.pos.set(n.id, this.g.nodes.length);
     this.g.nodes.push(n);
     this.ix.node.set(n.id, n);
-    (this.ix.byType.get(n.type) ?? this.ix.byType.set(n.type, []).get(n.type)!).push(n);
+    // (each list by id, as the index keeps them, F82)
+    insertById(this.ix.byType.get(n.type) ?? this.ix.byType.set(n.type, []).get(n.type)!, n, (x) => x.id);
     const pk = parentKey(n.parent);
-    (this.ix.kids.get(pk) ?? this.ix.kids.set(pk, []).get(pk)!).push(n);
+    insertById(this.ix.kids.get(pk) ?? this.ix.kids.set(pk, []).get(pk)!, n, (x) => x.id);
     this.ix.rekey(n, true);
     for (const grp of n.ports)
       for (const [pt, port] of grp.points) {
         const hk = handleKey(port.target);
-        (this.ix.points.get(hk) ?? this.ix.points.set(hk, []).get(hk)!).push({ node: n.id, group: grp.key, point: pt });
+        insertById(this.ix.points.get(hk) ?? this.ix.points.set(hk, []).get(hk)!, { node: n.id, group: grp.key, point: pt }, (x) => x.node);
       }
   }
 
@@ -207,6 +213,248 @@ export class World {
     this.ix.edge.delete(id);
   }
 
+  // ── keyed counts (F69) ──────────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Keyed counts (chrysalis D-keyed-counts-are-a-place-keyed-by-a-record; boundary's B1; F69): an entry of a keyed type
+   * (`Type[keyed = "n"]`, `n` its count) that a reaction made, moved, copied or rewrote merges into its place's entry of
+   * the same key (its type and every attribute but its count), their counts summed; an entry at count 0 leaves. So a
+   * place holds one entry per type and key, and a reactum writing an entry at a key finds it or makes it. `t`, `kept`
+   * and `revalued` are the reaction's, brought up to date here; `before` keeps what this changes, as it stood.
+   */
+  reconcile(hs: Signature, t: { created: Id[]; moved: Id[]; copied: [Id, Id][]; removed: Id[] }, keptState: Set<Id>, revalued: Set<Id>, before: Before) {
+    const { created, moved, copied, removed } = t;
+    const touched = new Set<Id>();
+    const consider = (id: Id) => {
+      const n = this.ix.node.get(id);
+      if (!n) return;
+      if (this.keyedCount(hs, n.type) !== null) touched.add(id);
+      else if ('node' in n.parent) {
+        const p = this.ix.node.get(n.parent.node);
+        if (p && this.keyedCount(hs, p.type) !== null) touched.add(p.id);
+      }
+    };
+    for (const id of created) consider(id);
+    for (const id of moved) consider(id);
+    for (const [, c] of copied) consider(c);
+    for (const id of revalued) consider(id);
+    if (touched.size) {
+      const gone = new Set<Id>();
+      const createdSet = new Set(created);
+      const drop = (root: Id) => {
+        for (const id of this.ix.subtree(root).reverse()) {
+          gone.add(id);
+          keptState.delete(id);
+          revalued.delete(id);
+          if (createdSet.has(id)) createdSet.delete(id);
+          else {
+            before.keep(id);
+            removed.push(id);
+          }
+          this.dropNode(id);
+        }
+      };
+      for (const id of touched) {
+        const t = this.ix.node.get(id);
+        if (!t || gone.has(id)) continue;
+        const key = this.entryKey(hs, t);
+        if (key === null) continue;
+        const nT = this.entryCount(hs, t);
+        const other = this.entryAt(hs, t, key);
+        if (other !== undefined) {
+          // the place already holds this key: the count joins it there, the entry goes
+          const sc = this.ix.children({ node: other.id }).find((c) => isAttr(c.member) && memberKey(c.member) === this.countKey(hs, other.type));
+          if (!sc || typeof sc.payload !== 'object' || !('int' in sc.payload.scalar)) continue;
+          // (written where it stands: a change of value, F76)
+          this.revalue(sc.id, { int: sc.payload.scalar.int + nT }, createdSet, keptState, revalued, before);
+          drop(t.id);
+        } else if (nT === 0) drop(t.id);
+        else this.entryPut(hs, t, key);
+      }
+      created.length = 0;
+      created.push(...createdSet);
+      if (gone.size) {
+        const left = moved.filter((id) => !gone.has(id));
+        moved.length = 0;
+        moved.push(...left);
+      }
+    }
+  }
+
+  /**
+   * A scalar's value written where it stands (F76): a change of value, named `revalued` (and kept), unless the reaction
+   * made the scalar itself, which then stands made with its new value.
+   */
+  private revalue(id: Id, v: Scalar, created: Set<Id>, keptState: Set<Id>, revalued: Set<Id>, before: Before) {
+    const n = this.ix.node.get(id)!;
+    if (!created.has(id)) {
+      before.keep(id);
+      keptState.add(id);
+      revalued.add(id);
+    }
+    (n as { payload: Node['payload'] }).payload = { scalar: v };
+  }
+
+  /** A draw's values, read at an occurrence before it reacts (F72). */
+  drawPlan(d: Draw, place: Id, env: Env): DrawPlan {
+    const value = (x: Expr) => {
+      const v = evaluate(x, env, 'float');
+      return 'float' in v ? v.float : 'int' in v ? v.int : 'text' in v ? v.text : v.bool;
+    };
+    return { place, type: d.type, filters: d.filters.map(([k, x]) => [k, value(x)]), count: Math.round(value(d.count) as number), set: d.set.map(([k, x]) => [k, value(x)]), ...(d.into ? { into: d.into } : {}), ...(d.intoBy ? { intoBy: d.intoBy } : {}) };
+  }
+
+  /**
+   * Draw `count` molecules of a class (F72): from the keyed entries of `type` in `place` whose attributes equal
+   * `filters`, one at a time without replacement, each equally likely (the multivariate hypergeometric over the
+   * entries); each entry gives what was drawn from it, which is put back beside it as an entry with `set` rewritten
+   * (merged by key afterwards, `reconcile`). `t`, `kept`, `revalued` and `before` are the reaction's, kept up to date.
+   */
+  draw(sig: Signature, d: DrawPlan, random: () => number, t: { created: Id[]; removed: Id[] }, keptState: Set<Id>, revalued: Set<Id>, before: Before) {
+    if (!d.count) return;
+    if (!sig.has(d.type)) throw new Error(`draw: no type ${d.type}`);
+    const T = sig.id(d.type);
+    const attrOf = (n: Id, k: string) => {
+      const c = this.ix.childAt({ node: n }, memberKey({ attr: { text: k } }));
+      return c && typeof c.payload === 'object' ? c.payload.scalar : null;
+    };
+    const plain = (s: Scalar | null) => (s === null ? null : 'int' in s ? s.int : 'float' in s ? s.float : 'text' in s ? s.text : s.bool);
+    const entries: { node: Node; n: number; ck: string }[] = [];
+    for (const c of [...this.ix.children({ node: d.place })].sort((a, b) => a.id - b.id)) {
+      if (!sig.sub(c.type, T)) continue;
+      const ck = this.keyedCount(sig, c.type);
+      if (ck === null || !d.filters.every(([k, v]) => plain(attrOf(c.id, k)) === v)) continue;
+      const n = plain(attrOf(c.id, ck));
+      if (typeof n === 'number' && n > 0) entries.push({ node: c, n, ck });
+    }
+    let left = entries.reduce((a, e) => a + e.n, 0);
+    if (left < d.count) throw new Error(`draw: the class holds ${left} ${d.type}, not ${d.count}`);
+    const took = entries.map(() => 0);
+    for (let i = 0; i < d.count; i++, left--) {
+      let u = Math.floor(random() * left), j = 0;
+      for (;;) {
+        const avail = entries[j].n - took[j];
+        if (u < avail) break;
+        u -= avail;
+        j++;
+      }
+      took[j]++;
+    }
+    entries.forEach((e, j) => {
+      const x = took[j];
+      if (!x) return;
+      const kids = [...this.ix.children({ node: e.node.id })];
+      const ckey = memberKey({ attr: { text: e.ck } });
+      // the entry gives x: its count written anew
+      const sc = kids.find((c) => isAttr(c.member) && memberKey(c.member) === ckey)!;
+      const counted = (s: Scalar, v: number): Scalar => ('float' in s ? { float: v } : { int: v });
+      // (written where it stands: a change of value, F76)
+      const made = new Set(t.created);
+      this.revalue(sc.id, counted((sc.payload as { scalar: Scalar }).scalar, e.n - x), made, keptState, revalued, before);
+      // and x stand beside it, rewritten (as another keyed type, where the draw says: its count at that type's key)
+      const id = this.next.node++;
+      const byStyle = d.intoBy ? sig.get(e.node.type).style?.[d.intoBy] : undefined;
+      const into = typeof byStyle === 'string' ? sig.id(byStyle) : d.into ? sig.id(d.into) : e.node.type;
+      const retyped = into !== e.node.type;
+      this.addNode({ ...e.node, id, type: into, ports: [] });
+      t.created.push(id);
+      const set = new Map(d.set);
+      for (const c of kids) {
+        if (typeof c.payload !== 'object') continue;
+        const k = 'attr' in c.member && c.member.attr && 'text' in c.member.attr ? c.member.attr.text : null;
+        const isCount = c.id === sc.id;
+        const payload = isCount ? { scalar: counted(c.payload.scalar, x) } : k !== null && set.has(k) ? { scalar: scalarOf(set.get(k)!, c.payload.scalar) } : c.payload;
+        const cid = this.next.node++;
+        // (a count put back as another type is that type's count: its key and its kind)
+        const member = isCount && retyped ? { attr: { text: this.keyedCount(sig, into)! } } : c.member;
+        const type = isCount && retyped ? (sig.get(into).attrs.find((a) => a.key === this.keyedCount(sig, into))?.type ?? c.type) : c.type;
+        this.addNode({ ...c, id: cid, parent: { node: id }, payload, member, type });
+        t.created.push(cid);
+      }
+    });
+  }
+
+  private keyedOf = new WeakMap<Signature, Map<Id, string | null>>();
+  /** The count attribute a keyed type declares (`Type[keyed = "n"]`), or null: on the type or a supertype. */
+  keyedCount(sig: Signature, type: Id): string | null {
+    let m = this.keyedOf.get(sig);
+    if (!m) this.keyedOf.set(sig, (m = new Map()));
+    let v = m.get(type);
+    if (v === undefined) {
+      v = null;
+      for (const t of sig.ups(type)) {
+        const k = sig.types.find((x) => x.id === t)?.style?.keyed;
+        if (typeof k === 'string') {
+          v = k;
+          break;
+        }
+      }
+      m.set(type, v);
+    }
+    return v;
+  }
+  private countKey(sig: Signature, type: Id): string {
+    return memberKey({ attr: { text: this.keyedCount(sig, type)! } });
+  }
+  /** An entry's key: its type and every attribute but its count, as text; null where it holds anything else. */
+  private entryKey(sig: Signature, n: Node): string | null {
+    const ck = this.countKey(sig, n.type);
+    const parts: string[] = [];
+    for (const c of this.ix.children({ node: n.id })) {
+      if (!isAttr(c.member) || typeof c.payload !== 'object' || c.ports.length) return null;
+      const mk = memberKey(c.member);
+      if (mk !== ck) parts.push(`${mk}=${scalarKey(c.payload.scalar)}`);
+    }
+    return `${n.type}|${parts.sort().join('|')}`;
+  }
+  private entryCount(sig: Signature, n: Node): number {
+    const ck = this.countKey(sig, n.type);
+    const c = this.ix.children({ node: n.id }).find((x) => isAttr(x.member) && memberKey(x.member) === ck);
+    return c && typeof c.payload === 'object' && 'int' in c.payload.scalar ? c.payload.scalar.int : 0;
+  }
+  /** Each place's entries by key: built when a place is first asked, kept as entries are reconciled, checked on use. */
+  private entries = new Map<string, Map<string, Id>>();
+  /** Keys a place held twice when its map was built (a state not yet reconciled): looked up by a look at the place. */
+  private doubled = new Set<string>();
+  private placeEntries(sig: Signature, p: Parent): Map<string, Id> {
+    const pk = parentKey(p);
+    let m = this.entries.get(pk);
+    if (!m) {
+      m = new Map();
+      for (const c of this.ix.children(p)) {
+        if (this.keyedCount(sig, c.type) === null) continue;
+        const k = this.entryKey(sig, c);
+        if (k === null) continue;
+        if (m.has(k)) this.doubled.add(`${pk}|${k}`);
+        else m.set(k, c.id);
+      }
+      this.entries.set(pk, m);
+    }
+    return m;
+  }
+  /** Another entry of `t`'s place standing at `key` now, if one does. */
+  private entryAt(sig: Signature, t: Node, key: string): Node | undefined {
+    const m = this.placeEntries(sig, t.parent);
+    const id = m.get(key), dk = `${parentKey(t.parent)}|${key}`;
+    if (id === undefined) return undefined;
+    if (id !== t.id) {
+      const o = this.ix.node.get(id);
+      if (o && parentKey(o.parent) === parentKey(t.parent) && this.entryKey(sig, o) === key) return o;
+      m.delete(key);
+    } else if (!this.doubled.has(dk)) return undefined;
+    else this.doubled.delete(dk);
+    // (the map was stale there: whatever stands at that key now, by a look at the place)
+    for (const c of this.ix.children(t.parent))
+      if (c.id !== t.id && this.keyedCount(sig, c.type) !== null && this.entryKey(sig, c) === key) {
+        m.set(key, c.id);
+        return c;
+      }
+    return undefined;
+  }
+  private entryPut(sig: Signature, t: Node, key: string) {
+    this.placeEntries(sig, t.parent).set(key, t.id);
+  }
+
   // ── a reaction, in place ──────────────────────────────────────────────────────────────────────────────────
 
   /**
@@ -219,7 +467,7 @@ export class World {
    * used up all the same. The transition names them as `revalued`, so discovery can see that only values changed there,
    * and keep what met them.
    */
-  apply(rule: Rule, occ: Occurrence, sig?: Signature, opts: { inPlace?: boolean } = {}): Applied {
+  apply(rule: Rule, occ: Occurrence, sig?: Signature, opts: { inPlace?: boolean; random?: () => number } = {}): Applied {
     const ix = this.ix;
     const R = rule.redex, X = rule.reactum, σ = rule.sites;
     const nmap = new Map(occ.nodes);
@@ -238,6 +486,8 @@ export class World {
     // values computed from what the sites hold, read before anything changes
     const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
     const computedOf = new Map((rule.computed ?? []).map((c) => [c.node, evaluate(c.expr, env, c.kind)]));
+    // draws of a class (F72), what each takes worked out now, before anything changes
+    const drawsNow = (rule.draws ?? []).map((d) => this.drawPlan(d, nmap.get(d.place)!, env));
 
     // what each site holds, walked only where it is needed (a site dropped or copied, or one whose contents link
     // to a closed redex edge): a site put back where it stood costs nothing, however much it holds
@@ -485,6 +735,13 @@ export class World {
         revalued.add(id);
       }
     }
+    // 5. keyed counts (chrysalis D-keyed-counts-are-a-place-keyed-by-a-record; boundary's B1; F69)
+    if (drawsNow.length) {
+      if (!hs || !opts.random) throw new Error(`${rule.name}: a draw needs a signature and a source of chance`);
+      for (const d of drawsNow) this.draw(hs, d, opts.random, { created, removed }, keptState, revalued, before);
+    }
+    if (hs && hasKeyed(hs)) this.reconcile(hs, { created, moved, copied, removed }, keptState, revalued, before);
+
     return {
       transition: {
         rule: rule.name,
@@ -555,8 +812,13 @@ export interface Affine {
  */
 export function affine(rule: Rule): Affine[] | null {
   const R = rule.redex, X = rule.reactum;
-  if (R.outer.places.length !== 1 || rule.kept.length !== R.nodes.length) return null;
+  if (R.outer.places.length !== 1) return null;
   const keptTo = new Map(rule.kept.map(([a, b]) => [b, a]));
+  // every redex node kept, but for literals at a kept node's attributes, each written back unchanged (below; F73)
+  const keptR = new Set(rule.kept.map(([a]) => a));
+  const literals = R.nodes.filter((x) => !keptR.has(x.id));
+  if (literals.some((x) => typeof x.payload !== 'object' || !('node' in x.parent) || !keptR.has(x.parent.node) || !isAttr(x.member))) return null;
+  const rewritten = new Set<Id>();
   // links: a node may be linked, so long as the reaction leaves its links as they were (the same names, the same points)
   const portsOf = (n: Node) => JSON.stringify(n.ports.map((g) => [g.key, g.contract, g.points, g.rest ?? null]));
   for (const n of X.nodes) {
@@ -579,6 +841,15 @@ export function affine(rule: Rule): Affine[] | null {
       continue;
     }
     const c = computed.get(n.id);
+    // a literal written back as the redex met it, at the same key of a kept node: nothing changes there (F73)
+    if (!c && typeof n.payload === 'object' && 'node' in n.parent && keptTo.has(n.parent.node)) {
+      const host = keptTo.get(n.parent.node)!;
+      const was = R.nodes.find((x) => 'node' in x.parent && x.parent.node === host && memberKey(x.member) === memberKey(n.member));
+      if (was && !keptR.has(was.id) && typeof was.payload === 'object' && scalarKey(was.payload.scalar) === scalarKey(n.payload.scalar) && was.type === n.type) {
+        rewritten.add(was.id);
+        continue;
+      }
+    }
     if (!c || c.kind !== 'int' || !('node' in n.parent) || !keptTo.has(n.parent.node)) return null;
     if (!('attr' in n.member) || !n.member.attr || !('text' in n.member.attr)) return null;
     const e = c.expr;
@@ -605,5 +876,33 @@ export function affine(rule: Rule): Affine[] | null {
     if (!('node' in rp) || !('node' in xp) || keptTo.get(xp.node) !== rp.node || memberKey(R.siteKeys[i]) !== memberKey(X.siteKeys[j])) return null;
   }
   if (R.sites.some((_, i) => !used.has(i) && !rule.sites.includes(i))) return null;
+  if (literals.some((x) => !rewritten.has(x.id))) return null;
   return out.length ? out : null;
+}
+
+const keyedSigs = new WeakMap<Signature, boolean>();
+/** Whether a signature declares any keyed type (`Type[keyed = …]`). */
+export function hasKeyed(sig: Signature): boolean {
+  let v = keyedSigs.get(sig);
+  if (v === undefined) keyedSigs.set(sig, (v = sig.types.some((t) => typeof t.style?.keyed === 'string')));
+  return v;
+}
+
+/** A draw's values at an occurrence (F72). */
+export interface DrawPlan {
+  place: Id;
+  type: string;
+  filters: [string, number | string | boolean][];
+  count: number;
+  set: [string, number | string | boolean][];
+  into?: string;
+  intoBy?: string;
+}
+
+/** A value as a scalar of the kind it replaces. */
+function scalarOf(v: number | string | boolean, like: Scalar): Scalar {
+  if ('int' in like) return { int: Math.round(v as number) };
+  if ('float' in like) return { float: v as number };
+  if ('text' in like) return { text: String(v) };
+  return { bool: Boolean(v) };
 }
