@@ -35,6 +35,9 @@ import {
   type Scalar,
   emptyFace,
   isAttr,
+  keyed,
+  memberKey,
+  scalarKey,
   memberScalar,
 } from './carrier';
 import type { Draw, Rule } from './rule';
@@ -804,23 +807,27 @@ class Builder {
         // any number of points: those written, and perhaps a rest
         const items = !w ? [] : w.k === 'points' ? w.items : [w];
         let rest: string | undefined;
+        // (a reactum puts back as many rests as it names, their points one after another, F84; a redex meets one)
+        const more: string[] = [];
         for (const it of items) {
           if (it.k === 'site') {
-            if (rest) throw new ReadError(`port ${p.key} of ${v.head}: one rest of points at most`);
-            rest = it.name;
+            if (rest && this.mode !== 'reactum') throw new ReadError(`port ${p.key} of ${v.head}: one rest of points at most in a pattern (which points each held would be ambiguous)`);
+            if (rest) more.push(it.name);
+            else rest = it.name;
           } else if (it.k === 'link') points.push([{ int: points.length }, { contract: p.contract, target: this.link(it.name, p.contract) }]);
           else if (it.k === 'free') points.push([{ int: points.length }, { contract: p.contract, target: this.freeEdge(p.contract) }]);
           else throw new ReadError(`port ${p.key} of ${v.head} takes links, ! and a rest`);
         }
         // unwritten: in a pattern, whatever points there are; on a kept node, those same points
         if (!w && (this.mode === 'redex' || this.mode === 'negative' || (this.mode === 'reactum' && named))) rest = `_${named ?? id}_${p.key}`;
-        if (rest && (this.mode === 'state' || (this.mode === 'reactum' && !this.readRests?.has(rest))))
-          throw new ReadError(`?${rest}: a rest of points is met in a redex, and put back in its reactum`);
+        for (const r of rest ? [rest, ...more] : [])
+          if (this.mode === 'state' || (this.mode === 'reactum' && !this.readRests?.has(r)))
+            throw new ReadError(`?${r}: a rest of points is met in a redex, and put back in its reactum`);
         if (rest && this.mode !== 'reactum') {
           if (this.rests.has(rest)) throw new ReadError(`?${rest} is a rest of points twice`);
           this.rests.add(rest);
         }
-        ports.push({ key: { text: p.key }, contract: p.contract, points, ...(rest ? { rest } : {}) });
+        ports.push({ key: { text: p.key }, contract: p.contract, points, ...(rest ? { rest } : {}), ...(more.length ? { more } : {}) });
         continue;
       }
       for (let j = 0; j < p.arity; j++) {
@@ -947,6 +954,8 @@ export const readState = (src: string, sig: Signature): Carrier => buildState(pa
 export interface RuleOptions {
   /** A number, or an expression over the redex's sites, evaluated at each spot (as text). */
   rate?: number | string;
+  /** An acceptance probability over the redex's sites, evaluated when an occurrence is chosen (as text; F92). */
+  accept?: string;
   /** A redex site, by name, that the reactum writes twice and divides between its places (F61). */
   split?: string;
   /** Draws of a class (F72), each `take[?p Type[filters] ?count Type[rewrites]]` (as text). */
@@ -1001,6 +1010,14 @@ export function buildRule(
       } catch (e) {
         throw new ReadError(`rate: ${(e as Error).message}`);
       }
+    }
+  }
+  let accept: Expr | undefined;
+  if (typeof opts.accept === 'string' && opts.accept.trim()) {
+    try {
+      accept = realDivision(toExpr(parseValue(opts.accept), reactum.readSites, redex.rests, redex.named));
+    } catch (e) {
+      throw new ReadError(`accept: ${(e as Error).message}`);
     }
   }
 
@@ -1106,6 +1123,26 @@ export function buildRule(
     if (a === undefined) throw new ReadError(`?${n} is kept but the redex does not name it`);
     kept.push([a, b]);
   }
+  // a literal the redex meets at a key of a kept node and the reactum writes there again, the same, is that same
+  // scalar, kept (F89): a reaction restating `active = true` changes nothing there, and neither path makes it afresh
+  {
+    const computedIds = new Set((reactum.computed ?? []).map((c) => c.node));
+    const literalAt = (g: Carrier, holder: Id) => {
+      const m = new Map<string, Carrier['nodes'][number]>();
+      for (const n of g.nodes)
+        if ('node' in n.parent && n.parent.node === holder && isAttr(n.member) && keyed(n.member) && typeof n.payload === 'object' && !n.ports.length) m.set(memberKey(n.member), n);
+      return m;
+    };
+    const hasKids = (g: Carrier, id: Id) => g.nodes.some((n) => 'node' in n.parent && n.parent.node === id);
+    for (const [a, b] of [...kept]) {
+      const before = literalAt(R, a), after = literalAt(X, b);
+      for (const [key, x] of after) {
+        const r = before.get(key);
+        if (!r || computedIds.has(x.id) || r.type !== x.type || hasKids(R, r.id) || hasKids(X, x.id)) continue;
+        if (typeof r.payload === 'object' && typeof x.payload === 'object' && scalarKey(r.payload.scalar) === scalarKey(x.payload.scalar)) kept.push([r.id, x.id]);
+      }
+    }
+  }
   const keptEdges: [Id, Id][] = [];
   for (const [n, b] of reactum.edgeNames) {
     const a = redex.edgeNames.get(n);
@@ -1142,7 +1179,7 @@ export function buildRule(
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
     rule: {
-      name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr,
+      name, redex: R, reactum: X, sites, kept, keptEdges, negatives, rate, rateExpr, ...(accept ? { accept } : {}),
       guard,
       computed: reactum.computed,
       ...(split !== undefined ? { split } : {}),

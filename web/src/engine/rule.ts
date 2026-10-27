@@ -31,6 +31,13 @@ export interface Rule {
    * given it wins over `rate`; a spot whose rate is not positive does not fire.
    */
   rateExpr?: Expr;
+  /**
+   * PROVISIONAL (F92): an acceptance, a probability over the redex's sites, worked out only when an occurrence is
+   * chosen: the reaction is made with that probability, else nothing happens (the time passes). With `rate` a bound
+   * that does not read what changes often, this is thinning (Lewis & Shedler): the rule fires at rate × accept as if
+   * that were its rate, but its spots are never rated again when what accept reads changes.
+   */
+  accept?: Expr;
   /** PROVISIONAL (spec part `rules.guard`, planned): the rule meets only where this holds, over its sites. */
   guard?: Expr;
   /** PROVISIONAL (operations answered in place): reactum scalar nodes whose value is computed from the sites. */
@@ -147,4 +154,39 @@ export function matcherProblems(r: Rule): string[] {
 
 export function checkRule(r: Rule, _sig?: Signature): string[] {
   return [...ruleProblems(r), ...matcherProblems(r)];
+}
+
+/**
+ * The redex sites a rule puts back exactly where they stood (F93): a node's one anonymous site, kept, and placed once
+ * in the reactum as the one anonymous site of that same node, in a redex with no closed edge joined to an inner name.
+ * Such a site's contents stay as they are: its roots under the same node, and nothing within it on a closed edge of the
+ * redex (an unjoined closed edge holds exactly the points the redex binds, F90). So a reaction in place need neither
+ * find what it holds nor touch it, however much it holds (a realm's other cells; the whole of Earth beside a lone
+ * cell).
+ */
+const stillCache = new WeakMap<Rule, Set<number>>();
+export function stillSites(rule: Rule): Set<number> {
+  let out = stillCache.get(rule);
+  if (out) return out;
+  out = new Set<number>();
+  const R = rule.redex, X = rule.reactum;
+  const joined = R.names.some((h) => 'edge' in h);
+  if (!joined) {
+    const keptTo = new Map(rule.kept);
+    R.sites.forEach((p, i) => {
+      if (!('node' in p) || keyed(R.siteKeys[i])) return;
+      // the node's one anonymous site
+      if (R.sites.some((q, k) => k !== i && 'node' in q && q.node === p.node && !keyed(R.siteKeys[k]))) return;
+      const b = keptTo.get(p.node);
+      if (b === undefined) return;
+      const uses = rule.sites.flatMap((src, j) => (src === i ? [j] : []));
+      if (uses.length !== 1) return;
+      const at = X.sites[uses[0]];
+      if (!('node' in at) || at.node !== b || keyed(X.siteKeys[uses[0]])) return;
+      if (X.sites.some((q, k) => k !== uses[0] && 'node' in q && q.node === b && !keyed(X.siteKeys[k]))) return;
+      out!.add(i);
+    });
+  }
+  stillCache.set(rule, out);
+  return out;
 }

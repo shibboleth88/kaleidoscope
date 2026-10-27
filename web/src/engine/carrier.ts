@@ -40,6 +40,12 @@ export interface PortGroup {
    * reactum group with that rest puts those points back.
    */
   rest?: string;
+  /**
+   * In a reactum only (kaleidoscope's, PROVISIONAL; finding F84): further rests the group puts back, after `rest`'s
+   * points: the union of several groups' points in one, as a victor taking over the loser's links. A redex group has
+   * one rest at most, since with two, which points each held would be ambiguous.
+   */
+  more?: string[];
 }
 
 export interface Node {

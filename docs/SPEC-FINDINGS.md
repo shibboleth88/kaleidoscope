@@ -1516,3 +1516,246 @@ MAPK×40 incremental old 3.72, 3.94, 5.04, new 3.65, 3.79, 3.74 (parity).
 
 **For the spec:** a checkpoint must determine the run that follows it, so nothing an implementation orders by its own
 history may decide which occurrence a draw takes. A state's canonical order (here, identities) is one way to say so.
+
+---
+
+## Found modelling history (cycle, `../cycle`)
+
+### F83. A spot's occurrences can be different reactions: rate a spot by its events (changed; semantics)
+
+**Came up:** cycle's 鹬蚌相争 (`../cycle/stories/yu-bang-xiang-zheng.ys`). Two polities at war wear each other down,
+each in proportion to the other's strength:
+`(~w :: War | ?a = P[wars = (~w | ?as) | s = ?x] | ?b = P[wars = (~w | ?bs) | s = ?y]) => (… ?a's s = ?x - 1 …)` at
+rate `0.05 * ?y`. The redex is symmetric, so both ways round (a wears, b wears) meet the same nodes and edge: one spot.
+The spot was rated by its first occurrence alone and fired one of its two occurrences uniformly. So the war ran at
+half its written rate, and the rate it ran at was whichever side's the discovery happened to list first. The
+incremental and the plain discovery list them in different orders, so the two paths gave different distributions:
+over 300 runs, from a world symmetric between the two belligerents, one path had them win 91 : 47 and the other 48 : 44.
+The cause was not stale rates, though it first looked like it.
+
+**Why spots were the unit (F14):** a symmetric rule `A | A => B` meets one pair of As twice, each way round, and the
+two are one reaction. Counting occurrences would double its rate. With a constant rate that was enough. With rates read
+from the occurrence (F13, F22) and a reactum that tells the two ways round apart, it is not.
+
+**Changed (`engine/events.ts`):** two occurrences of a spot are one event where what they do is the same: the reactum
+instantiated against the state (each kept node as the state node it is, each fresh node by its type, each site by the
+roots it holds, each computed value worked out, each link as the state's), and their rates are equal. That is so
+exactly where a symmetry of the whole rule (redex, reactum, guard and rate together) takes one to the other: the
+symmetry factor of rule-based modelling (Kappa, BioNetGen), worked out per spot rather than per rule. A spot's rate is
+the sum of its events' rates. An occurrence is drawn in proportion to its event's rate, shared among the event's
+occurrences (`pickOccurrence`). A spot of one occurrence (nearly every spot) is rated as before, at no extra cost.
+`policy.spots` and `Discovery` both rate spots by `eventRates`. `Discovery` rates a spot again whenever an occurrence
+joins it, and once at the end of an update for a spot that lost one.
+
+**Tests:** `test/events.test.ts`: `A | A => B` at rate 2 rates 2 (one event); the war above, sides at 3 and 5, rates
+3 + 5 = 8 (two events); and the rates stay right as the world changes in place, step for step against a plain
+discovery. **Engine tests:** 141/141. cycle's `run/same.ts`: the incremental and plain paths now agree over 300 runs
+(214 : 46 : 40 and 216 : 45 : 39), and the belligerents are symmetric.
+
+**Cost (changed, same day):** grouping a spot's occurrences by their effects on every re-rate was a quarter of a
+TCTG13 step, where nearly every spot holds two occurrences (a border, each way round). Whether two occurrences are one
+event depends only on the permutation of redex nodes relating them (a symmetry of the rule or not), so the answer is
+kept per rule and permutation (`eventSizes`): the effects are compared once per permutation, and a spot's grouping is
+worked out only where its occurrences change, never where only values do. The same firings, step for step.
+
+**Not covered:** fresh nodes are named by type in the effect, so two effects differing only in how fresh nodes are
+arranged among themselves would be taken as one. No rule here does that. A canonical form of the instantiated
+reactum (`Spec/Basis/Canon.lean`) would close it.
+
+**For the spec:** G7 (rates) and the scheduling axis's unit of choice (F14's question) need a statement of when two
+occurrences are the same reaction. Proposed: two occurrences are one event iff a symmetry of the rule (an automorphism
+of redex and reactum together, fixing the faces, under which guard and rate are invariant) takes one to the other. A
+policy weighs events, never occurrences or spots. The per-spot test above is a decision procedure for it.
+
+### F84. Several rests of points put back in one reactum port: the union of link groups (changed; expressiveness)
+
+**Came up:** cycle's 鹬蚌相争 again. A polity worn to nothing is conquered, and the victor takes over its other wars:
+`?a = P[wars = (?as | ?bs)]`, the victor's own fronts and the loser's. The reader refused it ("one rest of points at
+most"). The workaround was one rule per number of fronts the loser had, naming each extra link. That works for three
+polities and not on a grid, where a polity has up to eight neighbours. The same shape is every *transfer of links* in
+history: conquest (the conquered's alliances and wars), merger (two firms' or two cities' trade partners), succession
+(an heir takes the house's marriages and debts), and in biology, fusion (a merged cell's contacts).
+
+**Changed:** a reactum's port group may name several rests: `rest` as before and `more` (`PortGroup.more`,
+`carrier.ts`). It holds the points of each in turn, after its own. A redex group still has one rest at most, since with
+two, which points each held would be ambiguous; the reader says so. `react` and `World.apply` put the union back
+alike, and the effect key of F83 reads it.
+
+**Tests:** `test/rests.test.ts`: a conquered polity at war with three others; after conquest the victor is at war with
+those three, and it is the same reaction in place as functional; a redex with two rests is refused. **Engine
+tests:** 141/141.
+
+**Open:** where two of the rests hold points on one edge (the victor and the loser were both at war with a third), the
+union holds both, so the victor has two points on that edge. It is a well-formed bigraph, and a multiset union. A
+set union (one point per edge) is sometimes wanted (one war, not two), and would need either a law in the reactum
+or an idempotent link type. The spec should say which a port's union is, or let the link type say (F28's port types).
+
+**For the spec:** a reactum port's points are a list of named rests and links, and the composed group is their
+concatenation. This is the reactum-side dual of F28's rest: redexes split a group into named points and one rest;
+reactums join any number of rests.
+
+### F85. A later root is met from a linked member, upward (changed; performance)
+
+**Came up:** cycle's replication of Turchin et al. 2013 (`../cycle/stories/tctg13.ys`): 2,647 cells, each in a polity
+of its own at the start, and conquest across a border:
+`(~e :: Adj | ?p = Polity(?c = Cell[adj = (~e | ?ca)] | ?pr) | ?q = Polity(?d = Cell[adj = (~e | ?da)] | ?qr))`.
+The plan met the pattern's nodes root by root in written order: ?p, ?c, then ?q from all of Earth's 2,647 children,
+and only then ?d by the link. That is every pair of polities: 6 s to find this one rule's 6,150 occurrences.
+
+**Changed (`plan.ts`):** a root none of whose own points is on a link already bound, but which holds a node that is,
+is met from that node upward: the node first, by the link, then each of its ancestors as the one parent of what was
+met (`Step.up`), up to the root, then the rest of the root's subtree as before. Two siblings joined only through their
+members then cost the points on the link: 6,033 ms → 214 ms for the rule, the same occurrences.
+
+**Tests:** `test/upward.test.ts`: the pattern above in a world of four polities finds each of the eight
+cross-border adjacencies, each way round, unanchored and anchored at every node. **Engine tests:** 143/143.
+
+**Found besides:** `discoverReference` finds none of these occurrences, with F85 or without it: it does not meet a
+rest of points (F28), so it cannot be the oracle for a pattern with one. It should be widened to meet rests, or each
+test using it should say that it holds only for patterns without them.
+
+**For the spec:** `Plan.lean` plans "one matcher, keyed and link-directed" (F27). Link-directed should include
+upward: a node reached by a link determines its ancestors, so a plan may meet a subtree from any node of it that is
+reachable by a bound link.
+
+### F86. Regions joined by the redex's links are local, and a seeded region is met first (changed; performance)
+
+**Came up:** TCTG13 again. Military technology spreads between neighbouring cells in whatever polities they stand,
+so its rule has two regions joined by the link: `(~e :: Adj | ?c = Cell[adj = (~e | ?ca) | m1 = 1]) ||
+(?d = Cell[adj = (~e | ?da) | m1 = 0])`. Discovery held every rule of more than one region not local (`local`), so it
+searched these five rules over the whole world after every firing: 245 ms a step, whatever fired.
+
+**Changed:** (1) `incremental.ts`: a redex whose regions are all joined by its closed edges is local (`regionsLinked`).
+Every occurrence is one match connected by its links, so a commit makes or breaks one only by changing a node it
+meets, which anchored search finds, as for one region. It is the argument `local` already makes for a negative tied
+to the match by a link. (2) `plan.ts`: that alone was slower (600 ms a step), as the plan met regions in index order
+even when the anchor stood in the second: the first region's cell was met from all 2,647. A region holding a seeded
+node is now met first, and the others are reached from it by their links. Together: 245 ms → 2–12 ms a firing.
+
+**Tests:** the engine tests (143/143), and cycle's TCTG13 probe: the same 3,060 firings over 300 years, step for step,
+before and after.
+
+**For the spec:** `discover_local`'s cost law (what is beside the state and not asked about costs nothing) holds for a
+multi-region redex exactly where its regions are linked. The spec could state locality as connectivity of the
+redex (through places or closed links) rather than as one region.
+
+### F87. A rule that held few occurrences is found again by its anchors, not whole (changed; performance)
+
+**Came up:** TCTG13 (cycle). Discovery searched a local rule over the whole state whenever a commit cost it more than
+half its occurrences. A rule holding one occurrence (`vanish`, a polity emptied by conquest) loses all of it whenever
+that one fires, so each firing searched all 2,647 polities for it: a cost that grew with how often conquest happened.
+
+**Changed:** a local rule is found again whole only where it lost at least 16 occurrences (`WHOLE_AFTER`) and more
+than half. Below that, its anchors (the change and what holds it) find everything anyway, as the rule is local.
+
+### F88. A changed value is a change of what meets only for the rules that read it (changed; performance)
+
+**Came up:** TCTG13. A trait spreading to a cell rewrites one of the cell's values (`m1`), which `spread1`'s literal
+reads. Discovery decided value-sensitivity across all rules at once: any rule's literal or guard at a key made a
+change at that key a change of what meets for every rule, so the cell was searched again by all 25 rules.
+
+**Changed (`update`, `refind`, `rulesAt`):** a scalar rewritten in place is rated again for every rule, as before,
+and searched again (at its holder and what holds it) only for the rules whose literals or guards read that key.
+
+### F89. A literal is rewritten in place, a literal restated is kept, and a variadic port is a multiset (changed; performance)
+
+**Came up:** TCTG13, three ways in one firing of `spread1`:
+1. `m1 = 0 ⇒ m1 = 1` removed the matched scalar and made a fresh one. In-place writing (`World.apply`, `inPlace`)
+   covered values whose redex held a site at the key, not a literal.
+2. `active = true ⇒ active = true` did the same: a restated literal was a new scalar.
+3. A reactum writing `adj = (~e | ?ca)` puts its own point first and the rest after, renumbered, so discovery,
+   comparing ports as JSON, saw both cells relinked (and every neighbour on their links changed).
+
+Each made a cell's every rule search again.
+
+**Changed:** (1) `World.apply` writes a reactum value at a key of a kept node into the scalar the redex met there by
+a literal, as it did where it met a site (`revalued`). (2) `buildRule` keeps a literal the reactum restates
+unchanged: the same scalar, in both paths. (3) `update` compares a variadic group's points as a multiset
+(D-points-keyed-or-anonymous), a fixed-arity group's in order. With F88: a `spread` firing 5 ms → 0.5 ms.
+
+### F90. A lazy site is lazy beside a closed edge, unless the edge is joined (changed; performance)
+
+**Came up:** TCTG13's `annex` meets two polities by the link between their border cells (a closed edge). The plan
+ignored lazy sites wherever a redex had a closed edge, since what sites hold must not touch one. That check reads
+site contents only for an edge joined to an inner name: an unjoined closed edge holds exactly the points the redex
+binds (`finish` counts them), all on nodes it meets.
+
+**Changed (`plan.ts`):** lazy unless some closed edge is joined. An anchored search at a polity of n cells: quadratic
+→ linear (2.2 ms at 25 cells, 10.6 ms at 400).
+
+**And, found with it, a defect in F85:** plans were cached by the first root holding a seed. `Discovery.fresh` seeds
+every node, so its plan (no root met upward) was handed to anchored searches seeding one root, which then met the
+other root from every node of its type: 4–5 ms where 0.1 ms was due. Plans are now cached by every seeded root.
+Firings moving a cell: 6 ms → 1.3–1.5 ms.
+
+### F91. A sum tree of rates (changed; performance)
+
+**Came up:** with updates cheap, a step's choice cost as much: `live()` lists and filters every spot each step, and
+a policy then scans them (0.6 ms a step at 20,000 spots).
+
+**Changed (`RateTree` in `incremental.ts`):** discovery keeps its plain spots' rates in a Fenwick tree, updated where
+a rate is set: `totalRate(g)` in O(1), `spotAt(g, u)` in O(log n). Rebuilt exactly every 65,536 changes against float
+drift. Not for encounter rules held factored (`null`: list them). `test/ratetree.test.ts`.
+
+### F92. Acceptance: a rule's rate as a bound and a probability (changed; semantics, PROVISIONAL)
+
+**Came up:** TCTG13's attack succeeds with a probability read from both polities' trait sums. As a rate, every
+change of a polity's sum (a trait drifting, a cell taken) re-rated all its border spots, in 2 annex rules and 18 sea
+rules: a fifth of an update. TCTG13 itself attempts at a fixed rate and accepts with that probability.
+
+**Changed:** a rule node may have `accept` beside `rate` (`annex[rate = 0.125 | accept = …]`): an occurrence is chosen
+at `rate`, and its reaction made with probability `accept`, worked out then; otherwise only its time passes. This is
+thinning (Lewis & Shedler 1979): the process with rate × accept. `accept` never reads a lazy site (`lazySites`), so a
+rejection is decided on the occurrence as held, without finding it again. `policy.step` loops over rejected attempts,
+summing their times, and draws in the old order where no rule has an acceptance. `test/accept.test.ts`: rate 2 with
+accept 0.25 fires as rate 0.5, and an acceptance reading a changing value fires as that rate would.
+
+**For the spec:** G7 (rate as a rule attribute) could carry it: a propensity as a bound and an acceptance is the
+standard way to keep a stochastic simulation's cost to what changes when rates read aggregates
+(R-aggregates-in-rates-maintained).
+
+### F93. A site put back where it stood is never found nor touched (changed; performance)
+
+**Came up:** TCTG13 with a cell as a polity (cycle C8). A lone cell is matched standing in Earth,
+`?w = Earth(?c = Cell[…] | ?rest)`, so `?rest` is all of Earth's other members. It is lazy in discovery (F26, F90),
+but a chosen occurrence was found again whole (`fresh`, every member of Earth), and `World.apply` stringified each of
+its roots' ports and walked its whole subtree for points on the closed edge. O(world) per reaction.
+
+**Changed (`stillSites` in `rule.ts`):** a rule's still sites are statically known: a node's one anonymous site, the
+node kept and placed once as that same node's one anonymous site, in a redex no closed edge of which is joined. What
+such a site holds keeps its place, and nothing in it can be on a closed redex edge (F90). `World.apply` leaves them
+untouched, and `Discovery.fresh(…, { inPlace: true })` need not find an occurrence whose lazy sites are all still.
+The functional `react` still gets them found, as it builds the state anew.
+
+### F94. A subtree is met seed first, then by links, then upward, then nearest the seed (changed; performance)
+
+**Came up:** TCTG13 again. F85 met a later *root* upward from a linked member. A realm beside a lone cell is not a
+root (both stand in Earth), so `Earth(?c | ?q = Realm(?d | …) | ?rest)` met ?q from every member of Earth: 716 ms to
+find nothing. And anchored at a new realm (seeded with Earth), the plan met ?c, in written order, from every member
+of Earth before ?q's cell, from which ?c is one link away: 240 ms a reaction.
+
+**Changed (`planFor`):** within a subtree, of the nodes whose parent is met, the plan takes a seeded one first; then
+one a bound link reaches; then one holding a node a bound link reaches (met upward, F85, now for any node and not only
+roots); else the one whose parent is deepest, nearest the seed, whose candidates are the fewest. Plans are cached by
+the exact set of seeded nodes. A realm's creation: 240 → 25 ms.
+
+### F95. What cannot absorb a change, indexed apart (changed; performance)
+
+**Came up:** after F94, a realm's creation still cost 25 ms, nearly none of it searching. Earth is affected by any
+change to a lone cell, and the drop loop walked every occurrence meeting Earth (~20,000: every lone shape and drift),
+recomputing the changed children for each, to keep almost all of them (their lazy site absorbs the change).
+
+**Changed:** discovery keeps, beside `byNode`, the occurrences that cannot absorb a change below a node they meet
+(`byNodeStrict`: a rule not lazy, or met there by a node holding no lazy site), and walks only those where the change
+below is absorbable (the node not changed, no changed attribute among its children). A node's changed children are
+worked out once. 25 → 4.5 ms. And F88's `refind` visits only nodes an occurrence of the rule could meet (a type one
+of its redex nodes admits): a realm's size changing re-finds `collapse` at the realm, never walking Earth.
+
+### F96. Port groups by key, and the plan cache first (changed; performance)
+
+`groupOf` built every group's key string for every lookup (a tenth of a search, with a cell's ten port groups);
+groups are now mapped once per node object (a node changed in place is a new object). `planFor` built its prelude
+(children, subtrees, seeded roots) before looking in its cache; it looks first.
+
+**Engine tests:** 147/147 throughout. cycle's `run/tctg13-same.ts`: incremental and fresh discovery agree at 81
+checks over 2,000 reactions (183 dissolutions, collapses, every shape of conquest).

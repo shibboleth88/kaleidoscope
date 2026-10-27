@@ -4,13 +4,13 @@
  * PROVISIONAL. The spec's scheduling axis makes the policy rules in the program's run part, and its one fixed
  * part takes every independent occurrence as a round (`Scheduling.choose`). The library's default policy is not
  * written yet. The editor wants to watch reactions unfold one at a time, so this policy takes ONE occurrence per
- * step: a spot (`Occurrence.SameSpot`) chosen with probability proportional to its rule's rate, then one of the
- * spot's occurrences uniformly. Time advances as in Gillespie's direct method: dt ~ Exp(total propensity).
+ * step: a spot (`Occurrence.SameSpot`) chosen with probability proportional to its rate, then one of the spot's
+ * occurrences in proportion to its event's rate (`events.ts`, F83). Time advances as in Gillespie's direct method: dt ~ Exp(total propensity).
  */
 
 import { type Carrier, Index } from './carrier';
-import { evaluate } from './expr';
-import { type Occurrence, discover, siteEnv, spotKey } from './match';
+import { eventRates, occurrenceAccept, pickOccurrence } from './events';
+import { type Occurrence, discover, spotKey } from './match';
 import { type Transition, react } from './react';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
@@ -31,8 +31,10 @@ export function rng(seed: number): () => number {
 export interface Spot {
   rule: Rule;
   occurrences: Occurrence[];
-  /** How fast it fires: the rule's rate, or its rate expression evaluated here. */
+  /** How fast it fires: the sum of its events' rates (`events.ts`): the rule's rate, or its rate expression evaluated. */
   rate: number;
+  /** Each occurrence's share of the rate: its event's rate, shared among the event's occurrences (F83). */
+  weights?: number[];
 }
 
 /** Every spot each rule meets now, each with its rate; a spot whose rate is not positive is not one. */
@@ -46,15 +48,8 @@ export function spots(g: Carrier, rules: Rule[], sig: Signature): Spot[] {
       (bySpot.get(k) ?? bySpot.set(k, []).get(k)!).push(o);
     }
     for (const occurrences of bySpot.values()) {
-      let rate = rule.rate ?? 1;
-      if (rule.rateExpr) {
-        try {
-          rate = (evaluate(rule.rateExpr, siteEnv(ix, occurrences[0].sites, sig, occurrences[0].rests, occurrences[0].nodes), 'float') as { float: number }).float;
-        } catch {
-          rate = 0;
-        }
-      }
-      if (rate > 0 && Number.isFinite(rate)) out.push({ rule, occurrences, rate });
+      const { rate, weights } = eventRates(ix, rule, occurrences, sig);
+      if (rate > 0 && Number.isFinite(rate)) out.push({ rule, occurrences, rate, weights });
     }
   }
   return out;
@@ -74,23 +69,32 @@ export interface Stepped {
  * occurrences are kept across steps rather than found afresh.
  */
 export function step(g: Carrier, rules: Rule[], sig: Signature, random: () => number, discovery?: Discovery): Stepped | null {
-  const live = discovery ? discovery.live(g) : spots(g, rules, sig);
-  const rate = (s: Spot) => s.rate;
-  const total = live.reduce((a, s) => a + rate(s), 0);
-  if (!live.length || total <= 0) return null;
-  let u = random() * total;
-  let chosen = live[live.length - 1];
-  for (const s of live) {
-    u -= rate(s);
-    if (u < 0) {
-      chosen = s;
-      break;
+  // attempts until one is accepted (F92: a rule with an acceptance fires at rate × accept; a rejected attempt changes
+  // nothing and only its time passes, so the times of the attempts before it are summed into this step's)
+  let waited = 0;
+  for (;;) {
+    const live = discovery ? discovery.live(g) : spots(g, rules, sig);
+    const rate = (s: Spot) => s.rate;
+    const total = live.reduce((a, s) => a + rate(s), 0);
+    if (!live.length || total <= 0) return null;
+    let u = random() * total;
+    let chosen = live[live.length - 1];
+    for (const s of live) {
+      u -= rate(s);
+      if (u < 0) {
+        chosen = s;
+        break;
+      }
     }
+    const picked = pickOccurrence(chosen, random);
+    const occ = discovery ? discovery.fresh(g, chosen.rule, picked) : picked;
+    // (draws in the order they always were where no acceptance is asked: the occurrence, the reaction, the time)
+    if (chosen.rule.accept && random() >= occurrenceAccept(Index.of(g), chosen.rule, occ, sig)) {
+      waited += -Math.log(1 - random()) / total;
+      continue;
+    }
+    const { state, transition } = react(g, chosen.rule, occ, sig, { random });
+    discovery?.advance(g, state, transition);
+    return { state, transition, dt: waited - Math.log(1 - random()) / total, live: live.length };
   }
-  const picked = chosen.occurrences[Math.floor(random() * chosen.occurrences.length)];
-  const occ = discovery ? discovery.fresh(g, chosen.rule, picked) : picked;
-  const { state, transition } = react(g, chosen.rule, occ, sig, { random });
-  discovery?.advance(g, state, transition);
-  const dt = -Math.log(1 - random()) / total;
-  return { state, transition, dt, live: live.length };
 }

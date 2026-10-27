@@ -307,9 +307,9 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
   // a group with a rest of points: its own points, then the rest's, through the names the decomposition gave them
   const nameOfHandle = new Map(implicit.map(([z, h]) => [handleKey(h), z]));
   const withRests = (groups: PortGroup[]): PortGroup[] =>
-    groups.map(({ rest, ...g }) => {
+    groups.map(({ rest, more, ...g }) => {
       if (!rest) return g;
-      const held = occ.rests?.find(([n]) => n === rest)?.[1].ports ?? [];
+      const held = [rest, ...(more ?? [])].flatMap((r) => occ.rests?.find(([n]) => n === r)?.[1].ports ?? []);
       const points = [...g.points.map(([, p]) => p), ...held.map((p) => ({ contract: p.contract, target: { name: nameOfHandle.get(handleKey(p.target))! } }))];
       return { ...g, points: points.map((p, i) => [{ int: i }, p] as [{ int: number }, typeof p]) };
     });

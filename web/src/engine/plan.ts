@@ -4,7 +4,11 @@
  *
  * A plan fixes the order the pattern's nodes are met in (parents before children; a seeded root first) and, for
  * each node, where its candidates come from: its seed; the points on a link an earlier node bound
- * (link-directed); its parent's members; its region's place; or, for a first root, every node. Keys (member, payload,
+ * (link-directed); its parent's members; its region's place; or, for a first root, every node. A later root none of
+ * whose own points is on a link already bound, but which holds a node that is, is met from that node upward (F85): the
+ * node first, by the link, then each of its ancestors as the one parent of what was met, up to the root. Two
+ * siblings joined only through their members (`P(A[l = ~e]) | Q(B[l = ~e])`) then cost the points on the link, not
+ * the pairs of siblings. Keys (member, payload,
  * port group, point) are worked out once. Bindings are arrays indexed by the pattern's nodes, edges and names, undone
  * by popping stacks back to a mark.
  *
@@ -70,6 +74,10 @@ interface Step {
   ports: GroupPlan[];
   /** A point on a link some earlier step binds: candidates are the nodes on it. */
   via: PointPlan | null;
+  /** Whether it is a root of its region (its place is the region's). */
+  root: boolean;
+  /** Met upward (F85): the step of its child met before it, whose parent is its one candidate; else NONE. */
+  up: number;
 }
 interface Plan {
   steps: Step[];
@@ -92,9 +100,30 @@ const payloadKey = (n: Node) => (typeof n.payload === 'string' ? n.payload : `s$
 const planCache = new WeakMap<Carrier, Map<string, Plan>>();
 
 /** The plan for a pattern, with the roots holding `firstRoots` met first in each region. */
+/**
+ * A node's port groups by key, worked out once per node object (F96): the matcher looks a group up for every point it
+ * binds, and building each group's key to compare was a tenth of a search. A node changed in place is a new object,
+ * so what is kept for the old one is never read again.
+ */
+const groupsCache = new WeakMap<Node, Map<string, Node['ports'][number]>>();
+function groupsOf(n: Node) {
+  let m = groupsCache.get(n);
+  if (!m) {
+    m = new Map();
+    for (const g of n.ports) m.set(scalarKey(g.key), g);
+    groupsCache.set(n, m);
+  }
+  return m;
+}
+
 function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan {
   let byOrder = planCache.get(pattern);
   if (!byOrder) planCache.set(pattern, (byOrder = new Map()));
+  // (the plan depends on which nodes are seeded: a seeded node is met from its seed, and an unseeded one may be met
+  // upward from a linked member, F85; so plans are kept per seeding, and found before anything is worked out, F96)
+  const cacheKey = seeded ? [...seeded].sort((a, b) => a - b).join(',') : '-';
+  const cached = byOrder.get(cacheKey);
+  if (cached) return cached;
   // which roots go first depends only on which of them hold a seeded node
   const kids = new Map<string, Node[]>();
   for (const n of pattern.nodes) {
@@ -108,15 +137,61 @@ function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan
   };
   const regionRoots = pattern.outer.places.map((_, i) => kids.get(parentKey({ region: i })) ?? []);
   const firsts = regionRoots.map((roots) => (seeded ? roots.findIndex((r) => subtree(r).some((n) => seeded.has(n.id))) : -1));
-  const cacheKey = firsts.join(',');
-  const cached = byOrder.get(cacheKey);
-  if (cached) return cached;
 
-  const order: { n: Node; region: number }[] = [];
-  regionRoots.forEach((roots, i) => {
+  const order: { n: Node; region: number; upFrom?: Node }[] = [];
+  // the links the nodes ordered so far have points on: a later node on one is met by it
+  const onLink = new Set<string>();
+  const linksOf = (n: Node) => n.ports.flatMap((g) => g.points.flatMap(([, p]) => ('edge' in p.target ? [`e${p.target.edge}`] : 'name' in p.target ? [`n${p.target.name}`] : [])));
+  const byId = new Map(pattern.nodes.map((n) => [n.id, n]));
+  const placed = new Set<Id>();
+  const put = (n: Node, region: number, upFrom?: Node) => {
+    order.push({ n, region, upFrom });
+    placed.add(n.id);
+    for (const l of linksOf(n)) onLink.add(l);
+  };
+  // a subtree, breadth first: each node once its parent is; but a node no link of its own reaches, holding one that a
+  // bound link does reach, is met from that one upward (F85): it, by the link, then each ancestor as the one parent
+  // of what was met, up to the node. So siblings joined only through their members (two polities by their border
+  // cells; a realm beside a lone cell in Earth) cost the points on the link, not the pairs of siblings.
+  // the order within a subtree (F94): of the nodes whose parent is met, a seeded one first; then one a bound link
+  // reaches; then one holding a node a bound link reaches (met upward from it, F85); else the one whose parent is
+  // deepest, nearest the seed, whose candidates are the fewest (a seeded realm's cells before Earth's members)
+  const depth = (n: Node): number => ('node' in n.parent ? 1 + depth(byId.get(n.parent.node)!) : 0);
+  const walk = (r: Node, region: number) => {
+    const ready: Node[] = [r];
+    while (ready.length) {
+      const linked = (n: Node) => linksOf(n).some((l) => onLink.has(l));
+      const entryOf = (n: Node) => (seeded?.has(n.id) || linked(n) ? undefined : subtree(n).find((x) => x !== n && !placed.has(x.id) && linked(x)));
+      const score = (n: Node) => (seeded?.has(n.id) ? 4 : linked(n) ? 3 : entryOf(n) ? 2 : 1);
+      let best = 0;
+      for (let i = 1; i < ready.length; i++) {
+        const a = ready[i], b = ready[best];
+        if (score(a) > score(b) || (score(a) === score(b) && score(a) === 1 && depth(a) > depth(b))) best = i;
+      }
+      const [n] = ready.splice(best, 1);
+      const entry = entryOf(n);
+      const met: Node[] = [];
+      if (entry) {
+        const chain: Node[] = [entry];
+        while (chain[chain.length - 1] !== n) chain.push(byId.get((chain[chain.length - 1].parent as { node: Id }).node)!);
+        chain.forEach((x, j) => put(x, region, j ? chain[j - 1] : undefined));
+        met.push(...chain);
+      } else {
+        put(n, region);
+        met.push(n);
+      }
+      // what is now ready: the unmet children of what was met
+      for (const m of met) for (const c of kids.get(parentKey({ node: m.id })) ?? []) if (!placed.has(c.id) && !ready.includes(c)) ready.push(c);
+    }
+  };
+  // a region holding a seeded node is met first (F86): the others are then met from it by their links, not from
+  // every node of their roots' types; and in a region, the root holding a seed first
+  const regionOrder = regionRoots.map((_, i) => i).sort((a, b) => Number(firsts[b] >= 0) - Number(firsts[a] >= 0));
+  for (const i of regionOrder) {
+    const roots = regionRoots[i];
     const ordered = firsts[i] > 0 ? [roots[firsts[i]], ...roots.filter((_, j) => j !== firsts[i])] : roots;
-    for (const r of ordered) for (const n of subtree(r)) order.push({ n, region: i });
-  });
+    for (const r of ordered) walk(r, i);
+  }
 
   const edgeIds = pattern.edges.map((e) => e.id);
   const edgeIndex = new Map(edgeIds.map((id, i) => [id, i]));
@@ -128,7 +203,7 @@ function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan
 
   const stepOf = new Map<Id, number>();
   const bound = new Set<string>(); // `${kind}:${target}` bound by an earlier step
-  const steps: Step[] = order.map(({ n, region }, i) => {
+  const steps: Step[] = order.map(({ n, region, upFrom }, i) => {
     stepOf.set(n.id, i);
     const decl = sig.has(sig.name(n.type)) ? sig.get(n.type) : undefined;
     const ports: GroupPlan[] = n.ports.map((g) => ({
@@ -148,7 +223,10 @@ function planFor(pattern: Carrier, seeded: Set<Id> | null, sig: Signature): Plan
     for (const g of ports) for (const p of g.points) if (p.kind !== 2) bound.add(`${p.kind}:${p.target}`);
     return {
       pn: n,
-      parent: 'node' in n.parent ? stepOf.get(n.parent.node)! : NONE,
+      // (a node met before its parent, F85, has its parent checked by meeting the parent: it is the one candidate)
+      parent: 'node' in n.parent ? (stepOf.get(n.parent.node) ?? NONE) : NONE,
+      root: !('node' in n.parent),
+      up: upFrom ? stepOf.get(upFrom.id)! : NONE,
       region,
       member: memberKey(n.member),
       keyed: keyed(n.member),
@@ -197,8 +275,8 @@ export function runPlan(
   places0?: (Parent | undefined)[],
   /**
    * Redex nodes whose one anonymous site nothing reads (`lazySites`): what that site holds is left unworked (an empty
-   * list), to be found when the occurrence is used (`Discovery.fresh`). Ignored where the redex has closed edges, whose
-   * check reads what sites hold.
+   * list), to be found when the occurrence is used (`Discovery.fresh`). Ignored where a closed edge of the redex is
+   * joined to an inner name, whose check reads what sites hold (F90).
    */
   lazy?: Set<Id>,
 ): void {
@@ -219,11 +297,9 @@ export function runPlan(
   let stopped = false;
 
   const seedFor = steps.map((st) => seed?.get(st.pn.id) ?? NONE);
+  const anyJoined = plan.joined.some(Boolean);
 
-  const groupOf = (gn: Node, key: string) => {
-    for (const g of gn.ports) if (scalarKey(g.key) === key) return g;
-    return undefined;
-  };
+  const groupOf = (gn: Node, key: string) => groupsOf(gn).get(key);
 
   /** Bind one pattern point to a state handle; false where it cannot be (what it bound is undone by the caller). */
   const bindPoint = (pp: PointPlan, h: Handle): boolean => {
@@ -328,6 +404,12 @@ export function runPlan(
       const n = ix.node.get(s);
       return n ? [n] : [];
     }
+    // met upward (F85): the parent of the child met before it
+    if (st.up !== NONE) {
+      const c = ix.node.get(nodeOf[st.up])!;
+      const p = 'node' in c.parent ? ix.node.get(c.parent.node) : undefined;
+      return p ? [p] : [];
+    }
     if (st.via) {
       const h: Handle | null = st.via.kind === EDGE ? (edgeOf[st.via.target] !== NONE ? { edge: edgeOf[st.via.target] } : null) : nameOf[st.via.target];
       if (h) {
@@ -367,7 +449,7 @@ export function runPlan(
         if (!('node' in gn.parent) || gn.parent.node !== nodeOf[st.parent]) continue;
       }
       let placed = false;
-      if (st.parent === NONE) {
+      if (st.root) {
         const place = places[st.region];
         if (place) {
           if (parentKey(place) !== parentKey(gn.parent)) continue;
@@ -442,8 +524,11 @@ export function runPlan(
       if (!plan.holdsSite[k]) continue;
       const anon: number[] = [];
       plan.sites.forEach((s, i) => s.parent === k && s.key === null && anon.push(i));
-      // a lazy node's one site: whatever is left is its, worked out only when the occurrence is used
-      if (lazy && anon.length === 1 && !edgeIds.length && lazy.has(steps[k].pn.id)) continue;
+      // a lazy node's one site: whatever is left is its, worked out only when the occurrence is used. Not where a
+      // closed edge is joined to an inner name: what the sites hold may then be on it, and that is checked (F90); a
+      // closed edge not joined holds exactly the points the redex binds, all on nodes it meets, so nothing a site
+      // holds is on it and there is nothing to check
+      if (lazy && anon.length === 1 && !anyJoined && lazy.has(steps[k].pn.id)) continue;
       const rest: Id[] = [];
       for (const c of ix.children({ node: nodeOf[k] })) {
         if (used.has(c.id) || taken.has(c.id)) continue;

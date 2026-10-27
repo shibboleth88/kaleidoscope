@@ -134,12 +134,12 @@ export function buildProgram(ast: ProgramAst, types: (TypeAst & { module: string
     if (ruleAttrs.has(r.name)) throw new ReadError(`the rule ${r.name} is declared twice`);
     const attrs: Record<string, string> = {};
     for (const it of r.attrs) if (it.k === 'member' && it.key && 'text' in it.key) attrs[it.key.text] = valueText(it.value);
-    const { rate, split, ...rest } = attrs;
+    const { rate, split, accept, ...rest } = attrs;
     // draws of a class (F72): `draw`, `draw2`, … each `take[?p Class ?k Rewrite]`
     const draws = Object.keys(rest).filter((k) => /^draw\d*$/.test(k)).sort((a, b) => Number(a.slice(4) || 1) - Number(b.slice(4) || 1));
     const drawTexts = draws.map((k) => rest[k]);
     for (const k of draws) delete rest[k];
-    const opts = { ...(rate !== undefined ? { rate } : {}), ...(split !== undefined ? { split } : {}), ...(drawTexts.length ? { draws: drawTexts } : {}) };
+    const opts = { ...(rate !== undefined ? { rate } : {}), ...(accept !== undefined ? { accept } : {}), ...(split !== undefined ? { split } : {}), ...(drawTexts.length ? { draws: drawTexts } : {}) };
     // a rule making one keyed entry is read as its merge and its make (F73), so the merge can flow
     const two = split === undefined ? splitKeyed(r.rule, sig) : null;
     const readings: [string, typeof r.rule][] = two ? [[r.name, two.merge], [`${r.name}+`, two.make]] : [[r.name, r.rule]];

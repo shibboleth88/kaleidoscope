@@ -44,7 +44,7 @@ import { type Env, type Expr, evaluate } from './expr';
 import { type Face, settleHosts, startHosts } from './host';
 import { type Occurrence, siteEnv } from './match';
 import type { Transition } from './react';
-import type { Draw, Rule } from './rule';
+import { type Draw, type Rule, stillSites } from './rule';
 import type { Signature } from './signature';
 
 /** What discovery needs to see of a state: its nodes by identity, and the points on each handle. */
@@ -547,6 +547,7 @@ export class World {
     // values written in place (`inPlace`): reactum scalar → the state scalar it rewrites, and the sites they stood in
     const reuse = new Map<Id, Id>();
     const reusedSites = new Set<number>();
+    const reusedLiterals = new Set<Id>();
     if (opts.inPlace) {
       const used = new Set(σ);
       for (const n of X.nodes) {
@@ -556,13 +557,23 @@ export class World {
         if (rp === undefined) continue;
         const mk = memberKey(n.member);
         const i = R.sites.findIndex((p, j) => !used.has(j) && !reusedSites.has(j) && 'node' in p && p.node === rp && memberKey(R.siteKeys[j]) === mk);
-        if (i < 0 || occ.sites[i].length !== 1) continue;
+        if (i < 0) {
+          // where the redex met a literal at that key (`m = 0` ⇒ `m = 1`), the scalar it met is the one rewritten (F89)
+          const lit = R.nodes.find((r) => !reusedLiterals.has(r.id) && 'node' in r.parent && r.parent.node === rp && typeof r.payload === 'object' && memberKey(r.member) === mk && !keptTo.has(r.id));
+          const at = lit && ix.node.get(nmap.get(lit.id)!);
+          if (!lit || !at || typeof at.payload !== 'object' || at.ports.length || at.type !== n.type || ix.subtree(at.id).length !== 1) continue;
+          reuse.set(n.id, at.id);
+          reusedLiterals.add(lit.id);
+          continue;
+        }
+        if (occ.sites[i].length !== 1) continue;
         const at = ix.node.get(occ.sites[i][0])!;
         if (typeof at.payload !== 'object' || at.ports.length || at.type !== n.type || ix.subtree(at.id).length !== 1) continue;
         reuse.set(n.id, at.id);
         reusedSites.add(i);
       }
     }
+    const reusedState = new Set(reuse.values());
     for (const n of X.nodes) {
       const k = keptTo.get(n.id);
       if (k !== undefined) fn.set(n.id, k);
@@ -607,10 +618,10 @@ export class World {
     };
     const restPorts = new Map(occ.rests ?? []);
     const portsOf = (groups: PortGroup[]): PortGroup[] =>
-      groups.map(({ rest, ...grp }) => {
+      groups.map(({ rest, more, ...grp }) => {
         const mine = grp.points.map(([k, p]) => [k, { ...p, target: reactumHandle(p.target) }] as const);
         if (!rest) return { ...grp, points: mine.map(([k, p]) => [k, p]) };
-        const held = restPorts.get(rest)?.ports ?? [];
+        const held = [rest, ...(more ?? [])].flatMap((r) => restPorts.get(r)?.ports ?? []);
         const points = [...mine.map(([, p]) => p), ...held.map((p) => ({ contract: p.contract, target: p.target }))];
         return { ...grp, points: points.map((p, i) => [{ int: i }, p]) };
       });
@@ -623,7 +634,7 @@ export class World {
     for (const i of dropped) for (const id of own(i)) removed.push(id);
     const droppedEdges: Id[] = [];
     for (const i of dropped) for (const e of internalOf(i)) droppedEdges.push(e.id);
-    for (const [, s] of occ.nodes) if (!keptState.has(s)) removed.push(s);
+    for (const [, s] of occ.nodes) if (!keptState.has(s) && !reusedState.has(s)) removed.push(s);
 
     // edges a removed node had points on: idle afterwards, perhaps
     const touchedEdges = new Set<Id>();
@@ -655,6 +666,8 @@ export class World {
     for (const n of reactumNodes) {
       // a value written where it stands: only its payload (`Before` keeps parents and links, never values)
       if (revalued.has(n.id)) {
+        // (a literal written as it was, `active = true` ⇒ `active = true`, is named revalued all the same: in place,
+        // a rewritten scalar keeps its identity where react's is fresh, and `revalued` is what says so)
         (ix.node.get(n.id) as { payload: Node['payload'] }).payload = n.payload;
         continue;
       }
@@ -662,7 +675,10 @@ export class World {
       if (keptState.has(n.id)) this.replaceNode(node);
       else this.addNode(node);
     }
+    const still = stillSites(rule);
     for (const plan of plans) {
+      // (a site put back where it stood, F93: nothing it holds moves, nothing within it is on a closed edge)
+      if (still.has(plan.src)) continue;
       const where = placeOf(X.sites[plan.j]);
       if (plan.first) {
         for (const r of occ.sites[plan.src]) {
@@ -820,7 +836,7 @@ export function affine(rule: Rule): Affine[] | null {
   if (literals.some((x) => typeof x.payload !== 'object' || !('node' in x.parent) || !keptR.has(x.parent.node) || !isAttr(x.member))) return null;
   const rewritten = new Set<Id>();
   // links: a node may be linked, so long as the reaction leaves its links as they were (the same names, the same points)
-  const portsOf = (n: Node) => JSON.stringify(n.ports.map((g) => [g.key, g.contract, g.points, g.rest ?? null]));
+  const portsOf = (n: Node) => JSON.stringify(n.ports.map((g) => [g.key, g.contract, g.points, g.rest ?? null, g.more ?? null]));
   for (const n of X.nodes) {
     const from = keptTo.get(n.id);
     if (from === undefined) {
