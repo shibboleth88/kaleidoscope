@@ -187,6 +187,8 @@ export function readsAmount(e: Expr | undefined): boolean {
 /** Each function and how many values it takes (count: a site, and perhaps a type). */
 export const FUNCTIONS: Record<string, [number, number]> = {
   min: [2, 2], max: [2, 2], abs: [1, 1], sqrt: [1, 1], floor: [1, 1], round: [1, 1], exp: [1, 1], log: [1, 1], count: [1, 2],
+  /** sin[x], cos[x]: x in radians (F107: an angle a parameter gives, its axis worked out in the program). */
+  sin: [1, 1], cos: [1, 1],
   /** if[c a b]: a where c holds, else b (only the one taken is worked out). */
   if: [3, 3],
   /** clamp[v lo hi]. */
@@ -475,6 +477,8 @@ function compileExpr(e: Expr): Compiled {
         f = a.length === 3 ? (env) => Math.hypot(num(a[0](env), op), num(a[1](env), op), num(a[2](env), op)) : (env) => Math.hypot(num(a[0](env), op), num(a[1](env), op));
         break;
       case 'sqrt': f = (env) => Math.sqrt(num(a[0](env), op)); break;
+      case 'sin': f = (env) => Math.sin(num(a[0](env), op)); break;
+      case 'cos': f = (env) => Math.cos(num(a[0](env), op)); break;
       case 'max': f = (env) => Math.max(num(a[0](env), op), num(a[1](env), op)); break;
       case 'min': f = (env) => Math.min(num(a[0](env), op), num(a[1](env), op)); break;
       case 'clamp': f = (env) => Math.min(Math.max(num(a[0](env), op), num(a[1](env), op)), num(a[2](env), op)); break;
@@ -551,6 +555,8 @@ function interpret(e: Expr, env: Env): V {
     case 'floor': return Math.floor(num(a, op));
     case 'round': return Math.round(num(a, op));
     case 'exp': return Math.exp(num(a, op));
+    case 'sin': return Math.sin(num(a, op));
+    case 'cos': return Math.cos(num(a, op));
     case 'clamp': return Math.min(Math.max(num(a, op), num(b, op)), num(vs[2], op));
     case 'hypot': return Math.hypot(...vs.map((v) => num(v, op)));
     case 'log': return Math.log(num(a, op));

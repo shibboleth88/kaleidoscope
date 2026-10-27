@@ -40,8 +40,12 @@ export interface ReadSet {
   fields: string[];
   /** Whether the receiver's internal state is read. */
   state?: boolean;
-  /** Port groups whose far nodes are read: their fields, and whether their internal states are. */
-  across?: Record<string, { fields: string[]; state?: boolean }>;
+  /**
+   * Port groups whose far nodes are read: their fields, whether their internal states are, and the fields of the
+   * value each link holds (`held`, F97: a fold over a node's star reads the far node's attributes and the edge's
+   * value, CATEGORIES §9; a native type's read set is that fold's).
+   */
+  across?: Record<string, { fields: string[]; state?: boolean; held?: string[] }>;
 }
 
 /** What an arm may ask of the state, all of it within its declared read set. */
@@ -51,6 +55,11 @@ export interface HostCtx {
   field(node: Id, key: string): HostValue | undefined;
   /** The nodes at the far ends of a node's port group's points. */
   far(node: Id, port: string): Id[];
+  /**
+   * A node's port group's points, one per link: the nodes at its far ends and the fields of the value the link holds
+   * (F97; `{}` for the unit, a pure connection).
+   */
+  links(node: Id, port: string): { far: Id[]; held: Record<string, HostValue> }[];
   /** A host node's internal state (undefined for a node of no stateful host type). */
   state<S>(node: Id): S | undefined;
   /** The host instances within a node (its members, at any depth), in the state's order. */
@@ -170,6 +179,20 @@ function context(ix: Index, config: Record<string, HostValue>, sig?: Signature, 
       }
       return out;
     },
+    links(node, port) {
+      const n = ix.node.get(node);
+      const out: { far: Id[]; held: Record<string, HostValue> }[] = [];
+      for (const g of n?.ports ?? []) {
+        if (!('text' in g.key) || g.key.text !== port) continue;
+        for (const [, p] of g.points) {
+          const held: Record<string, HostValue> = {};
+          if ('edge' in p.target)
+            for (const [k, v] of ix.edge.get(p.target.edge)?.held?.fields ?? []) held[k] = Object.values(v)[0] as HostValue;
+          out.push({ far: ix.pointsOn(p.target).filter((pt) => pt.node !== node).map((pt) => pt.node), held });
+        }
+      }
+      return out;
+    },
     state: <S>(node: Id) => inst.get(node)?.state as S | undefined,
   };
 }
@@ -180,10 +203,16 @@ function readKey(ix: Index, ctx: HostCtx, reads: ReadSet, node: Id): string {
   const parts: unknown[] = [node, reads.fields.map((f) => ctx.field(node, f))];
   if (reads.state) parts.push(inst.get(node)?.rev ?? -1);
   for (const [port, r] of Object.entries(reads.across ?? {}))
-    for (const f of ctx.far(node, port)) {
-      parts.push(f, r.fields.map((k) => ctx.field(f, k)));
-      if (r.state) parts.push(inst.get(f)?.rev ?? -1);
-    }
+    if (r.held?.length)
+      for (const l of ctx.links(node, port)) {
+        parts.push(r.held.map((k) => l.held[k]));
+        for (const f of l.far) { parts.push(f, r.fields.map((k) => ctx.field(f, k))); if (r.state) parts.push(inst.get(f)?.rev ?? -1); }
+      }
+    else
+      for (const f of ctx.far(node, port)) {
+        parts.push(f, r.fields.map((k) => ctx.field(f, k)));
+        if (r.state) parts.push(inst.get(f)?.rev ?? -1);
+      }
   return JSON.stringify(parts);
 }
 

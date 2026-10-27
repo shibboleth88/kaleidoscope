@@ -529,6 +529,15 @@ class Parser {
         into.modules.push({ name, path: p.v, at });
         continue;
       }
+      // a parameter: a lowercase name bound to a constant, `rho = 0.51`, `half = rho / 2.0` (F107). Its value begins as
+      // a constant does (a literal, a sign, a parameter already declared); a rule's body never does
+      const declared = head.t === 'id' && (into.params ?? []).some((q) => q.name === head.v);
+      const constantHead = head.t === 'num' || head.t === 'str' || (head.t === 'sym' && head.v === '-') ||
+        (head.t === 'id' && (head.v === 'true' || head.v === 'false' || declared));
+      if (!binder && !attrs.length && /^[a-z]/.test(name) && constantHead) {
+        (into.params ??= []).push({ name, value: this.value(), at });
+        continue;
+      }
       if (head.t === 'id' && head.v === 'Type' && !this.isSym('=>', 1)) {
         this.next();
         const ty: TypeAst = binder ?? { name, binder: [], supers: [], slots: [], attrs: [], at };
@@ -590,6 +599,12 @@ export interface ModuleAst {
   types: TypeAst[];
   rules: RuleDeclAst[];
   modules: { name: string; path: string; at: number }[];
+  /**
+   * The module's parameters, `name = <constant>` (F107): a lowercase name bound to a value (DESIGN, "a lowercase name
+   * is a value"), read bare by the program's expressions, defaults and host configuration, and overridable when the
+   * program is read (its configuration).
+   */
+  params?: { name: string; value: Value; at: number }[];
 }
 export interface ProgramAst extends ModuleAst {
   world: Item[][];
@@ -600,7 +615,7 @@ export interface ProgramAst extends ModuleAst {
 export function parseModule(src: string): ModuleAst {
   const p = new Parser(lex(src));
   p.src = src;
-  const m: ModuleAst = { types: [], rules: [], modules: [] };
+  const m: ModuleAst = { types: [], rules: [], modules: [], params: [] };
   p.declarations(m);
   if (p.peek().t !== 'eof') throw new ReadError(`unexpected text at ${p.peek().at}`);
   return m;
@@ -610,7 +625,7 @@ export function parseModule(src: string): ModuleAst {
 export function parseProgram(src: string): ProgramAst {
   const p = new Parser(lex(src));
   p.src = src;
-  const out: ProgramAst = { types: [], rules: [], modules: [], world: [[]], run: [] };
+  const out: ProgramAst = { types: [], rules: [], modules: [], params: [], world: [[]], run: [] };
   if (p.ident('a program') !== 'Program') throw new ReadError('a program is written Program(…)');
   p.expect('(');
   while (p.more()) {

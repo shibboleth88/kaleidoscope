@@ -2154,3 +2154,94 @@ refused. With the in-place staleness switched off it fails at step 12; with quer
    spec's `discoverIn` should say whether a query meets the place's members only or what they hold too.
 4. Only `count` and `sum` of a one-node pattern; `group`, `->` pairs, patterns of several nodes or with links, and a
    query's own guard are not read.
+
+### F106. A native type reads the values its node's links hold (changed; semantics, PROVISIONAL)
+
+**Came up:** wyrm's embryo. A cell–cell contact's tension depends on the contact's age: a new contact (a cytokinetic
+furrow, a fresh touch) starts myosin-rich and relaxes over minutes, while a contact a daughter inherits stays mature
+[Yamamoto 2026, NMY-2 per contact]. The age belongs to the contact, not to either cell: ABa–EMS is as young as its two
+cells but is an old contact inherited from AB–P1. With F97 the contact's link holds it (`~c :: Contact =
+Junction[born = ?t]`, stamped by the touch and by a division's sister link, kept when a daughter inherits the link).
+But the contact law is computed by a native type (the tissue host's mechanics), and a host could read the far nodes'
+attributes across a port (`ReadSet.across`) but not the value each link holds.
+
+**What the spec decides, and what was followed:** a fold over a node's star reads, for each point, the far node's
+attributes and the edge's value (CATEGORIES §9, adopted §10; F97). A host's read set (R-host-answered-operations .5)
+is the native counterpart of that fold, so it reads both.
+
+**Built:**
+- `ReadSet.across[port].held?: string[]`: the fields of each link's value a host reads, beside the far nodes' `fields`.
+- `HostCtx.links(node, port)`: the node's points in that port group, one per link: its far nodes and its value's
+  fields (`{}` for the unit). `far(node, port)` is unchanged.
+- The read key (what an answer is memoized by) includes the declared held fields per link, so rewriting a link's value
+  makes a host method that reads it answer again.
+- Tests (`test/hostlinks.test.ts`): a host folds its links (a link's `k` times the far node's size), the unit holds no
+  fields; a rule rewrites a value and the host's answer changes. The suite: 36 files, 177 tests.
+
+**PROVISIONAL / for the spec:**
+1. **A host's read set over link values.** Is `held` the spelling and the granularity (fields named per port group),
+   or does a host read a link's whole value? The spec's read sets name a node's face fields; links are not in them.
+2. **A rule that only rewrites a link.** Maturation is a value that changes every round with the clock. As a rule,
+   `(?e = Embryo[t = ?t](?a = Cell[contacts = (~k | ?as)] | ?rest)) … ~k = Junction[…]` must match a cell. (Corrected
+   2026-10-27: wyrm first thought another rule rewriting the same cell each round pre-empted such a rule; it was not
+   scheduled at all, in its own runner's phases. In kaleidoscope's rounds nothing pre-empts. The decay is in the host
+   for now; a rule would also do.) Can a redex be a link
+   alone, its points' nodes sites (`~k = Junction[born = ?b] where …`), so a link's value has a rule of its own that
+   never contends with rules on its nodes? Or: should two rules that rewrite disjoint parts of a node (one its
+   attributes, one a link it has a point on) contend at all?
+3. **A link at a division.** wyrm copies a mother's contacts to one daughter and a `resolve` rule moves each to the
+   nearer daughter: the edge (and its value) is the same object throughout, so an inherited contact keeps its age.
+   Should the spec say that a link kept by a reaction keeps its value (as a kept node keeps its attributes), and that
+   a link made new (the sister's) starts at its type's defaults unless the reactum writes one? Here, both.
+4. **Time in a value.** `born = ?t` reads the embryo's clock from a node that holds it (F24's global quantity through a
+   place). A link's age is then `t − born`, recomputed by whoever reads it. If the spec had a clock a value can be
+   stamped with (a reaction's time), contact age would not need the embryo node in every redex that makes a contact.
+
+### F107. A module's parameters, read bare and configured when the program is read (changed; semantics, PROVISIONAL)
+
+**Came up:** wyrm's embryo. Each hypothesis carries numbers (a measured skew of AB's spindle, a myosin depletion ρ, an
+eggshell's semi-axes), and its generator baked them into the program from about 40 environment variables, out of the
+program's sight: a model's hypotheses were an environment string beside it, and switching one meant regenerating text.
+A model should say what it is in the program, and a run should set its numbers as a process takes its configuration.
+
+**What the spec decides, and what was followed:** "a lowercase name is a value", and a function's "outside names
+[are] captured by value when made" (`[?x] -> ?x + rate`; DESIGN, Writing): a name such as `rate` is read bare. A
+module is a place whose declarations are its members, and a name it uses and does not declare is an outer name
+(MODULES): so a value bound by a module and read elsewhere is the module's member, and configuring it is supplying
+that name's value from outside. A process's configuration is set once (`[config]`). The spec gives no spelling for a
+module-level value nor for supplying one when a program is read.
+
+**Built:**
+- *Declaration.* In a module or a program's `module`, `name = <constant>`: a lowercase name and a constant expression
+  (literals, operations, functions, and parameters declared before it: `cap = grow_by * 5`). Told from a rule by its
+  value's beginning (a literal, a sign, `true`/`false`, or a parameter already declared), which no rule body has.
+  Declared once across all the modules a program loads; twice is refused.
+- *Reading.* A bare lowercase name naming a parameter, wherever a value is written (a rule's guard, rate, reactum and
+  header values; a type's attribute defaults; a host type's configuration, `Type[host = "tissue" | zeta = zeta]`; the
+  world; the run part), is the parameter's value, substituted when the program is built: a constant, folded as one,
+  so a rule reading it matches nothing more and contends with nothing (a configuration node every rule matched would
+  pre-empt rules on the nodes it shares a redex with: wyrm's `radial`, 2026-10-17).
+- *Configuration.* `readProgram(src, load, { params: { name: value } })` gives values in place of the declared ones,
+  each of its declared kind (an `Int` given 2.5 is refused); a name no module declares is refused (a mistyped one
+  would otherwise change nothing). Parameters made of others follow the configured values (`cap` with `grow_by`).
+  `Program.params` is every parameter's value the program was read with, so a run can record its configuration.
+- *Functions.* `sin[x]`, `cos[x]` (radians): an angle a parameter gives, its axis worked out in the program.
+- *Tests* (`test/params.test.ts`): parameters in a rate, a guard, a reactum, a type default and a world, one made of
+  another, across a loaded module, against the same program with the numbers written in (the same world, states and
+  rates); configured values, and one following another; refusals (an unknown name, a value of another kind, a
+  parameter declared twice). The suite: 37 files, 181 tests.
+
+**PROVISIONAL / for the spec:**
+1. **The spelling.** `name = 0.5` in a module, read bare. Is a module-level value a declaration of its own (as here),
+   a member of the module's place, or a `def`? DESIGN's reaction bindings (`b = a * a`) and F104's rule-header values
+   are the nearest; this is the module-scoped one.
+2. **Supplying a value.** Here an option of reading the program. In the spec, is configuration an outer name a module
+   leaves open (filled by linking, `compose`), a value in the program's `run` part, or a process's `[config]`? A run
+   should record what it was given: here `Program.params`.
+3. **Scope and shadowing.** Here one flat namespace over every module loaded, each name declared once. With modules as
+   hypotheses (wyrm: a model is the set of modules it imports), two modules giving one number two values is a conflict
+   to refuse, or one module's version replacing another's; which?
+4. **Constants only.** A parameter is a scalar worked out once; a parameter that is a table (a measured curve, wyrm's
+   AFM tension time course, now written into the rule as knots) or a value of a record type is not read.
+5. **Units.** wyrm's parameters are in degrees, minutes, µm; DESIGN's units-as-types would let `ab_spindle :: Degree`
+   convert at the read, where here the program multiplies by π/180.

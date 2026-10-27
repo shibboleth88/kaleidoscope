@@ -49,15 +49,26 @@ export interface Program {
   run: Record<string, Scalar | string>;
   /** Every type declared, with where it came from. */
   types: (TypeAst & { module: string })[];
+  /** The parameters' values the program was read with, declared or configured (F107). */
+  params?: Record<string, number | string | boolean>;
 }
 
-/** Read a program's text, loading the modules it names by `load` (a path to that module's text). */
+/** A program's configuration: values for its modules' parameters, in place of their declared ones (F107). */
+export interface ReadOptions {
+  params?: Record<string, number | string | boolean>;
+}
+
+/**
+ * Read a program's text, loading the modules it names by `load` (a path to that module's text). Its parameters take
+ * the values `options.params` gives (its configuration), else their declared ones; `Program.params` is what they were.
+ */
 export function readProgram(src: string, load: (path: string) => string = () => {
   throw new ReadError('this program loads modules, and no loader was given');
-}): Program {
+}, options: ReadOptions = {}): Program {
   const ast = parseProgram(src);
   const types: (TypeAst & { module: string })[] = ast.types.map((t) => ({ ...t, module: '' }));
   const rules = [...ast.rules];
+  const params: { name: string; value: Value; at: number; module: string }[] = (ast.params ?? []).map((q) => ({ ...q, module: '' }));
   const seen = new Set<string>();
   const visit = (m: ModuleAst) => {
     for (const ref of m.modules) {
@@ -71,11 +82,57 @@ export function readProgram(src: string, load: (path: string) => string = () => 
       }
       types.push(...mod.types.map((t) => ({ ...t, module: ref.path })));
       rules.push(...mod.rules);
+      params.push(...(mod.params ?? []).map((q) => ({ ...q, module: ref.path })));
       visit(mod);
     }
   };
   visit(ast);
-  return buildProgram({ ...ast, rules }, types);
+  const values = resolveParams(params, options.params ?? {});
+  const subst = <T,>(x: T): T => substituteParams(x, values);
+  const p = buildProgram(
+    { ...ast, rules: rules.map((r) => ({ ...r, attrs: subst(r.attrs), rule: subst(r.rule) })), world: subst(ast.world), run: subst(ast.run) },
+    types.map((t) => ({ ...t, attrs: subst(t.attrs), binder: subst(t.binder), slots: subst(t.slots) })),
+  );
+  return { ...p, params: Object.fromEntries([...values].map(([k, v]) => [k, Object.values(v)[0] as number | string | boolean])) };
+}
+
+/**
+ * The parameters' values (F107): each declared once, in any module; worked out in the order declared, so one may be
+ * made of those before it (`half = rho / 2.0`); a configured value replaces the declared one, of the same kind. A
+ * configured name no module declares is refused, as a mistyped one would otherwise do nothing.
+ */
+function resolveParams(decls: { name: string; value: Value; at: number; module: string }[], given: Record<string, number | string | boolean>): Map<string, Scalar> {
+  const out = new Map<string, Scalar>();
+  for (const d of decls) {
+    if (out.has(d.name)) throw new ReadError(`the parameter ${d.name} is declared twice (${d.module || 'the program'})`);
+    const declared = constant(substituteParams(d.value, out));
+    if (d.name in given) {
+      const g = given[d.name], k = Object.keys(declared)[0];
+      const v: Scalar = k === 'float' && typeof g === 'number' ? { float: g } : k === 'int' && typeof g === 'number' && Number.isInteger(g) ? { int: g }
+        : k === 'text' && typeof g === 'string' ? { text: g } : k === 'bool' && typeof g === 'boolean' ? { bool: g } : (() => {
+          throw new ReadError(`the parameter ${d.name} is ${k}; configured as ${JSON.stringify(g)}`);
+        })();
+      out.set(d.name, v);
+    } else out.set(d.name, declared);
+  }
+  for (const k of Object.keys(given)) if (!out.has(k)) throw new ReadError(`no parameter ${k} to configure`);
+  return out;
+}
+
+/** A read program's parts with each bare parameter name (`rho`, a term with no arguments) its value. */
+function substituteParams<T>(x: T, values: Map<string, Scalar>): T {
+  if (!values.size) return x;
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (!v || typeof v !== 'object') return v;
+    const o = v as Record<string, unknown>;
+    if (o.k === 'term' && typeof o.head === 'string' && values.has(o.head) && !(o.attrs as unknown[])?.length && o.body === null)
+      return { k: 'lit', v: values.get(o.head) };
+    const out: Record<string, unknown> = {};
+    for (const [k, w] of Object.entries(o)) out[k] = walk(w);
+    return out;
+  };
+  return walk(x) as T;
 }
 
 const constant = (v: Value, kind?: 'int' | 'float' | 'text' | 'bool'): Scalar => {
