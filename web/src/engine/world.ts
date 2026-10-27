@@ -25,6 +25,7 @@ import {
   type Handle,
   type Id,
   Index,
+  type LinkValue,
   type Member,
   type Node,
   type Parent,
@@ -35,6 +36,7 @@ import {
   insertById,
   isAttr,
   keyed,
+  linkValueKey,
   memberKey,
   nextIds,
   parentKey,
@@ -42,9 +44,9 @@ import {
 } from './carrier';
 import { type Env, type Expr, evaluate } from './expr';
 import { type Face, settleHosts, startHosts } from './host';
-import { type Occurrence, siteEnv } from './match';
+import { type Occurrence, occEnv } from './match';
 import type { Transition } from './react';
-import { type Draw, type Rule, stillSites } from './rule';
+import { type Draw, type Rule, stillSites, writtenValue } from './rule';
 import type { Signature } from './signature';
 
 /** What discovery needs to see of a state: its nodes by identity, and the points on each handle. */
@@ -484,10 +486,12 @@ export class World {
     for (const e of imageEdges) before.handle({ edge: e });
 
     // values computed from what the sites hold, read before anything changes
-    const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
+    const env = occEnv(ix, occ, sig, rule);
     const computedOf = new Map((rule.computed ?? []).map((c) => [c.node, evaluate(c.expr, env, c.kind)]));
     // draws of a class (F72), what each takes worked out now, before anything changes
     const drawsNow = (rule.draws ?? []).map((d) => this.drawPlan(d, nmap.get(d.place)!, env));
+    // values written on links (F97), worked out now: each with the state edge it rewrites, where the link is kept
+    const linkWritesNow = rule.linkWrites?.length ? writesAt(rule, occ, env, ix) : null;
 
     // what each site holds, walked only where it is needed (a site dropped or copied, or one whose contents link
     // to a closed redex edge): a site put back where it stood costs nothing, however much it holds
@@ -661,7 +665,17 @@ export class World {
     for (const id of removed) this.dropNode(id);
     for (const e of droppedEdges) if (this.ix.edge.has(e)) (this.dropEdge(e), edgesRemoved.push(e));
     for (const [p, s] of occ.edges) if (!rule.keptEdges.some(([a]) => a === p)) (this.dropEdge(s), edgesRemoved.push(s));
-    for (const e of X.edges) if (!keptEdgeTo.has(e.id)) this.addEdge({ ...e, id: fe.get(e.id)!, value: e.value === null ? null : fn.get(e.value)! });
+    for (const e of X.edges) if (!keptEdgeTo.has(e.id)) this.addEdge({ ...e, id: fe.get(e.id)!, value: e.value === null ? null : fn.get(e.value)!, ...heldOn(linkWritesNow, e.id) });
+    // a kept link's value rewritten where it stands (F97): named only where it changed, as a scalar's is
+    const edgesRevalued: Id[] = [], edgesRetyped: Id[] = [];
+    for (const w of linkWritesNow ?? []) {
+      if (w.state === undefined) continue;
+      const edge = this.ix.edge.get(w.state);
+      if (!edge || linkValueKey(edge.held) === linkValueKey(w.value)) continue;
+      if (edge.held?.type !== w.value.type) edgesRetyped.push(w.state);
+      (edge as { held?: LinkValue }).held = w.value;
+      edgesRevalued.push(w.state);
+    }
     const revalued = new Set(reuse.values());
     for (const n of reactumNodes) {
       // a value written where it stands: only its payload (`Before` keeps parents and links, never values)
@@ -770,6 +784,8 @@ export class World {
         edgesRemoved,
         edgesCreated,
         ...(revalued.size ? { revalued: [...revalued] } : {}),
+        ...(edgesRevalued.length ? { edgesRevalued } : {}),
+        ...(edgesRetyped.length ? { edgesRetyped } : {}),
       },
       before,
     };
@@ -802,6 +818,33 @@ export class World {
   }
 }
 
+/**
+ * The values a rule's reactum writes on links at an occurrence (F97), worked out before it reacts: each with its link in
+ * the reactum, and the state edge it rewrites where the link is kept (a closed edge kept, or an outer name's).
+ */
+export function writesAt(rule: Rule, occ: Occurrence, env: Env, ix: Index): { link: Handle; state: Id | undefined; value: LinkValue }[] {
+  const emap = new Map(occ.edges), names = new Map(occ.names);
+  const keptFrom = new Map(rule.keptEdges.map(([a, b]) => [b, a]));
+  return (rule.linkWrites ?? []).map((w) => {
+    let state: Id | undefined;
+    if ('edge' in w.link) {
+      const a = keptFrom.get(w.link.edge);
+      state = a === undefined ? undefined : emap.get(a);
+    } else if ('name' in w.link) {
+      const h = names.get(w.link.name);
+      state = h && 'edge' in h ? h.edge : undefined;
+    }
+    const old = state === undefined ? undefined : ix.edge.get(state)?.held;
+    return { link: w.link, state, value: writtenValue(w, env, old) };
+  });
+}
+
+/** The value a fresh reactum edge is written (F97), as fields to spread into it: none where it holds the unit. */
+export function heldOn(writes: { link: Handle; value: LinkValue }[] | null, reactumEdge: Id): { held?: LinkValue } {
+  const w = writes?.find((x) => 'edge' in x.link && x.link.edge === reactumEdge);
+  return w ? { held: w.value } : {};
+}
+
 /** Each affine step's member key, worked out once (a step is asked for it on every firing). */
 const stepKeys = new WeakMap<Affine, string>();
 const stepKey = (s: Affine): string => {
@@ -829,6 +872,8 @@ export interface Affine {
 export function affine(rule: Rule): Affine[] | null {
   const R = rule.redex, X = rule.reactum;
   if (R.outer.places.length !== 1) return null;
+  // (a value written on a link is no count: F97)
+  if (rule.linkWrites?.length) return null;
   const keptTo = new Map(rule.kept.map(([a, b]) => [b, a]));
   // every redex node kept, but for literals at a kept node's attributes, each written back unchanged (below; F73)
   const keptR = new Set(rule.kept.map(([a]) => a));

@@ -1759,3 +1759,398 @@ groups are now mapped once per node object (a node changed in place is a new obj
 
 **Engine tests:** 147/147 throughout. cycle's `run/tctg13-same.ts`: incremental and fresh discovery agree at 81
 checks over 2,000 reactions (183 dissolutions, collapses, every shape of conquest).
+
+### F97. Links holding values (changed; semantics, PROVISIONAL in part)
+
+**Came up:** cycle wants a link between two towns that carries a record of numbers (a trade's volume), met and
+rewritten by rules and folded over a town's links. Kaleidoscope's links held nothing: `Edge.value` was only a node
+reference (`~r :: Ref[Cat] = @tom`), never set by the reader.
+
+**What the spec decides, and what was followed:** every link holds exactly one value, a pure connection the unit
+(D-every-link-holds-one-value; `structure Edge` in `Spec/Carrier/Carrier.lean`: `contract`, `value : Held`). A link
+holding a value is declared with it, `~r :: Ref[Cat] = @tom` (SYNTAX §8); a link's value is met by a pattern on the
+link, `~l = ?v` (§11, Ryan 2026-10-13). Values contain no place: a value is a record with fixed keys, a type applied to
+its arguments. A fold over a node's star reads, for each point, the far node's attributes and the edge's value
+(CATEGORIES §9, adopted §10), and an occurrence of a folding rule is stale only when its star changes
+(`Kernel.discover_local`). The spec gives no spelling for reading the edge's value inside a fold.
+
+**Built:**
+- *Carrier.* `Edge.held?: LinkValue`, a type and its fields (each a scalar, sorted by key so equal values are equal
+  JSON); absent is the unit. Kept with the edge in the carrier, so reading a link's value is the edge lookup by id
+  (`ix.edge`). `Edge.value` (the node reference) is unchanged.
+- *Syntax.* In a world and in a reactum, `~t :: Trade = Flow[volume = 5]` declares a closed edge holding the value; in
+  a world the type's declared defaults fill unwritten fields, and a whole number in a field declared `Float` is a float.
+  In a redex, `~t :: Trade = Flow[volume = ?v | open = true]` meets the link only where its value is a `Flow` (or below
+  it), with the literal fields, and binds `?v` to the field, read by the guard, the rate, `accept`, draws and the
+  reactum as a site is; a variable at two fields is a join (as F60). `~t = Flow[…]` (no `::`) is the same pattern, or
+  write, on a link the side names but does not declare: in a redex an outer name, so a rule can meet and rewrite a
+  link's value from one end. A link written with no value, `~t :: Trade`, meets a link whatever it holds, so every
+  existing program means what it meant. In a reactum, a link it keeps or makes and writes `= V[…]` holds the value
+  written, its unwritten fields what the link held (else the type's defaults); a link it writes no value on keeps what
+  it held (a fresh one, the unit). In an expression `~t.k` is a field of a redex link's value, and within
+  `sum[?ps E]`, `~ps.k` is the field of the value of the link of the point being summed (beside `?ps.x`, the far
+  node's attribute): `sum[?ps ~ps.volume]` is a town's total trade, `sum[?ps ?ps.wealth * ~ps.volume]` reads both.
+  The printer declares each link holding a value where its name is first met (`~e0 :: Trade = Flow[open = true |
+  volume = 2] | Town[trade = ~e0] …`), and a link of one point holding a value is named, not `!`. Refused: a value
+  pattern in an `unless`; `~t = …` in a world (a world's link declares its type); a value other than a record.
+- *Matching.* Value patterns are tested once the redex's structure has met (`linkValuesMeet`, before the guard): no
+  index by value, as for attributes (B5). A rule with none costs nothing more. The values a reactum writes must be
+  computable where the rule meets (as computed values are).
+- *Reaction.* `react` and `World.apply` both write values: a kept edge's value is rewritten where it stands (in place,
+  the edge object), and only where it changed is it named in the transition's `edgesRevalued`: a reactum restating a
+  value as it was, `~t :: Trade = Flow[volume = ?v]`, changes nothing. An idle edge goes even if it holds a value.
+- *Discovery.* Each rule is classed once by how it reads link values: `match` (a pattern on a link, or a guard, a
+  computed value or a written value reading one), `rate` (only its rate does), or none. A rewritten value is not a
+  change to any node: the nodes on the link do not count as changed (a town kept as it was stands still, F89), so a
+  rule reading no link value is never looked at again for it. For each edge in `edgesRevalued`, a `match` rule is found
+  again at the nodes on that edge (`refind`, F88), and a `rate` rule's spots there are rated again. That is exact:
+  every occurrence that reads a link's value meets a node on it (the link is a redex link, so a redex node has a
+  point on it; or it is a point of a rest whose owner the occurrence meets). A fold over `~ps.k` alone does not make a
+  rule read across links (`readsAcross`, which would look at far nodes on every change): a far node changing does not
+  change what such a fold reads. The environment an expression is evaluated in gets its link readers only for a rule
+  that reads link values; every other rule's is the one it always had. A rule reading or writing link values is never
+  held as an encounter (F57), and one writing them is never affine (τ-leaping).
+- *Tests* (`test/linkvalues.test.ts`, 11): read and print round trip; patterns binding fields, literal fields, a
+  subtype's value meeting its supertype's pattern; a pattern without a value meeting valued links and keeping them; a
+  written value, a restated one (no change, no `edgesRevalued`), a field left unwritten kept, a made link with defaults;
+  folds over `~ps.k` in a rate and a guard, and with `?ps.x`; an open link met and written from one end, read by the
+  far town's fold. And a 300-step random run of eleven such rules, both ways (`World.apply` against `react`, plain and
+  with values in place), with incremental discovery equal to a full search (spots and rates) at every step; switching
+  off either branch of the staling (re-finding, re-rating) fails it.
+
+**PROVISIONAL:** a value is a record of scalars (the spec's values are any `Held`: atoms, tensors, graph values,
+references); a field variable binds a field, and `~l = ?v` binding a whole value is refused; unwritten fields on a
+rewrite keep the old value's (a value is immutable in the spec, so `= V[k = x]` might rather mean the whole new value
+`V[k = x]`, defaults and all); the value's type is not checked against the link's contract; `~t.k` and `~ps.k` are this
+editor's spellings.
+
+**For the spec:**
+1. A link pattern written without a value, `~t :: T`: any value (as here, the way an unwritten attribute is a site) or
+   the unit (every link holds one value, and the pattern wrote none)? Here, any; the unit would change every program
+   that meets a link holding a value without saying so.
+2. SYNTAX §11 reads `~f = T` in a pattern as a reference on its own link holding `T`, "`T` the root of a region of its
+   own": a node, not a value. For a record (`Flow[volume = 5]`, a type applied to its arguments) the value reading is
+   the one taken here. Which is `~l = V[…]` in a pattern: a value pattern, or a node met in a region of its own?
+3. Writing a value: does `~t :: T = V[k = x]` in a reactum replace the value whole (values are immutable; fields left
+   out take the type's defaults), or update the fields written (as an unwritten attribute of a kept node keeps its
+   value)? Here, the latter.
+4. A fold's spelling for the edge's value: proposed `~ps.k`, the same name as the rest, the sigil choosing the link
+   (`~`) or the far node (`?`). On a hyperedge a point has several far nodes and the edge is read once for each, as
+   `?ps.x` reads each far node.
+5. Does a link's contract (`Trade`, `Ref[Cat]`) constrain the type of the value it holds? Here, no.
+6. An idle edge holding a value: still dropped (F8, F38), as here, or does a value keep a link alive?
+
+### F98. Regions joined by an open name are local too (changed; performance)
+
+**Came up:** cycle's library v2 (`../cycle/library/faith.ys`). A faith is a link of many points (every community and
+realm that holds it), so a rule reaching from a community to its faith writes the faith as an open name, its other
+points outside the match: `(?g = Region(?s = Settlement[creed = ~a] | ?t = Settlement[creed = ~b] | ?ss)) ||
+(?f = Faith[creed = (~a | ?fa)](?fx)) || (?h = Faith[creed = (~b | ?hb)](?hx))`. F86 holds a redex of several
+regions local only where its closed edges join them, so these rules were searched over the whole state after every
+firing: 0.56 ms a reaction at 5 communities, 7.2 ms at 40.
+
+**Changed (`incremental.ts`, `regionsLinked`):** an open name met in more than one region joins them, as a closed edge
+does. F86's argument holds unchanged: a name binds each of its points in the redex to one link of the state, so every
+occurrence is one connected match; a commit makes or breaks one only by changing a node it meets (or what holds one),
+which anchored search finds. The link's other points, outside the match, are not read by it (a fold over them, `sum`,
+reads across links and is staled as F35 has it). 7.2 → 0.26 ms a reaction at 40 communities, flat in their number.
+
+**Tests:** `test/opennames.test.ts`: conversion, an official pull, consent and a schism (a new link and a nested
+faith), regions joined by open names and a closed edge: each rule held local, and incremental discovery equal to a
+full search at every step of 300. The test fails on the engine before the change. Engine tests 159/159.
+
+**For the spec:** F86's suggestion (locality as the connectivity of the redex) should count connection through names
+as well as through closed edges; and whether two names of a redex may meet one link (they may here; cycle's
+`docs/FINDINGS.md` C13) is a question for the spec's matching, which a rule wanting distinct links must answer itself.
+
+### F99. A guard's single-node conjuncts are the rate's (changed; performance)
+
+**Came up:** cycle's library v2 composed (`../cycle/stories/shui-dao-qu-cheng-v2.ys`). Some twenty rules meet a realm
+and each community it rules, and read the realm's treasury or army in their guards beside conjuncts on the community:
+famine (`?m == 0 and 80·?n > ⅔·?l·?c`), relief, surtax, a grant, a departure. The treasury is rewritten in place at
+every tax (F88), and F88 searches again, at the realm, every rule whose guard reads a value that changed: each such
+rule's occurrences at the realm, one per community, dropped and found again, at every tax. And a guard counting what a
+realm holds (`count[?ks Campaign] == 0`) made every value at the realm one that rule waited on. 3.7 ms a reaction at 48
+communities, most of it matching.
+
+**Changed:**
+- `incremental.ts`, `match.ts`, `events.ts`: a guard is split into its conjuncts; a conjunct that reads keyed
+  attributes of one redex node only (no rest, amount, link value or read across links) is deferred to the rate. The
+  rule's occurrences are matched with the rest of the guard (`guardParts`, `MatchOptions.deferGuard`); one whose whole
+  guard fails, or whose computed values cannot be computed, is held dormant: in no spot, met by its nodes like any
+  other, rated zero (`occurrenceRate`). A value a deferred conjunct reads, rewritten in place, no longer makes the rule
+  sensitive there: it is rated again, and `recheck` puts each occurrence at the node into its spot or takes it out as
+  its guard now holds or fails. A conjunct joining two nodes' values (`?a == ?b`) stays matched: deferred, it would keep
+  every pair a join prunes.
+- `valueKeys`: a site read only as what `count` counts (`count[?ks T]`) is not a value read; what a place holds changes
+  by nodes made, removed or moved, which are found again as such.
+- A full search (`spots`) applies the whole guard in matching, and agrees with the rate.
+3.7 → 1.3 ms a reaction on cycle's composite at 48 communities; a 3000-year run 13 → 4 minutes. (In cycle's model,
+famine's empty treasury became a guard, `?m == 0`, not the literal `treasury = 0`: a literal is matched.)
+
+**Tests:** `test/deferredguards.test.ts`: per-town rules guarded on their realm's treasury beside the town's values, a
+guard counting the realm's columns, values written in place (`World.apply`): every rule fires, the deferred guards
+are crossed both ways, and discovery equals a full search at each of 400 steps. With `recheck` disabled it fails at
+step 4. Engine tests 160/160.
+
+**For the spec:** the spec's guard is a condition of the occurrence; whether an occurrence whose guard fails exists
+(and is rated zero) or does not is unobservable to a policy that draws by rate, so the split is an implementation's
+choice. A policy integrating rates (a flow) sees dormant occurrences nowhere (`all` lists spots, which hold none).
+Literals stay part of matching: a literal on a value rewritten often is better written as a guard, which the spec
+could note.
+
+### F100. A closed edge is the side's, whichever region declares it (changed; semantics)
+
+**Came up:** cycle's library v2. `(?g = Region[border = (~e | ?gb)](…)) || (~e :: Border = Crossing[cost = ?c] | ?k = …)`
+met nothing, silently, where the same rule declaring `~e` in the first region met. The reader built each region in
+turn, declaring the edges written in it first: the first region's `~e`, not yet declared, was read as an outer name, and
+the second region's declaration made a closed edge of its own, holding no point of the first region's (and, holding
+fewer points than the state's link, never met).
+
+**What the spec decides:** edges are declared at the top level, beside the faces and outside every place (SYNTAX §13,
+"The whole carrier": "Edges are declared at the top level", Ryan 2026-10-11). An edge belongs to the carrier, not to a
+region, so where among the regions its declaration is written means nothing.
+
+**Changed (`text.ts`, `Builder.side`):** a side's closed edges (and the link values written with them) are declared
+first, from every region, then each region's members are read. In a state, a redex, a reactum and an unless alike.
+`test/edgedecl.test.ts`: the rule declaring its border in the second region reads with one closed edge and no outer
+name, meets, rates and fires as the one declaring it in the first (both by `react` and in place); it fails on the
+reader before the change.
+
+**For the spec:** kaleidoscope writes a closed edge in a region's place (`(~e :: Border | ?g = …) || (…)`) where the
+spec writes it above the regions; the spec's own placement makes the question moot. Writing one name's declaration in two
+regions of a side is still read as one edge (the second declaration's type is ignored): the spec might refuse it.
+
+### F101. A fold across links stales what it folds, by the group it folds and the keys it reads (changed; performance)
+
+**Came up:** cycle's library v2 wants a realm's cash share as an exact fold over the communities it rules
+(`sum[?hs ?hs.tax * ?hs.n * ?hs.coin]` over the realm's `holds`), and a disease's persistence reading its trade
+partners' people (`sum[?tr ?tr.n]` over a community's `trade`). One such rule made every value rewritten in place at any
+node with links leave the fast path (`update`: `host.ports.length && this.across.some(Boolean)`), and every change
+collected every node on every link of every changed node (a community's faith is a link of hundreds of points) to
+search every rule reading across links there. cycle dropped the trade fold: it "tripled the cost of every reaction".
+
+**Changed (`incremental.ts`, `expr.ts`):**
+- Each rule reading across links is read once for what it reads (`acrossOf`, `acrossReads`): for each rest its guard,
+  rate or computed values fold over (`?ps.x` within `sum[?ps …]`), the redex group the rest stands on (its owner's type,
+  the group's key and contract) and the attribute keys read of the far nodes ('all' where a native folds the rest). A
+  host method, whose reads are not known by rest, is read as before ('unknown').
+- `acrossOwners(n, k)`: the nodes whose occurrences read node `n`'s attribute `k` across a link: on a link of `n`, at a
+  point of a group some rule's rest stands on, of that rule's owner type, for a rule reading `k`. Only the links of `n`
+  whose contract can type a point of that group are walked (some type within both: a point's contract is within its
+  link's, SYNTAX §13), so a fold over a realm's `holds` (Rule) never walks a faith's link (Creed).
+- A value rewritten in place stays on the fast path; for each rule reading it across a link, the owners are found again
+  (where a guard or a computed value folds) or rated again (where only the rate does). A value no rule reads across
+  links costs nothing more. In the full update, the nodes found again for such a rule are its owners only, by the key
+  that changed (a changed node itself: any key), not every node on every link.
+- `valueKeys` no longer makes every value of every node an across-reading rule meets a change of what meets it: its
+  own reads are its literals' and guard's, as any rule's; what it reads across links is staled above. And
+  `advanceValues` (a flow's values) goes to the full update where a value it moved is read across a link (before, a fold
+  over a type not in the folding rule's redex was not staled there at all).
+
+**Measured** (`bench/across.bench.test.ts`: realms holding communities by many-point ports, three faiths of a link each,
+trade chains, values rewritten in place by most reactions; `levy` folding `?hs.tax * ?hs.n * ?hs.coin` over holds and
+`fade` folding `?tr.n` over trade, or the same rules without folds): at 400 communities, 0.082 ms a reaction without
+the folds and 0.512 ms with them before; 0.095 and 0.091 ms after. At 100: 0.080 / 0.258 before, 0.091 / 0.086 after.
+
+**Tests:** `test/across.test.ts`: towns ruled by realms, sharing one faith's link, trading; folds in a rate (over holds
+and trade) and in a guard (over trade); values in place, links made, moved and broken, towns founded and abandoned:
+discovery equals a full search at every step of three runs of 300 (two in place, one by `react`, whose every value
+change takes the full update). And a value read by no fold (a town's wealth) and one read by a rate's fold (its tax)
+search nothing; one read by a guard's fold (its people) searches the folding rule at its trade partners only. With the
+rules read as before ('unknown') the second fails (20 searches); with either half of the staling switched off, the
+first fails at step 1.
+
+**PROVISIONAL:** the contract filter rests on links being typed: each point's contract within its link's (SYNTAX §13,
+"a point whose contract is narrower than the one declared"). Kaleidoscope's reader does not check it: a state joining
+ports of unrelated contracts on one link would be staled short here. The spec's carrier formedness could state it.
+
+### F102. A link's value in a guard's conjunct of its own is the rate's (changed; performance)
+
+**Came up:** cycle's trade (`../cycle/library/trade.ys`). `relax_far` meets two regions joined by a border and the
+trade link between their communities, `~t :: Trade = Flow[volume = ?v]`, guarded `where ?v > 0`, and writes the volume
+computed from it. F97 classed every rule whose pattern, guard or written value reads a link's value as 'match': each
+volume rewritten was found again, by every such rule, at both towns on the link (98 searches a firing, 10 ms on the v2
+composite: what the volume reads is matched, not rated).
+
+**Changed (`incremental.ts`, `react.ts`, `world.ts`):**
+- F99's deferral takes link values: a guard's conjunct reading one redex link's value fields and nothing else (no site,
+  rest, amount or read across links) is the rate's, as a conjunct on one node's attributes is. And a rule whose computed
+  values or link writes read link values is deferred whole (its guard's matched part as F99 has it, `match` absent
+  where none): an occurrence whose values cannot be worked out is dormant, not unfound.
+- A value pattern binds without constraining where its fields are all variables, but for the value's type. Each rule's
+  link reads are classed again: `match` (a pattern's literal field, or a matched conjunct, computed value or write
+  reading a link), `types` (a pattern of variables), `rate` (its rate, or a deferred guard, computed value or write).
+  A link revalued in place: `match` rules are found again at its nodes, as before; `types` rules only where the value's
+  type changed (the transition names those edges, `edgesRetyped`); `rate` rules have their occurrences there put in or
+  out of their spots (`recheck`, for that rule alone) and rated again.
+- **A defect found with it:** incremental discovery keyed an occurrence by its rule, nodes, edges and sites, not its
+  outer names. Two occurrences meeting one town by two of its links through an open name (`~t = Flow[…]` at a town of
+  two trade links) were one: the second was never held. They are keyed by their names too.
+
+**Measured** on cycle's v2 composite (`stories/shui-dao-qu-cheng-v2.ys`, 20,000 reactions, apply and update timed by the
+rule that fired; the engine of F101 against the same with this finding's deferral and classes switched off):
+`relax_far` 10.2 → 0.8 ms a firing (98 → 8 searches: `close`, whose `volume = 0` is a literal, at the link's towns).
+`carry` and `fade` (no searches now) were 11–13 ms.
+
+**Tests:** `test/linkguards.test.ts`: `relax_far`'s shape, a write reading the value with no guard (`carry`), a guard
+reading `~t.volume` beside a town's value, a literal volume (`close`), and a value's type rewritten (`Flow` to `Jam` and
+back): the guards deferred, discovery equal to a full search at every step of three runs of 400 (two in place, one by
+`react`), every rule firing and types rewritten; and a volume rewritten in place searches only `close`, at most four
+times. Each part switched off fails it: the old classes (20 searches), no deferral of link conjuncts (16), no `recheck`
+for link values (step 2), no search where a type changed (step 3); and the old key held one of a town's two `carry`
+occurrences (step 0).
+
+**For the spec:** as F99. A literal on a value rewritten often is matched; a guard on it is rated.
+
+### F103. A node relinked changes what meets on the links it joined or left, and only where that can be told (changed; performance; and a defect)
+
+**Came up:** cycle's faith `spread` and military-tech-diffusion's `border` (`(~e :: Border = Crossing[cost = ?c] | ?g =
+Region[border = (~e | ?gb)](?s = Settlement[…] | ?ss)) || (?k = Region[border = (~e | ?kb)](…)) || (faith or art nodes by
+open names)`) were searched far more than they fired: on 20,000 reactions of the v2 composite, after F101–F102, `spread`
+fired twice and was searched 4,355 times, `border` 23 and 6,051 times. Profiled by what fired before each search, almost
+none came from what these rules read: they came from rare firings that relink a realm or a community (a war declared, a
+community taken, a schism suppressed: 1,700–1,900 searches and some 50 ms each), and from `spread`'s own firing (1,821
+searches, 63 ms). `update` took a node whose links changed as changing every node on every link of it, so a realm gaining
+a war changed every community it holds and every member of its faith (a link of hundreds of points), and a community
+changing faith changed every member of both faiths: each searched again, with what holds it, by every rule.
+
+**What a link's other nodes can tell** of a point joining or leaving it, where the occurrence does not meet the node that
+moved (which is changed itself): (1) a closed edge of a pattern meets a link of exactly its points (joined to an inner
+name, of at least them), so only a link whose count before or after is one a pattern's closed edge of a meeting contract
+has; (2) a negative's node at a root, tied to the redex by a link, which the node that moved could now be or cease to be;
+(3) a fold over a rest of points, whose terms are the link's other nodes (`sum[?ps …]`, whatever its body reads). Nothing
+else an occurrence reads of a node it does not meet depends on who is on its links: its own points, an open name's link,
+`count[?ps]` and `shared` are its nodes' own.
+
+**Changed (`incremental.ts`, `expr.ts`):**
+- `touchedLinks`: a relinked node's links it joined or left, by each point's group key and link (a point renumbered,
+  F89, is none), with the net count; a link's count before is its count after less every relinked node's net change.
+  Only a touched link whose count (before or after) a closed edge of some pattern could meet carries the change to its
+  other nodes (1).
+- Folds (3) are staled by F101's `acrossOwners`, given the node and the links it touched (`'+links'`): every rule
+  folding over a rest is read for its rests (`foldsRest`; a sum's rest is read whatever its body reads), and its owners on
+  a touched link of the group's contract are found again there.
+- (2), per rule: each rule's negatives' root nodes tied by a link (`negativeRoots`); a change at or under a node of such a
+  type (in the full update, every node affected; in place, the host of a value rewritten and what holds it) finds that
+  rule again at the nodes on that node's links (`negativeLinked`).
+- **A defect found with it, older than this:** `local()` holds such a rule local on the argument that "a change to it is
+  a change to the links of the nodes it is linked to". A value rewritten in place at that node (a town falling sick,
+  `unless (?t = Town | Town[creed = ~f | sick = 1])`) changed nothing at the far end: the occurrence it now blocks was
+  kept. The test below fails on the engine before this finding at step 8, as on this one with (2) switched off.
+
+**Measured** on cycle's v2 composite (20,000 reactions, apply and update timed by the rule that fired; F101–F102 against
+this): all reactions 1.04 → 0.63 ms each (1.17 before F101). `spread` 52 → 4.1 ms a firing (1,795 → 106 searches),
+`border` 15.5 → 7.0 ms (254 → 22), `link_far` 37 → 12.5 ms, `declare` 52 → 11.7 ms (1,719 → 175), `take` 51 → 20 ms,
+`absorb` 46 → 14 ms, `suppress` 54 → 19 ms. Searched over the run: `spread` 4,355 → 410 times, `border` 6,051 → 819.
+What remains of `link_far`'s searches follows values its guard joins (`?n * ?m > 20`, two communities' people: matched,
+as F99 keeps a join) and is some four searches a change of a community's people.
+
+**Tests:** `test/relink.test.ts`: towns ruled by realms, of faiths that are links of many points; a town converting
+(open names, F98), wars made and ended, a town defecting; a closed edge of three points (a faith of exactly two towns), a
+negative's root node tied by the faith's link, a fold over a faith's members and one over a realm's towns' people:
+discovery equals a full search at every step of four runs of 300 (two in place, two by `react`), every rule firing; and a
+war declared searches at most 30 times (71 before). Each part switched off fails it: the closed-edge counts (step 19), the
+negative's root nodes in the full update (step 8) or in place (step 1), the folds over a touched link (step 5).
+
+**For the spec:** `discover_local`'s staleness could be stated by these three readers of a link's points beside the
+nodes an occurrence meets; and (2) is a reason to keep a negative's nodes at a root rare, or to say how they are local.
+Not changed here: `World.apply`'s `Before` keeps, for every node a reaction could change, every point on every link of it
+(a community's faith: hundreds), copied at every reaction meeting a community.
+
+### F104. Values a rule names in its header (changed; semantics, spelled as the spec has it)
+
+**Came up:** cycle's epidemic (`../cycle/library/epidemic.ys`, `strike` and `strike_more`): the final size of an outbreak
+and the dead it makes are one long expression, written out eight times across the rate and the reactum, for want of a
+name (F36 asked for one).
+
+**What the spec decides:** a reaction is one place and its bindings are its members, evaluated in the order their
+dependencies give (DESIGN, "A reaction is one place, and bindings are its members", D-bindings-are-members-ordered-by-
+dependency); a rule's attributes are written in its header, `R[rate = …] = l => r` (STEPS `rules.attributes`); and
+SYNTAX §7 reads a value so named in the reactum as `?g`: `tally[g = group[Cell(fate = ?f) -> ?f]] = (?t = Fates() |
+Pending()) => ?t = Fates(?g)`.
+
+**Changed (`text.ts`, `expr.ts`, `program.ts`):** every attribute of a rule's header other than `rate`, `accept`, `split`
+and `draw…` is a value the rule names: `R[z = E | d = F | rate = G] = …`, read as `?z` by its guard, rate, acceptance,
+draws, computed values and link writes, and by another named value (in any order; refused where they name each other,
+`a → b → a`). A reactum attribute written `k = ?z` is that value. Each named value is one expression node,
+`let[z E]`, shared by every expression reading it, and worked out once per `Env` (an occurrence's guard, its rate, its
+reaction: the state does not change within one), not within a fold's term. A name the rule's expressions never read is
+only a label, as before (`ruleAttrs` keeps every attribute as text); a name both given a value and named in the redex
+(a site, a node, a rest, a link's field) is refused. A header holding only `rate`/`accept` reads as it did: cycle's runner
+needs nothing new.
+
+**Measured:** cycle's `strike` and `strike_more` written with three names, `x = (?i - 100) / 20.0`, `z = 1.0 -
+exp[?x * (1.0 - exp[?x * (1.0 - exp[?x])])]`, `d = 0.002 * (100 - ?i) * ?n * ?z`: 1,656 characters → 741; on 3,000
+communities the same rates and the same states after each reaction, a spot found and rated 14.1 → 13.1 µs, a reaction in
+place 35.4 → 28.2 µs.
+
+**Tests:** `test/lets.test.ts`: a rule with named values (one built of another, one read in a guard, a rate, a reactum
+alone and a link's write, one reading a link's value) against the same rule written out: the same spots, rates and
+reactions, by `react` and in place; a value read twice by the guard and three times by the rate worked out once in each,
+and once in the reaction (a counting native: 8 calls without the sharing, 2 with it); names naming each other, and a
+name of the redex, refused. Before the change, `?z` is "no site of the redex".
+
+**PROVISIONAL / for the spec:**
+1. The spelling of a read: SYNTAX §7's `tally` example reads a named value as `?g`; DESIGN's `graze = (rate = 2.0 | a = 5 |
+   b = a * a | … where b > 11 => …)` reads it bare, `b`. Here `?g` (a bare name is a type in kaleidoscope's expressions).
+   Which is it?
+2. Here a value is named only in the header (`R[…]`); DESIGN writes bindings as members of the reaction's place, beside
+   `redex` and `reactum`. The header is the sugar kaleidoscope reads; the place form is not read.
+3. "Once": here once per evaluation of an occurrence (its guard, its rate, its reaction each work it out once, and the
+   state may change between them). A named value inside a rate is read as the rate is, its division real (F64), and in
+   a reactum as the reactum is: written `/` between two whole numbers floors there and not in the rate.
+4. Values only: SYNTAX's `?g` unfolding a let's map into a place's members (a group) is not read; a named value is a
+   scalar.
+
+### F105. Queries over a place a redex node names (changed; semantics, PROVISIONAL in part)
+
+**Came up:** cycle's epidemic. A disease's persistence wants the people of the community's region (its critical
+community size), the sum of an attribute over a node's members; the engine folded only a link's far ends, so cycle
+wrote `?n * (1 + count[?ss Settlement])`, exact only where a region's communities are alike.
+
+**What the spec decides:** a pattern in code is a query (SYNTAX §7, D-a-query-is-a-pattern-in-an-expression):
+`count[Drip()]`, `sum[Tank(level = ?x) -> ?x]`, searching the place holding the rule; `in p` names another, "a member
+of the world" (`values.folds.scope`: linked from the rule's names, a name of no member refused `E-unbound`). A query
+`in p` costs the place, not the world (FOLDS a12). FOLDS (a4) and QUERIES §4.7 write the place as a site or a matched
+node, `count[Mol() in ?s]`, `count[Drip() in ?t]`; the decided form names a world member.
+
+**Changed (`text.ts`, `expr.ts`, `incremental.ts`):** `count[T(…) in ?p]` and `sum[T(k = ?x | …) in ?p -> E]`, `?p` a
+node the redex names: the nodes of type `T` (or below it) within `?p`, at any depth (but not a node's attributes),
+whose attributes meet the pattern's, counted or each adding `E`. A pattern's attribute is a literal or a value of the
+occurrence (a filter: `Town(n = ?n)` where the redex binds `?n`, a join), or a variable it binds for `E` (a node lacking
+the attribute is not met). `T(…)` and `T[…]` both read. A query stands in a guard, a rate, an acceptance, a named value
+(F104) or a reactum's value; its type and attribute keys are checked as the rule is read (a misspelling would count
+nothing, silently). Worked out once per occurrence, and within a pass of rating once a place where `E` reads only what
+the query met (as F78's amounts).
+- *Staleness, by the place* (as an amount's, F71/F74): a rule making a query is never lazy (its place's members are
+  read whatever its sites hold) and its query conjuncts are never deferred (F99); a member made, removed or moved, or an
+  attribute made anew, changes a node the place holds, so the place is affected and what met it found again (anchored,
+  at the place). A value rewritten in place at a member is read by a query only where the member's type is the
+  pattern's and the key one the query reads: then the occurrences meeting a holder of the member as that query's place
+  (indexed apart, `queryAt`) are found again (a guard's query) or rated again (a rate's), and nothing else is. A flow's
+  value (`advanceValues`) read by a query takes the update.
+
+**Measured:** `bench/query.bench.test.ts`, a disease fading by its region's people, communities' people and wealth
+rewritten in place: written as cycle's approximation or as the query, ms a reaction at 200 and at 800 communities:
+0.058 / 0.056 and 0.058 / 0.069 (flat in the world's size). On cycle's v2 composite with `die_out` written exactly
+(`die_out[nc = sum[Settlement(n = ?x) in ?g -> ?x] / 30.0 | rate = 1.0 / (1.0 + ?nc * ?nc * ?nc * ?nc)]`, a scratch copy;
+nothing in cycle edited): 0.605 → 0.594 ms a reaction, `die_out` 0.72 → 0.75 ms a firing.
+
+**Tests:** `test/queries.test.ts`: regions of settlements, one in a fort (any depth); people, sickness and wealth
+rewritten; settlements founded, abandoned, moved between regions and into forts; queries in a rate (`sum … -> ?x`), a
+guard (`count[Settlement(sick = 1) in ?g] > 1`), a reactum's value, and joined to the occurrence (`count[Settlement(n =
+?n) in ?g]`): the values a full search gives, and discovery equal to it at every step of three runs of 400 (two in
+place, one by `react`), every rule firing; a value no query reads searches nothing beyond what it did, one a guard's
+query reads searches at most six times; misspelt types and attributes, a place not a redex node and a sum without `->`
+refused. With the in-place staleness switched off it fails at step 12; with query rules left lazy, at step 17.
+
+**PROVISIONAL / for the spec:**
+1. `in ?p`, a matched node, is the spelling FOLDS (a4) and QUERIES (§4.7) propose; the decided `in p` names a member of
+   the world. Is a place the redex names (`?g`) admitted as `p`? Here it must be: without it, a region's total is a
+   query of the world filtered by a link or a key back to the region.
+2. A query without `in` (the place holding the rule) is refused here: kaleidoscope's rules stand in no place.
+3. "Within the place" read here as at any depth below it (a pattern met in a context), not a node's attributes; the
+   spec's `discoverIn` should say whether a query meets the place's members only or what they hold too.
+4. Only `count` and `sum` of a one-node pattern; `group`, `->` pairs, patterns of several nodes or with links, and a
+   query's own guard are not read.

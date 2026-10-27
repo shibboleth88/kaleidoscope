@@ -19,7 +19,7 @@
  * law like that is not a propensity.)
  */
 import type { Carrier, Id, Node } from './carrier';
-import type { Expr } from './expr';
+import { type Expr, readsLinks } from './expr';
 import type { Occurrence } from './match';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
@@ -75,6 +75,7 @@ export function encounter(rule: Rule, sig: Signature): Encounter | string {
   if (R.outer.names.length || R.inner.names.length || R.names.length) return 'names';
   if (rule.guard) return 'a guard';
   if (rule.negatives.length) return 'a negative';
+  if (rule.linkPatterns?.length || rule.linkWrites?.length || readsLinks(rule.rateExpr) || readsLinks(rule.accept)) return 'link values (F97)';
   if ((rule.computed ?? []).some((c) => !safe(c.expr))) return 'a computed value that can fail';
   const byId = new Map(R.nodes.map((n) => [n.id, n]));
   const rootOf = (n: Node): Id => ('node' in n.parent ? rootOf(byId.get(n.parent.node)!) : n.id);

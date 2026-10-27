@@ -20,6 +20,7 @@ import {
   type Node,
   type Parent,
   type Port,
+  fieldOf,
   handleKey,
   scalarKey,
   isAttr,
@@ -32,7 +33,7 @@ import {
 } from './carrier';
 import type { Rule } from './rule';
 import { runPlan } from './plan';
-import { type Env, EvalError, evaluate, holds } from './expr';
+import { type Env, EvalError, type Expr, evaluate, holds, readsLinks } from './expr';
 import type { Signature } from './signature';
 
 /** One place a rule meets the state. */
@@ -66,6 +67,24 @@ export interface MatchOptions {
   index?: Index;
   /** Redex nodes whose one anonymous site is left unworked (`runPlan`'s `lazy`). */
   lazy?: Set<Id>;
+  /**
+   * Match the structure, link values and negatives only; the guard and the computed values are the rate's (F99): an
+   * occurrence whose guard fails is kept, dormant, at a rate of zero (`guardHolds`, `occurrenceRate`).
+   */
+  deferGuard?: boolean;
+}
+
+/**
+ * The rules part of whose guard incremental discovery has made the rate's (F99), with the part still matched (`match`,
+ * absent where none is): their occurrences are matched with that part alone and rated zero where the whole guard fails.
+ * A rule is put here by `Discovery` once, by what its guard's conjuncts read; a full search (`spots`) still applies the
+ * whole guard in matching, and the rate agrees with it there.
+ */
+export const guardParts = new WeakMap<Rule, { match?: Expr }>();
+
+/** Whether an occurrence's guard holds and its computed values can be computed: whether it could fire (F99). */
+export function guardHolds(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
+  return computable(ix, rule, occ, sig);
 }
 
 interface Bound {
@@ -110,8 +129,8 @@ export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOpti
     rule.redex,
     sig,
     (occ) => {
-      // the guard first: it is cheap, and a negative is a search
-      if (!computable(ix, rule, occ, sig)) return;
+      // the guard first: it is cheap, and a negative is a search (a deferred guard is the rate's, F99)
+      if (opts.deferGuard ? !matchedPart(ix, rule, occ, sig) : !computable(ix, rule, occ, sig)) return;
       if (blocked(ix, rule, occ, sig)) return;
       found.push({ ...occ, rule: rule.name });
       stats.found++;
@@ -150,10 +169,39 @@ function blockedReference(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, 
   return false;
 }
 
+/** Whether a rule reads the values links hold anywhere (F97): its patterns, its writes, or an expression of it. */
+const linkRules = new WeakMap<Rule, boolean>();
+export function readsLinkValues(rule: Rule): boolean {
+  let v = linkRules.get(rule);
+  if (v === undefined) {
+    v =
+      !!rule.linkPatterns?.length ||
+      !!rule.linkWrites?.length ||
+      [rule.guard, rule.rateExpr, rule.accept, ...(rule.computed ?? []).map((c) => c.expr), ...(rule.draws ?? []).flatMap((d) => [d.count, ...d.filters.map(([, x]) => x), ...d.set.map(([, x]) => x)])].some(readsLinks);
+    linkRules.set(rule, v);
+  }
+  return v;
+}
+
+/**
+ * What an occurrence holds, for expressions to read: its sites, rests and nodes, and, for a rule that reads them, the
+ * values its links hold (F97). (A rule reading none gets the environment it always had, at the cost it always had.)
+ */
+export const occEnv = (ix: Index, o: Omit<Occurrence, 'rule'>, sig: Signature | undefined, rule: Rule): Env =>
+  readsLinkValues(rule) ? siteEnv(ix, o.sites, sig, o.rests, o.nodes, o.edges, o.names, true) : siteEnv(ix, o.sites, sig, o.rests, o.nodes);
+
+/** The state edge a redex link met: by its handle in the redex (`e3` a closed edge, `x1` an outer name). */
+export function linkMet(handle: string, edges?: [Id, Id][], names?: [Id, Handle][]): Id | undefined {
+  const id = Number(handle.slice(1));
+  if (handle[0] === 'e') return edges?.find(([p]) => p === id)?.[1];
+  const h = names?.find(([x]) => x === id)?.[1];
+  return h && 'edge' in h ? h.edge : undefined;
+}
+
 /** What an occurrence's sites hold, for expressions to read. */
-export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [string, { owner: Id; ports: Port[] }][], nodes?: [Id, Id][]): Env {
+export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [string, { owner: Id; ports: Port[] }][], nodes?: [Id, Id][], edges?: [Id, Id][], names?: [Id, Handle][], links = false): Env {
   const rest = (name: string) => rests?.find(([n]) => n === name)?.[1];
-  return {
+  const env: Env = {
     index: ix,
     sig,
     nodeOf(r) {
@@ -191,16 +239,67 @@ export function siteEnv(ix: Index, sites: Id[][], sig?: Signature, rests?: [stri
       return roots.filter((r) => sig.sub(ix.node.get(r)!.type, t)).length;
     },
   };
+  if (links) {
+    // the values links hold (F97): a redex link's, and each point's link's within a fold
+    env.link = (handle, key) => {
+      const e = linkMet(handle, edges, names);
+      return e === undefined ? null : fieldOf(ix.edge.get(e)?.held, key);
+    };
+    env.edgeField = (edge, key) => fieldOf(ix.edge.get(edge)?.held, key);
+    env.farPoints = (name) => {
+      const r = rest(name);
+      if (!r) return [];
+      const out: [Id, Id][] = [];
+      for (const p of r.ports) {
+        if (!('edge' in p.target)) continue;
+        for (const pt of ix.pointsOn(p.target)) if (pt.node !== r.owner) out.push([pt.node, p.target.edge]);
+      }
+      return out;
+    };
+  }
+  return env;
+}
+
+/**
+ * The values the occurrence's links hold meet the rule's patterns on them (F97): each of the pattern's type or below it,
+ * with its literal fields. (A link the redex writes no value pattern on meets whatever value it holds.)
+ */
+export function linkValuesMeet(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
+  for (const p of rule.linkPatterns ?? []) {
+    const e = linkMet(handleKey(p.link), occ.edges, occ.names);
+    const v = e === undefined ? undefined : ix.edge.get(e)?.held;
+    if (!v || !sig.sub(v.type, p.type)) return false;
+    for (const [k, want] of p.fields) {
+      const have = fieldOf(v, k);
+      if (!have || scalarKey(have) !== scalarKey(want)) return false;
+    }
+  }
+  return true;
 }
 
 /** The guard holds here, and every computed value can be computed here. */
 function computable(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
-  if (!rule.guard && !rule.computed?.length) return true;
-  const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
+  if (rule.linkPatterns && !linkValuesMeet(ix, rule, occ, sig)) return false;
+  if (!rule.guard && !rule.computed?.length && !rule.linkWrites) return true;
+  const env = occEnv(ix, occ, sig, rule);
   try {
     if (rule.guard && !holds(rule.guard, env)) return false;
     for (const c of rule.computed ?? []) evaluate(c.expr, env, c.kind);
+    // (and every value written on a link, F97)
+    for (const w of rule.linkWrites ?? []) for (const [, x, kind] of w.fields) evaluate(x, env, kind);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The part of a deferred guard still matched (F99), and the link values: what a dormant occurrence must meet. */
+function matchedPart(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
+  if (rule.linkPatterns && !linkValuesMeet(ix, rule, occ, sig)) return false;
+  const m = guardParts.get(rule)?.match;
+  if (!m) return true;
+  try {
+    return holds(m, occEnv(ix, occ, sig, rule));
   } catch {
     return false;
   }

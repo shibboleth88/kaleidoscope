@@ -24,15 +24,16 @@ import {
   handleKey,
   scalarKey,
   keyed,
+  linkValueKey,
   nextIds,
   relabel,
 } from './carrier';
 import { compose } from './compose';
-import { type Occurrence, siteEnv } from './match';
+import { type Occurrence, occEnv } from './match';
 import { evaluate } from './expr';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
-import { Before, World, hasKeyed } from './world';
+import { Before, World, hasKeyed, heldOn, writesAt } from './world';
 
 export interface Decomposition {
   context: Carrier;
@@ -201,6 +202,10 @@ export interface Transition {
   edgesCreated: Id[];
   /** Scalars kept where they stood with only their values rewritten (`World.apply`'s `inPlace`; also in `kept`). */
   revalued?: Id[];
+  /** Edges kept whose values the reaction rewrote, and changed (F97): what read them is stale, and nothing else is. */
+  edgesRevalued?: Id[];
+  /** Of those, the edges whose value's type changed (or that held none): what a value pattern's type tests (F102). */
+  edgesRetyped?: Id[];
 }
 
 export interface Reacted {
@@ -210,7 +215,7 @@ export interface Reacted {
 
 /** The occurrence replaced: `apply_spec`, as composition. */
 export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, opts: { ids?: { node: Id; edge: Id }; random?: () => number } = {}): Reacted {
-  const { context, parameter, implicit } = decompose(g, rule, occ);
+  const { context: context0, parameter, implicit } = decompose(g, rule, occ);
   // fresh identities from one past the largest in use, or from where a caller's own counters stand (a world's)
   const ids = opts.ids ?? nextIds(g);
   let nextNode = ids.node;
@@ -302,8 +307,21 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
   const relabelled = relabel(rule.reactum, (x) => fn.get(x) ?? x, (x) => fe.get(x) ?? x);
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   // values computed from what the sites held
-  const env = siteEnv(ix, occ.sites, sig, occ.rests, occ.nodes);
+  const env = occEnv(ix, occ, sig, rule);
   const computed = new Map((rule.computed ?? []).map((c) => [fn.get(c.node)!, evaluate(c.expr, env, c.kind)]));
+  // values written on links (F97): a reactum edge holds what is written on it, or, kept, what it held; an outer name's
+  // link, in the context, what is written on it
+  const writes = rule.linkWrites?.length ? writesAt(rule, occ, env, ix) : null;
+  const edgesRevalued = (writes ?? []).filter((w) => w.state !== undefined && linkValueKey(ix.edge.get(w.state)?.held) !== linkValueKey(w.value)).map((w) => w.state!);
+  const edgesRetyped = (writes ?? []).filter((w) => w.state !== undefined && edgesRevalued.includes(w.state) && ix.edge.get(w.state)?.held?.type !== w.value.type).map((w) => w.state!);
+  const reactumEdges = relabelled.edges.map((e, i) => {
+    const own = heldOn(writes, rule.reactum.edges[i].id);
+    if (own.held) return { ...e, held: own.held };
+    const was = keptEdgeTo.has(rule.reactum.edges[i].id) ? ix.edge.get(keptEdgeTo.get(rule.reactum.edges[i].id)!)?.held : undefined;
+    return was ? { ...e, held: was } : e;
+  });
+  const onNames = new Map((writes ?? []).filter((w) => 'name' in w.link && w.state !== undefined).map((w) => [w.state!, w.value]));
+  const context = onNames.size ? { ...context0, edges: context0.edges.map((e) => (onNames.has(e.id) ? { ...e, held: onNames.get(e.id)! } : e)) } : context0;
   // a group with a rest of points: its own points, then the rest's, through the names the decomposition gave them
   const nameOfHandle = new Map(implicit.map(([z, h]) => [handleKey(h), z]));
   const withRests = (groups: PortGroup[]): PortGroup[] =>
@@ -315,6 +333,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
     });
   const freshReactum: Carrier = {
     ...relabelled,
+    edges: reactumEdges,
     inner: extend(relabelled.inner),
     outer: extend(relabelled.outer),
     nodes: relabelled.nodes.map((n) => ({
@@ -360,10 +379,10 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
       for (const d of rule.draws) w.draw(sig, w.drawPlan(d, at.get(d.place)!, env), opts.random, t, keptIds, new Set(), before);
     }
     w.reconcile(sig, t, keptIds, new Set(), before);
-    return { state: w.g, transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], ...t, edgesRemoved, edgesCreated } };
+    return { state: w.g, transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], ...t, edgesRemoved, edgesCreated, ...(edgesRevalued.length ? { edgesRevalued } : {}), ...(edgesRetyped.length ? { edgesRetyped } : {}) } };
   }
   return {
     state,
-    transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], removed, created, moved, copied, edgesRemoved, edgesCreated },
+    transition: { rule: rule.name, occurrence: occ, kept: [...keptIds], removed, created, moved, copied, edgesRemoved, edgesCreated, ...(edgesRevalued.length ? { edgesRevalued } : {}), ...(edgesRetyped.length ? { edgesRetyped } : {}) },
   };
 }

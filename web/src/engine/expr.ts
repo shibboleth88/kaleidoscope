@@ -19,6 +19,14 @@ export type Expr =
   | { restAttr: string; key: string }
   /** A node the redex names (`?p` where `?p = Cell[…]`): a host type's receiver or argument (host.ts). */
   | { node: number }
+  /**
+   * A field of the value a redex link holds (F97): `?v` where the redex has `~t :: T = V[k = ?v]`, or `~t.k`. The link
+   * by its handle in the redex, as `handleKey` writes it (`e3` a closed edge, `x1` an outer name).
+   */
+  | { link: string; key: string }
+  /** Within `sum[?ps …]`: the field `key` of the value held by the link of the point being summed over (`~ps.k`, F97). */
+  | { restLink: string; key: string }
+  /** An operation on its arguments; `let[name E]`, a value a rule names in its header (F104), read once per `Env`. */
   | { op: string; args: Expr[] };
 
 export class EvalError extends Error {}
@@ -37,6 +45,12 @@ export interface Env {
   shared?(a: string, b: string): number;
   /** The scalar attribute `key` of a node, if it has one. */
   attr?(node: number, key: string): Scalar | null;
+  /** A field of the value held by the state link a redex link (by its handle in the redex, `e3` or `x1`) met (F97). */
+  link?(handle: string, key: string): Scalar | null;
+  /** Each point of a rest: the far node, and the edge the point is on (a point on a hyperedge: each other node on it). */
+  farPoints?(rest: string): [number, number][];
+  /** A field of the value an edge of the state holds. */
+  edgeField?(edge: number, key: string): Scalar | null;
   /** The state node a redex node (by its identity in the redex) met. */
   nodeOf?(redexNode: number): number;
   /** The state and its signature, for a host type's arms (host.ts). */
@@ -62,12 +76,16 @@ export function withinPass<T>(fn: () => T): T {
 
 /** What `?ps.x` reads: the far node being summed over, for each rest (set by `sum`). */
 const current = new Map<string, number>();
+/** What `~ps.k` reads: the edge of the point being summed over, for each rest (set by `sum`, where its body reads it). */
+const currentEdge = new Map<string, number>();
 /**
  * The sums already worked out at an occurrence (its `Env`), by what is summed. A state does not change while an
  * occurrence's expressions are evaluated, so a sum repeated within a guard or across a reactum's values (as there is
  * no `let` to name it, F36) is worked out once.
  */
 const sums = new WeakMap<Env, Map<string, number>>();
+/** The named values already worked out at an occurrence (its `Env`), by the `let` node naming them (F104). */
+const lets = new WeakMap<Env, Map<Expr, V>>();
 
 export const NO_SITES: Env = {
   scalar: () => {
@@ -82,10 +100,21 @@ type V = number | string | boolean;
 
 const toV = (s: Scalar): V => ('int' in s ? s.int : 'float' in s ? s.float : 'text' in s ? s.text : s.bool);
 
+/** A link value's field as an expression reads it, or null where the link holds none. */
+const linkField = (e: { link: string; key: string } | { restLink: string; key: string }, env: Env): Scalar | null => {
+  if ('link' in e) return env.link?.(e.link, e.key) ?? null;
+  const edge = currentEdge.get(e.restLink);
+  return edge === undefined ? null : (env.edgeField?.(edge, e.key) ?? null);
+};
+
 /** Whether a value is a whole number held as such (an Int), so arithmetic on Ints stays whole. */
 const isInt = (e: Expr, env: Env): boolean => {
   if ('lit' in e) return 'int' in e.lit;
   if ('type' in e || 'rest' in e || 'node' in e) return false;
+  if ('link' in e || 'restLink' in e) {
+    const s = linkField(e, env);
+    return !!s && 'int' in s;
+  }
   if ('restAttr' in e) {
     const n = current.get(e.restAttr);
     const s = n === undefined ? null : (env.attr?.(n, e.key) ?? null);
@@ -97,6 +126,13 @@ const isInt = (e: Expr, env: Env): boolean => {
   }
   if (['+', '-', '*', '%', 'neg', 'abs', 'min', 'max', 'clamp'].includes(e.op)) return e.args.every((a) => isInt(a, env));
   if (e.op === 'if') return isInt(e.args[1], env) && isInt(e.args[2], env);
+  if (e.op === 'let') return isInt(e.args[1], env);
+  if (e.op === 'query') return (e.args[0] as { lit: { text: string } }).lit.text === 'count';
+  if (e.op === 'qattr') {
+    const n = current.get((e.args[0] as { lit: { text: string } }).lit.text);
+    const s = n === undefined ? null : (env.attr?.(n, (e.args[1] as { lit: { text: string } }).lit.text) ?? null);
+    return !!s && 'int' in s;
+  }
   return ['count', 'floor', 'round', 'shared'].includes(e.op);
 };
 
@@ -126,6 +162,21 @@ export function keyedCountOf(sig: import('./signature').Signature, type: number)
   }
   return null;
 }
+
+/**
+ * The queries an expression makes (F105): each `count[T(…) in ?p]` or `sum[T(…) in ?p -> E]`, by the redex node naming
+ * its place, the type its pattern meets, and the attribute keys it reads of each occurrence (its literals and bindings).
+ */
+export function queriesOf(e: Expr | undefined, out: { place: number; type: string; keys: string[] }[] = []): { place: number; type: string; keys: string[] }[] {
+  if (!e || !('op' in e)) return out;
+  if (e.op === 'query') {
+    const [, , p, t, filters, binds] = e.args as [Expr, Expr, { node: number }, { type: string }, { op: string; args: Expr[] }, { op: string; args: { lit: { text: string } }[] }];
+    out.push({ place: p.node, type: t.type, keys: [...filters.args.map((f) => ((f as { args: Expr[] }).args[0] as { lit: { text: string } }).lit.text), ...binds.args.map((b) => b.lit.text)] });
+  }
+  for (const a of e.args) queriesOf(a, out);
+  return out;
+}
+export const readsQuery = (e: Expr | undefined): boolean => queriesOf(e).length > 0;
 
 /** Whether an expression reads an amount of a class (F71): what its place holds, beyond its sites. */
 export function readsAmount(e: Expr | undefined): boolean {
@@ -212,12 +263,22 @@ function compileExpr(e: Expr): Compiled {
     f = () => {
       throw new EvalError('a named node stands only as a host method\'s receiver or argument');
     };
+  } else if ('link' in e || 'restLink' in e) {
+    const x = e;
+    f = (env) => {
+      if ('restLink' in x && !currentEdge.has(x.restLink)) throw new EvalError(`~${x.restLink}.${x.key} is read within sum[?${x.restLink} …]`);
+      const v = linkField(x, env);
+      if (!v) throw new EvalError(`a link holds no value with ${x.key}`);
+      return toV(v);
+    };
   } else if (e.op === 'sum') {
     const [over, body] = e.args;
     if (!('rest' in over)) throw new EvalError('sum[?ps E]: the first is a rest of points');
     const r = over.rest;
     const b = compileExpr(body);
     const key = JSON.stringify(e);
+    // (each point's link worked out only where the body reads its value, `~ps.k`: a sum of far attributes costs as it did)
+    const byPoint = readsRestLink(body, r);
     f = (env) => {
       // a sum not within another is the same wherever it is written: worked out once per occurrence
       const top = current.size === 0;
@@ -225,16 +286,27 @@ function compileExpr(e: Expr): Compiled {
         const hit = sums.get(env)?.get(key);
         if (hit !== undefined) return hit;
       }
-      const outer = current.get(r);
+      const outer = current.get(r), outerEdge = currentEdge.get(r);
       let total = 0;
       try {
-        for (const n of env.far?.(r) ?? []) {
-          current.set(r, n);
-          total += num(b(env), 'sum');
-        }
+        if (byPoint)
+          for (const [n, edge] of env.farPoints?.(r) ?? []) {
+            current.set(r, n);
+            currentEdge.set(r, edge);
+            total += num(b(env), 'sum');
+          }
+        else
+          for (const n of env.far?.(r) ?? []) {
+            current.set(r, n);
+            total += num(b(env), 'sum');
+          }
       } finally {
         if (outer === undefined) current.delete(r);
         else current.set(r, outer);
+        if (byPoint) {
+          if (outerEdge === undefined) currentEdge.delete(r);
+          else currentEdge.set(r, outerEdge);
+        }
       }
       if (top) {
         let m = sums.get(env);
@@ -242,6 +314,93 @@ function compileExpr(e: Expr): Compiled {
         m.set(key, total);
       }
       return total;
+    };
+  } else if (e.op === 'query') {
+    // a query over a place (F105): the nodes of the pattern's type (or below it) within the place a redex node names, at
+    // any depth (but no node's attributes), whose attributes meet the pattern's: counted, or each folded into the sum
+    const [fold, qid, p, t, filters, binds, body] = e.args as [{ lit: { text: string } }, { lit: { text: string } }, { node: number }, { type: string }, { args: { args: Expr[] }[] }, { args: { lit: { text: string } }[] }, Expr | undefined];
+    const keys = filters.args.map((x) => (x.args[0] as { lit: { text: string } }).lit.text);
+    const wants = filters.args.map((x) => compileExpr(x.args[1]));
+    const needs = binds.args.map((b) => b.lit.text);
+    const each = body ? compileExpr(body) : null;
+    const q = qid.lit.text, memo = JSON.stringify(e);
+    // (a body reading only what the query met is the same at every occurrence meeting the place: within a pass of
+    // rating that changes nothing, worked out once a place and its literals' values, as an amount is, F78)
+    const own = (x: Expr): boolean => 'lit' in x || ('op' in x && x.op !== 'query' && x.op !== 'amount' && x.op !== 'let' && !HOST_CALL.methods.has(x.op) && !NATIVE.has(x.op) && x.args.every(own));
+    const shared = !body || own(body);
+    const kept = Object.assign(new Map<string, number>(), { pass: 0 });
+    f = (env) => {
+      const ix = env.index, sig = env.sig;
+      if (!ix || !sig || !env.nodeOf || !env.attr) throw new EvalError(`${fold.lit.text}[… in ?p]: no state here`);
+      // (worked out once per occurrence, as a sum is, where no fold's term is under way)
+      const top = current.size === 0;
+      if (top) {
+        const hit = sums.get(env)?.get(memo);
+        if (hit !== undefined) return hit;
+      }
+      if (!sig.has(t.type)) return 0;
+      const T = sig.id(t.type), want = wants.map((w) => w(env));
+      const pk = pass && shared ? `${env.nodeOf(p.node)}|${want.map(String).join('|')}` : '';
+      if (pk) {
+        if (kept.pass !== pass) kept.clear(), (kept.pass = pass);
+        const hit = kept.get(pk);
+        if (hit !== undefined) return hit;
+      }
+      let total = 0;
+      const outer = current.get(q);
+      try {
+        const stack = [...ix.children({ node: env.nodeOf(p.node) })];
+        while (stack.length) {
+          const c = stack.pop()!;
+          if ('attr' in c.member) continue;
+          for (const k of ix.children({ node: c.id })) stack.push(k);
+          if (!sig.sub(c.type, T)) continue;
+          let ok = true;
+          for (let i = 0; i < keys.length && ok; i++) {
+            const v = env.attr(c.id, keys[i]);
+            ok = !!v && toV(v) === want[i];
+          }
+          for (let i = 0; i < needs.length && ok; i++) ok = !!env.attr(c.id, needs[i]);
+          if (!ok) continue;
+          if (!each) total += 1;
+          else {
+            current.set(q, c.id);
+            total += num(each(env), 'sum');
+          }
+        }
+      } finally {
+        if (outer === undefined) current.delete(q);
+        else current.set(q, outer);
+      }
+      if (top) {
+        let m = sums.get(env);
+        if (!m) sums.set(env, (m = new Map()));
+        m.set(memo, total);
+      }
+      if (pk) kept.set(pk, total);
+      return total;
+    };
+  } else if (e.op === 'qattr') {
+    const q = (e.args[0] as { lit: { text: string } }).lit.text, key = (e.args[1] as { lit: { text: string } }).lit.text;
+    f = (env) => {
+      const n = current.get(q);
+      if (n === undefined) throw new EvalError(`a query's variable is read within its query`);
+      const v = env.attr?.(n, key);
+      if (!v) throw new EvalError(`a node a query met has no ${key}`);
+      return toV(v);
+    };
+  } else if (e.op === 'let') {
+    // a value the rule names in its header, `R[x = E]` (F104): worked out once where it is first read at an occurrence,
+    // then read as worked out (an occurrence's state does not change while its expressions are evaluated). Not within a
+    // fold's term, where it could read the point being summed.
+    const inner = compileExpr(e.args[1]);
+    f = (env) => {
+      if (current.size) return inner(env);
+      let m = lets.get(env);
+      if (!m) lets.set(env, (m = new Map()));
+      let v = m.get(e);
+      if (v === undefined) m.set(e, (v = inner(env)));
+      return v;
     };
   } else if (e.op === 'amount') {
     const [p, cls] = e.args;
@@ -350,7 +509,7 @@ function interpret(e: Expr, env: Env): V {
     return toV(s);
   }
   if ('type' in e) throw new EvalError(`${e.type} is a type: count[?x ${e.type}] counts them`);
-  if ('rest' in e || 'restAttr' in e || 'node' in e) return compileExpr(e)(env);
+  if ('rest' in e || 'restAttr' in e || 'node' in e || 'link' in e || 'restLink' in e) return compileExpr(e)(env);
   const { op, args } = e;
   if (op === 'count') {
     const [a, t] = args;
@@ -428,26 +587,69 @@ export function evaluate(e: Expr, env: Env, kind: ScalarKind): Scalar {
 /** The kind an expression gives where nothing else says (no slot declares it). */
 export function kindOf(e: Expr): ScalarKind {
   if ('type' in e) return 'text';
-  if ('rest' in e || 'restAttr' in e || 'node' in e) return 'float';
+  if ('rest' in e || 'restAttr' in e || 'node' in e || 'link' in e || 'restLink' in e) return 'float';
   if ('lit' in e) return 'int' in e.lit ? 'int' : 'float' in e.lit ? 'float' : 'text' in e.lit ? 'text' : 'bool';
   if ('site' in e) return 'float';
   if (['==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'].includes(e.op)) return 'bool';
   if (e.op === '++') return 'text';
-  if (e.op === 'if') return kindOf(e.args[1]);
+  if (e.op === 'if' || e.op === 'let') return kindOf(e.args[1]);
   if (e.op === 'count' || e.op === 'floor' || e.op === 'round' || e.op === 'shared') return 'int';
+  if (e.op === 'query') return (e.args[0] as { lit: { text: string } }).lit.text === 'count' ? 'int' : 'float';
   return 'float';
 }
 
 /** Every site an expression reads. */
 export function sitesOf(e: Expr): number[] {
-  if ('lit' in e || 'type' in e || 'rest' in e || 'restAttr' in e || 'node' in e) return [];
+  if ('lit' in e || 'type' in e || 'rest' in e || 'restAttr' in e || 'node' in e || 'link' in e || 'restLink' in e) return [];
   if ('site' in e) return [e.site];
   return e.args.flatMap(sitesOf);
 }
 
+/** Whether an expression reads a link's value (F97): a redex link's field, or within a sum each point's link's. */
+export function readsLinks(e: Expr | undefined): boolean {
+  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e || 'node' in e || 'restAttr' in e) return false;
+  if ('link' in e || 'restLink' in e) return true;
+  return e.args.some(readsLinks);
+}
+
+/** Whether an expression reads, as `~r.k`, the link of the point of rest `r` being summed over. */
+function readsRestLink(e: Expr, r: string): boolean {
+  if ('restLink' in e) return e.restLink === r;
+  if (!('op' in e)) return false;
+  return e.args.some((a) => readsRestLink(a, r));
+}
+
+/**
+ * What an expression reads across links (F101): for each rest of points, the attribute keys it reads of the far nodes
+ * (`?ps.x` within `sum[?ps …]`), or 'all' where a native folds the rest and may read any. 'unknown' where what is read
+ * is not known by rest (a host method reads across its receiver's links, whichever its type declares).
+ */
+export function acrossReads(e: Expr | undefined, out: Map<string, Set<string> | 'all'> = new Map()): Map<string, Set<string> | 'all'> | 'unknown' {
+  if (!e || !('op' in e || 'restAttr' in e)) return out;
+  if ('restAttr' in e) {
+    const now = out.get(e.restAttr);
+    if (now !== 'all') (now ?? out.set(e.restAttr, new Set()).get(e.restAttr) as Set<string>).add(e.key);
+    return out;
+  }
+  if (HOST_CALL.methods.has(e.op)) return 'unknown';
+  if (NATIVE.has(e.op)) for (const a of e.args) if ('rest' in a) out.set(a.rest, 'all');
+  // (a sum has a term for each far point: it reads the rest's links' points whatever its body reads of them, F103)
+  if (e.op === 'sum' && 'rest' in e.args[0] && !out.has(e.args[0].rest)) out.set(e.args[0].rest, new Set());
+  for (const a of e.args) if (acrossReads(a, out) === 'unknown') return 'unknown';
+  return out;
+}
+
+/** Whether an expression folds over a rest of points (`sum[?ps …]`, or a native given one): it reads who is on its links. */
+export function foldsRest(e: Expr | undefined): boolean {
+  if (!e || !('op' in e)) return false;
+  if ((e.op === 'sum' || NATIVE.has(e.op) || HOST_CALL.methods.has(e.op)) && e.args.some((a) => 'rest' in a)) return true;
+  return e.args.some(foldsRest);
+}
+
 /** Whether an expression reads the nodes at the far ends of a rest's points (their attributes). */
 export function readsAcross(e: Expr | undefined): boolean {
-  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e || 'node' in e) return false;
+  // (a link's value read across a point, `~ps.k`, is no far node's attribute: discovery stales it by the edge, F97)
+  if (!e || 'lit' in e || 'site' in e || 'type' in e || 'rest' in e || 'node' in e || 'link' in e || 'restLink' in e) return false;
   if ('restAttr' in e) return true;
   // a host method reads what its type declares, across the receiver's links among it
   if (HOST_CALL.methods.has(e.op)) return true;

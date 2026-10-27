@@ -60,8 +60,35 @@ export interface Node {
 export interface Edge {
   id: Id;
   contract: Id;
+  /** A node the link refers to (`~r :: Ref[Cat] = @tom`), or none. */
   value: Id | null;
+  /**
+   * The record the link holds (chrysalis D-every-link-holds-one-value; `Edge.value : Held`, `Spec/Carrier/Carrier.lean`),
+   * absent for the unit value, a pure connection. Kaleidoscope's, PROVISIONAL (finding F97): a value is a type applied to
+   * fields that are scalars, kept here beside the edge so reading it is a lookup.
+   */
+  held?: LinkValue;
 }
+
+/** A record a link holds: a type and its fields, each a scalar, sorted by key (so equal values are equal JSON). */
+export interface LinkValue {
+  type: Id;
+  fields: [string, Scalar][];
+}
+
+/** A link value's field, if it has one. */
+export function fieldOf(v: LinkValue | undefined, key: string): Scalar | null {
+  if (!v) return null;
+  for (const [k, s] of v.fields) if (k === key) return s;
+  return null;
+}
+
+/** A link value as one string: equal values, equal keys (the unit value is ''). */
+export const linkValueKey = (v: LinkValue | undefined): string =>
+  v ? `${v.type}[${v.fields.map(([k, s]) => `${k}=${scalarKey(s)}`).join('|')}]` : '';
+
+/** A link value made from fields in any order. */
+export const linkValue = (type: Id, fields: [string, Scalar][]): LinkValue => ({ type, fields: [...fields].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) });
 
 /** A face: its places (each typed), its names (each typed), and which names are local to which place. */
 export interface Interface {

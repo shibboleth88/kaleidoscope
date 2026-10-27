@@ -21,15 +21,17 @@
 
 import { type Carrier, type Handle, type Index, type Node, memberKey, scalarKey } from './carrier';
 import { evaluate } from './expr';
-import { type Occurrence, siteEnv } from './match';
+import { type Occurrence, guardHolds, guardParts, occEnv } from './match';
 import type { Rule } from './rule';
 import type { Signature } from './signature';
 
 /** An occurrence's rate: the rule's rate expression evaluated there, or its constant rate (zero where it fails). */
 export function occurrenceRate(ix: Index, rule: Rule, o: Occurrence, sig?: Signature): number {
+  // a deferred guard (F99): an occurrence that could not fire, kept dormant, is rated zero
+  if (sig && guardParts.has(rule) && !guardHolds(ix, rule, o, sig)) return 0;
   if (!rule.rateExpr) return rule.rate ?? 1;
   try {
-    return (evaluate(rule.rateExpr, siteEnv(ix, o.sites, sig, o.rests, o.nodes), 'float') as { float: number }).float;
+    return (evaluate(rule.rateExpr, occEnv(ix, o, sig, rule), 'float') as { float: number }).float;
   } catch {
     return 0;
   }
@@ -39,7 +41,7 @@ export function occurrenceRate(ix: Index, rule: Rule, o: Occurrence, sig?: Signa
 export function occurrenceAccept(ix: Index, rule: Rule, o: Occurrence, sig?: Signature): number {
   if (!rule.accept) return 1;
   try {
-    const v = (evaluate(rule.accept, siteEnv(ix, o.sites, sig, o.rests, o.nodes), 'float') as { float: number }).float;
+    const v = (evaluate(rule.accept, occEnv(ix, o, sig, rule), 'float') as { float: number }).float;
     return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
   } catch {
     return 0;
@@ -58,7 +60,7 @@ export function effectKey(ix: Index, rule: Rule, o: Occurrence, sig?: Signature)
   const keptOf = new Map(rule.kept.map(([a, b]) => [b, a]));
   const keptEdgeOf = new Map(rule.keptEdges.map(([a, b]) => [b, a]));
   const computed = new Map((rule.computed ?? []).map((c) => [c.node, c]));
-  const env = rule.computed?.length ? siteEnv(ix, o.sites, sig, o.rests, o.nodes) : null;
+  const env = rule.computed?.length || rule.linkWrites?.length ? occEnv(ix, o, sig, rule) : null;
   const byId = new Map(R.nodes.map((n) => [n.id, n]));
   // a node's name: the state node it is, where kept; else fresh, by its type
   const label = (n: Node) => (keptOf.has(n.id) ? `s${meets.get(keptOf.get(n.id)!)}` : `f${n.type}`);
@@ -86,6 +88,16 @@ export function effectKey(ix: Index, rule: Rule, o: Occurrence, sig?: Signature)
       })
       .join(';');
     lines.push(`${where(n.parent)}>${label(n)}[${memberKey(n.member)}=${value}](${ports})`);
+  }
+  // each value written on a link (F97): the link, and what it is written
+  for (const w of rule.linkWrites ?? []) {
+    let value: string;
+    try {
+      value = w.fields.map(([k, x, kind]) => `${k}=${scalarKey(evaluate(x, env!, kind))}`).join('|');
+    } catch {
+      value = '!';
+    }
+    lines.push(`~${handle(w.link)}=${w.type}[${value}]`);
   }
   // each site: the roots it holds, under where it stands
   R.sites.forEach((p, j) => lines.push(`${where(p)}>site${JSON.stringify(R.siteKeys[j])}{${[...(o.sites[rule.sites[j]] ?? [])].sort((a, b) => a - b).join(',')}}`));

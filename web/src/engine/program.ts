@@ -14,6 +14,7 @@
  *
  * Kaleidoscope's readings, beyond what the spec has settled (each a finding in docs/SPEC-FINDINGS.md):
  * - a rule's rate is the attribute `rate` of its node, written `name[rate = …] = rule` (G7 is `proposed`);
+ * - its node's other attributes are values it names, `name[x = E] = …`, read as `?x` (F104), else labels;
  * - a slot in a type's body (`()`) is read but not enforced: a composite node here holds anything;
  * - a default is a constant, filled where a node is made (a state's nodes, a reactum's fresh ones);
  * - a module is a text of declarations; `Module["p"]` is answered as it is read, by the caller's `load`.
@@ -139,7 +140,14 @@ export function buildProgram(ast: ProgramAst, types: (TypeAst & { module: string
     const draws = Object.keys(rest).filter((k) => /^draw\d*$/.test(k)).sort((a, b) => Number(a.slice(4) || 1) - Number(b.slice(4) || 1));
     const drawTexts = draws.map((k) => rest[k]);
     for (const k of draws) delete rest[k];
-    const opts = { ...(rate !== undefined ? { rate } : {}), ...(accept !== undefined ? { accept } : {}), ...(split !== undefined ? { split } : {}), ...(drawTexts.length ? { draws: drawTexts } : {}) };
+    // every other attribute is a value the rule names (F104; SYNTAX §7, `tally[g = …]`), read as `?name` where its
+    // expressions read it, and otherwise a label (kept in `ruleAttrs` either way)
+    const lets: Record<string, Value> = {};
+    for (const it of r.attrs) if (it.k === 'member' && it.key && 'text' in it.key && it.key.text in rest && !draws.includes(it.key.text)) lets[it.key.text] = it.value;
+    const opts = {
+      ...(rate !== undefined ? { rate } : {}), ...(accept !== undefined ? { accept } : {}), ...(split !== undefined ? { split } : {}), ...(drawTexts.length ? { draws: drawTexts } : {}),
+      ...(Object.keys(lets).length ? { lets } : {}),
+    };
     // a rule making one keyed entry is read as its merge and its make (F73), so the merge can flow
     const two = split === undefined ? splitKeyed(r.rule, sig) : null;
     const readings: [string, typeof r.rule][] = two ? [[r.name, two.merge], [`${r.name}+`, two.make]] : [[r.name, r.rule]];

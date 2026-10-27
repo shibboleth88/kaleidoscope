@@ -8,10 +8,10 @@
  * - negative patterns, each extending the redex: an occurrence holds only where none of them meets the state.
  */
 
-import { type Carrier, type Id, formedProblems, keyed, sameFace } from './carrier';
+import { type Carrier, type Handle, type Id, type LinkValue, type Scalar, formedProblems, keyed, linkValue, sameFace } from './carrier';
 
 import type { Signature } from './signature';
-import type { Expr, ScalarKind } from './expr';
+import { type Env, type Expr, type ScalarKind, evaluate } from './expr';
 
 export interface Rule {
   name: string;
@@ -57,6 +57,41 @@ export interface Rule {
   draws?: Draw[];
   /** PROVISIONAL (F73): for each negative, an equality its own sites must meet with the redex's (a join), if any. */
   negativeGuards?: (Expr | undefined)[];
+  /**
+   * Patterns on the values redex links hold (F97; chrysalis SYNTAX §11, `~l = ?v`): the link, by its handle in the redex
+   * (a closed edge or an outer name), meets only a link whose value is of `type` (or a subtype) with these literal
+   * fields. A field bound to a variable is read by expressions (`{ link, key }`), and constrains nothing here. A redex
+   * link with no pattern meets a link whatever value it holds.
+   */
+  linkPatterns?: LinkPattern[];
+  /**
+   * Values the reactum writes on links (F97): the link by its handle in the reactum (a closed edge, kept or fresh, or an
+   * outer name), its value's type, and each field written. Fields left unwritten keep what the link held (a kept link's),
+   * or else take the type's defaults. A link the reactum writes no value on keeps its own (a fresh one, the unit).
+   */
+  linkWrites?: LinkWrite[];
+}
+
+export interface LinkPattern {
+  link: Handle;
+  type: Id;
+  fields: [string, Scalar][];
+}
+
+export interface LinkWrite {
+  link: Handle;
+  type: Id;
+  fields: [string, Expr, ScalarKind][];
+  /** The type's defaults, for fields neither written nor held. */
+  defaults?: [string, Scalar][];
+}
+
+/** The value a write leaves on a link that held `old` (F97), worked out at an occurrence, before anything changes. */
+export function writtenValue(w: LinkWrite, env: Env, old: LinkValue | undefined): LinkValue {
+  const fields = new Map<string, Scalar>(w.defaults ?? []);
+  for (const [k, v] of old?.fields ?? []) fields.set(k, v);
+  for (const [k, x, kind] of w.fields) fields.set(k, evaluate(x, env, kind));
+  return linkValue(w.type, [...fields]);
 }
 
 export interface Draw {

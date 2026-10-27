@@ -16,10 +16,10 @@
  * The spec's `discover_local` asks this of an implementation; the tests hold it to the full search.
  */
 
-import { type Carrier, type Id, Index, type Node, isAttr, keyed, memberKey, parentKey, scalarKey } from './carrier';
-import { type Expr, keyedCountOf, readsAcross, readsAmount, sitesOf, withinPass } from './expr';
+import { type Carrier, type Handle, type Id, Index, type Node, handleKey, isAttr, keyed, memberKey, parentKey, scalarKey } from './carrier';
+import { type Expr, acrossReads, foldsRest, keyedCountOf, queriesOf, readsQuery, readsAcross, readsAmount, readsLinks, sitesOf, withinPass } from './expr';
 import { eventRates, eventSizes } from './events';
-import { type Occurrence, discover, spotKey } from './match';
+import { type Occurrence, discover, guardHolds, guardParts, spotKey } from './match';
 import type { Transition } from './react';
 import type { View, World } from './world';
 import { type Rule, stillSites } from './rule';
@@ -54,10 +54,15 @@ export interface DiscoveryOptions {
   factor?: (rule: Rule) => boolean;
 }
 
-/** An occurrence's identity: its rule, and where it sends each redex node and edge (in the redex's order, whatever order it was found in). */
+/**
+ * An occurrence's identity: its rule, and where it sends each redex node, edge and outer name (in the redex's order,
+ * whatever order it was found in). Two occurrences meeting the same nodes by different links of an open name (a town's
+ * two trade links, `~t = Flow[…]`, F102) are two.
+ */
 const pairs = (xs: [Id, Id][]) => [...xs].sort((a, b) => a[0] - b[0]).map(([p, s]) => `${p}:${s}`).join(',');
+const namePairs = (xs: [Id, Handle][]) => (xs.length ? `|${[...xs].sort((a, b) => a[0] - b[0]).map(([x, h]) => `${x}:${handleKey(h)}`).join(',')}` : '');
 const occKey = (o: Occurrence, withSites: boolean) =>
-  `${o.rule}|${pairs(o.nodes)}|${pairs(o.edges)}${withSites ? `|${o.sites.map((x) => [...x].sort((a, b) => a - b).join('.')).join('/')}` : ''}`;
+  `${o.rule}|${pairs(o.nodes)}|${pairs(o.edges)}${namePairs(o.names)}${withSites ? `|${o.sites.map((x) => [...x].sort((a, b) => a - b).join('.')).join('/')}` : ''}`;
 
 /**
  * Whether a rule's occurrences may keep stale site contents, refreshed when it fires: nothing reads its sites (no
@@ -91,13 +96,17 @@ function regionsLinked(R: Carrier): boolean {
   const regionOf = (n: Carrier['nodes'][number]): number => ('node' in n.parent ? regionOf(byId.get(n.parent.node)!) : n.parent.region);
   const up = R.outer.places.map((_, i) => i);
   const find = (i: number): number => (up[i] === i ? i : (up[i] = find(up[i])));
-  const firstOn = new Map<Id, number>();
+  // a closed edge joins the regions its points stand in, and so does an open name met in more than one (F98): a name
+  // binds every point on it to one link of the state, so the match is as connected as by an edge, though the link's
+  // other points stand outside it
+  const firstOn = new Map<string, number>();
   for (const n of R.nodes)
     for (const g of n.ports)
       for (const [, p] of g.points) {
-        if (!('edge' in p.target)) continue;
-        const r = regionOf(n), seen = firstOn.get(p.target.edge);
-        if (seen === undefined) firstOn.set(p.target.edge, r);
+        const key = 'edge' in p.target ? `e${p.target.edge}` : 'name' in p.target ? `n${p.target.name}` : null;
+        if (key === null) continue;
+        const r = regionOf(n), seen = firstOn.get(key);
+        if (seen === undefined) firstOn.set(key, r);
         else up[find(seen)] = find(r);
       }
   return R.outer.places.every((_, i) => find(i) === find(0));
@@ -119,6 +128,65 @@ export function local(rule: Rule): boolean {
       if (!tied) return false;
     }
   return true;
+}
+
+/**
+ * What a rule reads across links (F101): for each rest its expressions fold over the far nodes' attributes of, the redex
+ * group the rest stands on (its owner's type, the group's key and contract) and the attribute keys read there (member
+ * keys), or 'all'. 'unknown' where that is not known by rest (a host method reading across its receiver's links).
+ */
+export interface AcrossRead {
+  owner: Id;
+  group: string;
+  contract: Id;
+  keys: Set<string> | 'all';
+}
+export function acrossOf(rule: Rule): AcrossRead[] | 'unknown' {
+  const reads = new Map<string, Set<string> | 'all'>();
+  for (const e of [rule.guard, rule.rateExpr, ...(rule.computed ?? []).map((c) => c.expr)]) if (acrossReads(e, reads) === 'unknown') return 'unknown';
+  const out: AcrossRead[] = [];
+  for (const [rest, keys] of reads) {
+    let at: AcrossRead | undefined;
+    for (const pn of rule.redex.nodes)
+      for (const g of pn.ports)
+        if (g.rest === rest)
+          at = { owner: pn.type, group: scalarKey(g.key), contract: g.contract, keys: keys === 'all' ? 'all' : new Set([...keys].map((k) => memberKey({ attr: { text: k } }))) };
+    if (!at) return 'unknown';
+    out.push(at);
+  }
+  return out;
+}
+
+/**
+ * The links a node's points joined or left between two of its states (F103), each with how many more points the node
+ * has on it after than before: each point counted by its group's key and its link, a node absent having none. A point
+ * renumbered in its group (F89) is no change; one moved to another group touches its link, by nothing.
+ */
+function touchedLinks(a: Node | undefined, b: Node | undefined): [Handle, number][] {
+  const count = new Map<string, number>();
+  const handles = new Map<string, Handle>();
+  for (const [n, sign] of [[a, -1], [b, 1]] as const)
+    for (const g of n?.ports ?? [])
+      for (const [, pt] of g.points) {
+        const hk = handleKey(pt.target), k = `${scalarKey(g.key)}|${hk}`;
+        count.set(k, (count.get(k) ?? 0) + sign);
+        handles.set(hk, pt.target);
+      }
+  // each link touched, and how many points the node has on it now more than before
+  const out = new Map<string, number>();
+  for (const [k, c] of count) {
+    if (c === 0) continue;
+    const hk = k.slice(k.indexOf('|') + 1);
+    out.set(hk, (out.get(hk) ?? 0) + c);
+  }
+  return [...out].map(([hk, d]) => [handles.get(hk)!, d]);
+}
+
+/** The sites an expression reads the values of: `sitesOf`, less a site read only as what `count` counts (F99). */
+function valueSitesOf(e: Expr): number[] {
+  if (!('op' in e)) return sitesOf(e);
+  if (e.op === 'count') return e.args.slice(1).flatMap(valueSitesOf);
+  return e.args.flatMap(valueSitesOf);
 }
 
 /** A node's payload as matching compares it (`plan.ts`). */
@@ -215,7 +283,8 @@ const WHOLE_AFTER = 16;
 
 export class Discovery {
   private state: Carrier | null = null;
-  private occs = new Map<string, { occ: Occurrence; spot: string; rule: Rule }>();
+  // (an occurrence of a deferred guard's rule that could not fire is held dormant: in no spot, found again by its nodes, F99)
+  private occs = new Map<string, { occ: Occurrence; spot: string; rule: Rule; dormant?: boolean }>();
   private spots = new Map<string, LiveSpot & { keys: Set<string> }>();
   private byNode = new Map<Id, Set<string>>();
   /** Of `byNode`, the occurrences that do not absorb a change below a node they meet (F95): a rule not lazy, or met there by a node holding no lazy site. */
@@ -225,12 +294,39 @@ export class Discovery {
   private readonly lazy: (Set<number> | null)[];
   /** Rules whose expressions read the far ends of a rest of points (`?ps.x`): a change there is a change to them. */
   private readonly across: boolean[];
+  /** What each such rule reads across links, by the group its rest stands on (F101); null for a rule reading none. */
+  private readonly acrossSpec: (AcrossRead[] | 'unknown' | null)[];
+  /** Whether it reads across links where that decides what meets (a guard, a computed value), not only in its rate. */
+  private readonly acrossMatch: boolean[];
+  /** Every closed edge of every rule's patterns: its contract, its points, and whether it is joined (F103). */
+  private readonly closedEdges: { contract: Id; points: number; joined: boolean }[] = [];
+  /**
+   * For each rule making queries over places (F105): each query's place (the redex node naming it), the type its pattern
+   * meets, the member keys it reads of each node it meets, and whether it decides what meets (a guard, a computed value)
+   * or only the rate. Null for a rule making none.
+   */
+  private readonly querySpecs: ({ place: Id; type: Id; keys: Set<string>; match: boolean }[] | null)[];
+  /** The occurrences of rules making queries, by the state node each meets as a query's place. */
+  private readonly queryAt = new Map<Id, Set<string>>();
+  /**
+   * For each rule, the types of the nodes its negatives add at a root, tied to the redex by a link (F103): a change at
+   * or under such a node can block or free an occurrence met at the link's other end.
+   */
+  private readonly negativeRoots: Id[][];
   /**
    * Rules whose occurrences do not depend on values: no guard, no negative, no literal value in the redex. Where
    * only values change (a count moves, nothing is made, moved or broken), such a rule's occurrences all stand, and
    * only their rates need working out again.
    */
   private readonly valueFree: boolean[];
+  /**
+   * How each rule reads the values links hold (F97): `match` where they decide what meets (a pattern's literal field, or
+   * a guard's conjunct or a value the reactum computes, matched, reading one); `types` where a pattern tests only the
+   * value's type (its fields variables); `rate` where its rate reads one, or a deferred guard or computed value does
+   * (F102); null where it reads none. A link's value rewritten in place stales exactly what reads it: found again
+   * (`match`; `types` where the value's type changed), or put in or out of its spot and rated again (`rate`).
+   */
+  private readonly linkReads: ({ match: boolean; types: boolean; rate: boolean } | null)[];
   /** The plain spots' rates, summed (F91). */
   private readonly tree = new RateTree();
   /** Spots that lost an occurrence and kept others: rated again once the update is done (F83). */
@@ -243,6 +339,8 @@ export class Discovery {
   readonly encounters: Encounter[] = [];
   private readonly parts: Discovery | null = null;
   private readonly partOf = new Map<string, { enc: Encounter; index: number }>();
+  /** For each rule, whether its guard is the rate's (F99). */
+  private defer: boolean[] = [];
 
   constructor(
     rules: Rule[],
@@ -269,9 +367,78 @@ export class Discovery {
     // what meets, and is found again)
     this.amountRates = rules.some((r) => readsAmount(r.rateExpr));
     this.amounts = rules.some((r) => [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount));
-    this.lazy = rules.map((r) => ([r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount) ? null : lazySites(r)));
+    // (and one making a query over a place reads that place's members at any depth, whatever its sites hold: F105)
+    this.lazy = rules.map((r) => ([r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount) || [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(readsQuery) ? null : lazySites(r)));
+    this.querySpecs = rules.map((r) => {
+      const at = (e: Expr | undefined, match: boolean) =>
+        queriesOf(e).map((q) => ({ place: q.place, type: sig.id(q.type), keys: new Set(q.keys.map((k) => memberKey({ attr: { text: k } }))), match }));
+      const out = [...[r.guard, ...(r.computed ?? []).map((c) => c.expr), ...(r.linkWrites ?? []).flatMap((w) => w.fields.map(([, x]) => x))].flatMap((e) => at(e, true)), ...at(r.rateExpr, false)];
+      return out.length ? out : null;
+    });
     this.across = rules.map((r) => [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(readsAcross));
+    this.acrossSpec = rules.map((r, i) => (this.across[i] || [r.guard, r.rateExpr, ...(r.computed ?? []).map((c) => c.expr)].some(foldsRest) ? acrossOf(r) : null));
+    // what a link's points joining or leaving it can change beyond the nodes that joined or left (F103): a pattern's
+    // closed edge, which meets a link of exactly its points (or, joined to an inner name, of at least them); and a
+    // negative's node standing at a root, tied to the redex by a link, which the node that joined could now be
+    for (const r of rules)
+      for (const P of [r.redex, ...r.negatives]) {
+        const joined = new Set(P.names.filter((h): h is { edge: Id } => 'edge' in h).map((h) => h.edge));
+        for (const e of P.edges) {
+          const p = P.nodes.reduce((a, n) => a + n.ports.reduce((b, g) => b + g.points.filter(([, pt]) => 'edge' in pt.target && pt.target.edge === e.id).length, 0), 0);
+          this.closedEdges.push({ contract: e.contract, points: p, joined: joined.has(e.id) });
+        }
+      }
+    this.negativeRoots = rules.map((r) => {
+      const own = new Set(r.redex.nodes.map((n) => n.id));
+      return r.negatives.flatMap((ng) => ng.nodes.filter((n) => !own.has(n.id) && 'region' in n.parent && n.ports.length).map((n) => n.type));
+    });
+    this.acrossMatch = rules.map((r) => [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAcross));
     this.valueFree = rules.map((r, i) => !r.guard && !r.negatives.length && !this.across[i] && !r.redex.nodes.some((n) => typeof n.payload === 'object'));
+    // a guard's conjuncts that read only keyed attributes of one redex node are the rate's (F99): its occurrences are
+    // matched with the rest of the guard and kept dormant where the whole fails, so a value those conjuncts read,
+    // rewritten in place, is rated again, not searched. A conjunct joining two nodes' values (`?a == ?b`) prunes pairs
+    // and stays matched; so does one reading a rest, an amount, a link's value or across links.
+    // (and so are a conjunct reading only one redex link's value, and the values a reactum computes or writes from link
+    // values, F102: a link's value rewritten in place is then rated again, not searched)
+    const writes = (r: Rule) => (r.linkWrites ?? []).flatMap((w) => w.fields.map(([, x]) => x));
+    this.defer = rules.map((r, i) => {
+      const g = r.guard;
+      const linkComputed = [...(r.computed ?? []).map((c) => c.expr), ...writes(r)].some(readsLinks);
+      if ((!g && !linkComputed) || this.across[i] || (r.computed ?? []).some((c) => readsAmount(c.expr) || readsAcross(c.expr) || readsQuery(c.expr))) return false;
+      const conjuncts = (e: Expr): Expr[] => ('op' in e && e.op === 'and' ? e.args.flatMap(conjuncts) : [e]);
+      const hasRest = (e: Expr): boolean => 'rest' in e || 'restAttr' in e || 'restLink' in e || ('op' in e && e.args.some(hasRest));
+      const linksOf = (e: Expr, out = new Set<string>()): Set<string> => {
+        if ('link' in e) out.add(e.link);
+        else if ('op' in e) for (const a of e.args) linksOf(a, out);
+        return out;
+      };
+      const deferrable = (e: Expr) => {
+        if (readsAmount(e) || readsAcross(e) || hasRest(e) || readsQuery(e)) return false;
+        const links = linksOf(e);
+        if (links.size) return links.size === 1 && !sitesOf(e).length;
+        const at = new Set<Id>(), sites = sitesOf(e);
+        for (const si of sites) {
+          const p = r.redex.sites[si];
+          if (!p || !('node' in p) || !keyed(r.redex.siteKeys[si])) return false;
+          at.add(p.node);
+        }
+        return at.size === 1;
+      };
+      const all = g ? conjuncts(g) : [], kept = all.filter((c) => !deferrable(c));
+      if (kept.length === all.length && !linkComputed) return false;
+      guardParts.set(r, { match: kept.length ? kept.reduce((a, b) => ({ op: 'and', args: [a, b] })) : undefined });
+      return true;
+    });
+    this.linkReads = rules.map((r, i) => {
+      const pats = r.linkPatterns ?? [];
+      // what decides what meets: a pattern's literal field, or a guard's conjunct (or a computed value) still matched;
+      // a pattern of variables alone binds without constraining, but for its type
+      const matched = this.defer[i] ? [guardParts.get(r)?.match] : [r.guard, ...(r.computed ?? []).map((c) => c.expr), ...writes(r)];
+      const match = pats.some((p) => p.fields.length) || matched.some(readsLinks);
+      const types = pats.length > 0;
+      const rate = readsLinks(r.rateExpr) || (this.defer[i] && [r.guard, ...(r.computed ?? []).map((c) => c.expr), ...writes(r)].some(readsLinks));
+      return match || types || rate ? { match, types, rate } : null;
+    });
   }
 
   /** The places holding these keyed entries, or the entries holding these scalars (an amount reads them there, F74). */
@@ -310,12 +477,14 @@ export class Discovery {
     const out: { type: Id; key: string | 'all'; rule: number }[] = [];
     for (const [i, r] of this.rules.entries()) {
       if (this.valueFree[i]) continue;
-      // a rule whose dependence on values is not confined to keys: every value of every node it meets
-      if (this.across[i] || (this.amounts && [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount))) {
+      // a rule whose dependence on values is not confined to keys: every value of every node it meets (a rule reading
+      // across links by its rests is: what it reads of far nodes is staled by `acrossOwners`, F101)
+      if (this.acrossSpec[i] === 'unknown' || (this.amounts && [r.guard, ...(r.computed ?? []).map((c) => c.expr)].some(readsAmount))) {
         for (const pn of [r.redex, ...r.negatives].flatMap((P) => P.nodes)) out.push({ type: pn.type, key: 'all', rule: i });
         continue;
       }
-      const patterns: [Carrier, Expr | undefined][] = [[r.redex, r.guard], ...r.negatives.map((ng, k): [Carrier, Expr | undefined] => [ng, r.negativeGuards?.[k]])];
+      // (a deferred guard reads values the rate reads, F99: a change to one rates again, it does not search)
+      const patterns: [Carrier, Expr | undefined][] = [[r.redex, this.defer[i] ? guardParts.get(r)?.match : r.guard], ...r.negatives.map((ng, k): [Carrier, Expr | undefined] => [ng, r.negativeGuards?.[k]])];
       for (const [P, g] of patterns) {
         const byId = new Map(P.nodes.map((n) => [n.id, n]));
         // literals at a node's attributes
@@ -326,8 +495,9 @@ export class Discovery {
           // (a literal standing on its own, no node's attribute: a value rewritten at a node of its type)
           else out.push({ type: n.type, key: 'all', rule: i });
         }
-        // what a guard reads
-        for (const si of g ? sitesOf(g) : []) {
+        // what a guard reads: its sites' values, but not a site only counted (`count[?ks Campaign]`): what a place
+        // holds changes by nodes made, removed or moved, which are found again as such, never by a value in place
+        for (const si of g ? valueSitesOf(g) : []) {
           const p = P.sites[si], k = P.siteKeys[si];
           const host = p && 'node' in p ? byId.get(p.node) : undefined;
           if (host) out.push({ type: host.type, key: k && keyed(k) ? memberKey(k) : 'all', rule: i });
@@ -372,6 +542,94 @@ export class Discovery {
   }
 
   /**
+   * The nodes whose occurrences, of each rule reading across links, read node `n`'s attribute at member key `key` ('all':
+   * any; '+links': `n`'s being on the links `only` names, which every fold over them reads, F103) across a link (F101): each node on a link of `n` at a point of the group a rule's rest stands on, of its owner's
+   * type. Only `n`'s links whose contract can type a point of that group are walked: a point's contract is within its
+   * link's (SYNTAX §13, "a point whose contract is narrower than the one declared"), so the owner's point, within its
+   * group's contract and the link's, makes the two meet (`meets`). A faith's link of hundreds of points is never walked
+   * for a fold over a realm's `holds`. A rule whose reads are not known by rest ('unknown') reads everything on every
+   * link of `n`, as before. `edges` is where the links' contracts are looked up; a link not there is walked.
+   */
+  private acrossOwners(ix: View, edges: Index, n: Node, key: string, into: Map<number, Set<Id>>, skip?: Set<Id>, only?: Set<string>) {
+    const add = (i: number, m: Id) => {
+      if (m === n.id || skip?.has(m)) return;
+      (into.get(i) ?? into.set(i, new Set()).get(i)!).add(m);
+    };
+    this.acrossSpec.forEach((spec, i) => {
+      if (!spec) return;
+      if (spec === 'unknown') {
+        for (const g of n.ports) for (const [, pt] of g.points) for (const p of ix.pointsOn(pt.target)) add(i, p.node);
+        return;
+      }
+      for (const s of spec) {
+        // (`+links`: n joined or left these links, which every fold over them reads; 'all': any of n's attributes)
+        if (key === 'all' ? s.keys !== 'all' && !s.keys.size : key !== '+links' && s.keys !== 'all' && !s.keys.has(key)) continue;
+        for (const g of n.ports)
+          for (const [, pt] of g.points) {
+            if (only && !only.has(handleKey(pt.target))) continue;
+            const e = 'edge' in pt.target ? edges.edge.get(pt.target.edge) : undefined;
+            if (e && !this.meets(e.contract, s.contract)) continue;
+            for (const p of ix.pointsOn(pt.target)) {
+              if (p.node === n.id || scalarKey(p.group) !== s.group) continue;
+              const m = ix.node.get(p.node);
+              if (m && this.sig.sub(m.type, s.owner)) add(i, p.node);
+            }
+          }
+      }
+    });
+  }
+
+  /**
+   * The nodes on the links of `n`, for each rule a negative of which could add `n` at a root, tied to its redex by a link
+   * (F103): an occurrence met there may be blocked or freed by what changed at or under `n`.
+   */
+  private negativeLinked(ix: View, n: Node | undefined, into: Map<number, Set<Id>>, skip?: Set<Id>) {
+    if (!n?.ports.length) return;
+    this.negativeRoots.forEach((types, i) => {
+      if (!types.some((t) => this.sig.sub(n.type, t))) return;
+      for (const g of n.ports)
+        for (const [, pt] of g.points)
+          for (const p of ix.pointsOn(pt.target)) if (p.node !== n.id && !skip?.has(p.node)) (into.get(i) ?? into.set(i, new Set()).get(i)!).add(p.node);
+    });
+  }
+
+  /** Whether some rule's query reads, of a node of this type, a value at one of these keys (any, where none are given). */
+  private queryReads(type: Id, keys?: Iterable<string>): boolean {
+    const ks = keys ? [...keys] : null;
+    return this.querySpecs.some((qs) => qs?.some((q) => this.sig.sub(type, q.type) && (!ks || ks.some((k) => q.keys.has(k)))));
+  }
+
+  /**
+   * A value at key `key` of node `m` rewritten in place (F105): for each rule a query of which reads it, the occurrences
+   * meeting, as that query's place, a node holding `m`: found again (where the query decides what meets) or rated again.
+   */
+  private queryStale(m: Node, key: string, ix: Index, into: Map<number, Set<string>>) {
+    this.querySpecs.forEach((qs, i) => {
+      const hits = qs?.filter((q) => q.keys.has(key) && this.sig.sub(m.type, q.type));
+      if (!hits?.length) return;
+      for (let up: Node | undefined = ('node' in m.parent ? ix.node.get(m.parent.node) : undefined); up; up = 'node' in up.parent ? ix.node.get(up.parent.node) : undefined)
+        for (const k of this.queryAt.get(up.id) ?? []) {
+          const v = this.occs.get(k);
+          if (!v || v.rule !== this.rules[i]) continue;
+          const at = up.id;
+          if (hits.some((q) => v.occ.nodes.some(([pn, sn]) => pn === q.place && sn === at))) (into.get(i) ?? into.set(i, new Set()).get(i)!).add(k);
+        }
+    });
+  }
+
+  /** Whether some type is within both contracts: a point of the one could stand on a link of the other. */
+  private meetsCache = new Map<string, boolean>();
+  private meets(a: Id, b: Id): boolean {
+    const k = `${a}|${b}`;
+    let v = this.meetsCache.get(k);
+    if (v === undefined) {
+      v = this.sig.sub(a, b) || this.sig.sub(b, a) || this.sig.types.some((t) => this.sig.sub(t.id, a) && this.sig.sub(t.id, b));
+      this.meetsCache.set(k, v);
+    }
+    return v;
+  }
+
+  /**
    * A world whose only change since the last step is to values: counts at the nodes `hosts` hold, moved in place
    * with their identities kept (`World.applyRepeated`). Where no rule that depends on values can meet those nodes,
    * every occurrence stands, and the rates of those meeting them are worked out again: work in proportion to what
@@ -385,10 +643,26 @@ export class Discovery {
     if (world.g !== this.state) return this.rebuild(world.g);
     const ix = world.ix;
     // (where the keys that changed at a host are known, only a rule reading one of them there decides what meets, F76)
+    // (and where a rule reads one of them across a link, F101: the update stales what folds over it)
+    const anyAcross = this.acrossSpec.some(Boolean);
     if (hosts.some((h) => {
-      const keys = changed?.get(h), type = ix.node.get(h)!.type;
+      const keys = changed?.get(h), n = ix.node.get(h)!, type = n.type;
+      if (anyAcross && n.ports.length) {
+        const owners = new Map<number, Set<Id>>();
+        for (const k of keys ?? ['all']) this.acrossOwners(ix, ix, n, k, owners);
+        if (owners.size) return true;
+      }
+      // (a value a query over a place holding the host reads: the update stales it, F105)
+      if (this.queryReads(type, keys)) return true;
       return keys ? [...keys].some((k) => this.sensitiveAt(type, k)) : this.sensitive(type);
     })) return this.update(before, ix, world.g, t);
+    // what a deferred guard reads changed at these hosts: occurrences put in or taken out of their spots (F99)
+    this.recheck(hosts, ix);
+    for (const k of this.toRate) {
+      const spot = this.spots.get(k);
+      if (spot) this.rateSpot(spot, ix, true);
+    }
+    this.toRate.clear();
     const done = new Set<string>();
     // a keyed entry's count changed: what reads an amount of its place is rated again (F74)
     const all = this.amountRates ? [...hosts, ...this.placesOf(hosts.map((h) => ix.node.get(h)!), ix)] : hosts;
@@ -445,7 +719,9 @@ export class Discovery {
       // an amount reads what its place holds: everything there
       const places = (e: Expr | undefined): Id[] => (!e || !('op' in e) ? [] : e.op === 'amount' && 'node' in e.args[0] ? [e.args[0].node] : e.args.flatMap(places));
       for (const p of places(rule.rateExpr)) m.set(p, 'all');
-      for (const i of rule.rateExpr ? sitesOf(rule.rateExpr) : []) {
+      // (a deferred guard and the computed values it gates are read with the rate, F99)
+      const rated = guardParts.has(rule) ? [rule.rateExpr, rule.guard, ...(rule.computed ?? []).map((c) => c.expr)] : [rule.rateExpr];
+      for (const i of rated.flatMap((e) => (e ? sitesOf(e) : []))) {
         const parent = R.sites[i];
         if (!parent || !('node' in parent)) continue;
         const member = R.siteKeys[i];
@@ -589,12 +865,13 @@ export class Discovery {
     this.tree.clear();
     this.byNode.clear();
     this.byNodeStrict.clear();
+    this.queryAt.clear();
     this.ratedCache.clear();
     this.toRate.clear();
     this.state = g;
     const ix = Index.of(g);
     this.rules.forEach((rule, i) => {
-      for (const o of discover(g, rule, this.sig, { index: ix, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, ix);
+      for (const o of discover(g, rule, this.sig, { index: ix, lazy: this.lazy[i] ?? undefined, deferGuard: this.defer[i] })) this.add(o, rule, ix);
     });
   }
 
@@ -661,17 +938,36 @@ export class Discovery {
     }
     // for each rule, the holders of values it reads that changed in place (F88): searched again for it alone
     const valueOnly = new Map<number, Set<Id>>();
+    // and for each rule reading across links, the nodes whose occurrences fold over a value that changed in place
+    // (F101): found again there, or rated again where only its rate folds
+    const acrossValue = new Map<number, Set<Id>>();
+    const anyAcross = this.acrossSpec.some(Boolean);
+    const anyNegative = this.negativeRoots.some((t) => t.length);
+    const anyQuery = this.querySpecs.some(Boolean);
+    const queryValue = new Map<number, Set<string>>();
     for (const id of [...changed]) {
       if (gone.has(id) || relinked.has(id)) continue;
       const a = before.node.get(id), b = after.node.get(id);
       if (!a || !b) continue;
       if (revalued.has(id)) {
         const host = 'node' in b.parent ? after.node.get(b.parent.node) : undefined;
-        if (!host || this.sensitive(b.type) || (host.ports.length && this.across.some(Boolean))) continue;
+        if (!host || this.sensitive(b.type)) continue;
+        const key = memberKey(b.member);
         // (F88: a value read by some rules' literals or guards changes what meets those rules only; the others are
         // rated again, as where no rule reads it)
-        const some = this.sensitiveAt(host.type, memberKey(b.member)) ? this.rulesAt(host.type, memberKey(b.member)) : [];
+        const some = this.sensitiveAt(host.type, key) ? this.rulesAt(host.type, key) : [];
         if (some === 'all') continue;
+        // (F101: a value read across a link, by a rule folding over the group of a node linked to the host, stales
+        // that rule there; a rule reading across links costs what it folds, not every value at every linked node)
+        if (anyAcross && host.ports.length) {
+          if (this.acrossSpec.includes('unknown')) continue;
+          this.acrossOwners(after, after, host, key, acrossValue);
+        }
+        // (F103: a value at or under a node a negative could add at a root, tied by a link: the rule is found again on
+        // that node's links)
+        if (anyNegative) for (let up: Node | undefined = host; up; up = 'node' in up.parent ? after.node.get(up.parent.node) : undefined) this.negativeLinked(after, up, valueOnly);
+        // (F105: a value a query over a place holding the host reads: what met that place, by that query)
+        if (anyQuery) this.queryStale(host, key, after, queryValue);
         changed.delete(id);
         rerate.add(host.id);
         for (const r of some) (valueOnly.get(r) ?? valueOnly.set(r, new Set()).get(r)!).add(host.id);
@@ -688,13 +984,31 @@ export class Discovery {
       } else if (a.payload !== b.payload) continue;
       changed.delete(id);
     }
-    for (const ix of [before, after])
-      for (const id of relinked) {
-        changed.add(id);
-        const n = ix.node.get(id);
-        if (!n) continue;
-        for (const grp of n.ports) for (const [, pt] of grp.points) for (const p of ix.pointsOn(pt.target)) changed.add(p.node);
+    // a relinked node changes what meets the nodes on the links it joined or left (their points, a closed edge's count,
+    // an open name's), and on no other link of it: a realm declaring a war changes its foes, not its faith's link of
+    // hundreds of points nor every community it holds (F103)
+    // (and on those only where their points' joining or leaving can change what meets the others: a closed edge's
+    // count, or a negative's root node; a fold over them is staled below, by its owners)
+    const touchedOf = new Map<Id, Set<string>>();
+    const delta = new Map<string, { h: Handle; d: number }>();
+    for (const id of relinked) {
+      changed.add(id);
+      const a = before.node.get(id), b = after.node.get(id);
+      const t = touchedLinks(a, b);
+      touchedOf.set(id, new Set(t.map(([h]) => handleKey(h))));
+      for (const [h, d] of t) {
+        const k = handleKey(h), x = delta.get(k);
+        if (x) x.d += d;
+        else delta.set(k, { h, d });
       }
+    }
+    for (const { h, d } of delta.values()) {
+      const now = after.pointsOn(h).length, was = now - d;
+      const contract = 'edge' in h ? after.edge.get(h.edge)?.contract : undefined;
+      const counts = this.closedEdges.some((e) => (contract === undefined || this.meets(e.contract, contract)) && (e.joined ? e.points <= Math.max(now, was) : e.points === now || e.points === was));
+      if (!counts && !('name' in h)) continue;
+      for (const ix of [before, after]) for (const p of ix.pointsOn(h)) changed.add(p.node);
+    }
     // and everything that holds it
     // (walked in each state on its own: a node that moved has different holders before and after)
     const affected = new Set<Id>();
@@ -711,18 +1025,24 @@ export class Discovery {
       }
     }
 
-    // what is linked to a changed node: a rule reading across links (`?ps.x`) reads them
-    // (and to a node whose attributes changed: what is read across a link is an attribute)
-    const linked = new Set<Id>();
-    if (this.across.some(Boolean))
+    // what is linked to a changed node: a rule reading across links (`?ps.x`) reads them (and to a node whose
+    // attributes changed: what is read across a link is an attribute). For each such rule, only the nodes on a link of
+    // the group its rest stands on, and only where it reads the key that changed (F101)
+    const linkedFor = new Map<number, Set<Id>>();
+    // (and for a rule with a negative's node at a root, tied by a link: what stands on the links of a node changed at or
+    // below that a negative could add, F103)
+    if (this.negativeRoots.some((t) => t.length)) for (const ix of [before, after]) for (const id of affected) this.negativeLinked(ix, ix.node.get(id), linkedFor, changed);
+    if (anyAcross)
       for (const ix of [before, after])
-        for (const id of [...changed, ...[...changed].flatMap((c) => {
-          const n = ix.node.get(c);
-          return n && 'node' in n.parent && isAttr(n.member) ? [n.parent.node] : [];
-        })]) {
+        for (const id of changed) {
           const n = ix.node.get(id);
           if (!n) continue;
-          for (const grp of n.ports) for (const [, pt] of grp.points) for (const p of ix.pointsOn(pt.target)) if (!changed.has(p.node)) linked.add(p.node);
+          // (a node that joined or left links: every fold over them, F103; and any attribute of a node made or gone)
+          const only = touchedOf.get(id);
+          if (only?.size) this.acrossOwners(ix, after, n, '+links', linkedFor, changed, only);
+          if (n.ports.length && (!before.node.get(id) || !after.node.get(id))) this.acrossOwners(ix, after, n, 'all', linkedFor, changed);
+          const h = 'node' in n.parent && isAttr(n.member) ? ix.node.get(n.parent.node) : undefined;
+          if (h?.ports.length) this.acrossOwners(ix, after, h, memberKey(n.member), linkedFor, changed);
         }
 
     // the changed nodes and their parents, before and after: where a lazy rule's new occurrences can be; and the
@@ -777,11 +1097,11 @@ export class Discovery {
       }
     }
     // a rule reading across links: what met a node linked to a change read the change
-    for (const id of linked)
-      for (const k of [...(this.byNode.get(id) ?? [])]) {
-        const v = this.occs.get(k);
-        if (v && this.across[this.rules.indexOf(v.rule)]) drop(k);
-      }
+    for (const [i, ids] of linkedFor) {
+      const rule = this.rules[i];
+      for (const id of ids)
+        for (const k of [...(this.byNode.get(id) ?? [])]) if (this.occs.get(k)?.rule === rule) drop(k);
+    }
     // a rule that lost most of what it had is found again whole: one search, not one per anchor. Only where it lost
     // many: a rule holding one occurrence loses all it had whenever that one fires, and a search of the whole state
     // for it costs what the state holds, where the anchors cost what the change touched (F87)
@@ -794,10 +1114,11 @@ export class Discovery {
     // find again: anchored at each affected node, for each redex node it could be
     this.rules.forEach((rule, i) => {
       if (whole[i]) {
-        for (const o of discover(next, rule, this.sig, { index: after, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, after);
+        for (const o of discover(next, rule, this.sig, { index: after, lazy: this.lazy[i] ?? undefined, deferGuard: this.defer[i] })) this.add(o, rule, after);
         return;
       }
-      const anchors = this.across[i] ? new Set([...(this.lazy[i] ? near : affected), ...linked]) : this.lazy[i] ? near : affected;
+      const linked = linkedFor.get(i);
+      const anchors = linked ? new Set([...(this.lazy[i] ? near : affected), ...linked]) : this.lazy[i] ? near : affected;
       for (const id of anchors) {
         const n = after.node.get(id);
         if (!n) continue;
@@ -816,12 +1137,13 @@ export class Discovery {
           // a parent anchored where its redex node has its one site: a change among what it holds is that site's,
           // so nothing new meets there (but a change to its attributes is no site's)
           if (lz && lz.has(pn.id) && !changed.has(id) && !attrsChanged.has(id)) continue;
-          for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id }, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, after);
+          for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id }, lazy: this.lazy[i] ?? undefined, deferGuard: this.defer[i] })) this.add(o, rule, after);
         }
       }
     });
     // where only values changed, what stands is rated again; and what reads an amount of a place whose entries changed
     if (this.amountRates) for (const ix of [before, after]) for (const p of this.placesOf([...t.removed, ...t.created, ...t.kept, ...(t.revalued ?? [])].map((c) => ix.node.get(c)), ix)) rerate.add(p);
+    this.recheck(rerate, after);
     const done = new Set<string>();
     withinPass(() => {
       for (const h of rerate)
@@ -839,6 +1161,82 @@ export class Discovery {
       this.toRate.clear();
     });
     for (const [i, hosts] of valueOnly) this.refind(i, hosts, after, next);
+    for (const [i, keys] of queryValue) {
+      const live = [...keys].filter((k) => this.occs.has(k));
+      if (!live.length) continue;
+      // (found again where the query decides what meets: at the places those occurrences met; else rated again)
+      const qs = this.querySpecs[i]!;
+      if (qs.some((q) => q.match)) this.refind(i, new Set(live.flatMap((k) => this.occs.get(k)!.occ.nodes.filter(([pn]) => qs.some((q) => q.place === pn)).map(([, sn]) => sn))), after, next);
+      else if (!unrated?.has(this.rules[i])) {
+        const done = new Set<string>();
+        withinPass(() => {
+          for (const k of live) {
+            const v = this.occs.get(k);
+            if (!v || done.has(v.spot)) continue;
+            done.add(v.spot);
+            const spot = this.spots.get(v.spot);
+            if (spot) this.rateSpot(spot, after);
+          }
+        });
+      }
+    }
+    for (const [i, owners] of acrossValue) {
+      if (this.acrossMatch[i]) this.refind(i, owners, after, next);
+      else if (!unrated?.has(this.rules[i])) this.rerateRule(i, owners, after);
+    }
+    if (t.edgesRevalued?.length) this.revalueLinks(t.edgesRevalued, t.edgesRetyped ?? [], after, next, whole, unrated);
+  }
+
+  /**
+   * Links whose values a reaction rewrote in place (F97), and nothing else about them: what reads those values is
+   * stale, and nothing else. Every occurrence reading a link's value meets a node on it (the link is the redex's, so a
+   * node of the redex has a point on it; or it is a point of a rest, whose owner the occurrence meets), so a rule whose
+   * matches read link values is found again at the nodes on those links, and one whose rate alone reads them is rated
+   * again there. A rule reading no link's value is not looked at.
+   */
+  private revalueLinks(edges: Id[], retyped: Id[], after: Index, next: Carrier, whole: boolean[], unrated?: Set<Rule>) {
+    const nodesOf = (es: Id[]) => {
+      const on = new Set<Id>();
+      for (const e of es) for (const p of after.pointsOn({ edge: e })) on.add(p.node);
+      return on;
+    };
+    let on: Set<Id> | undefined;
+    const nodesOn = () => (on ??= nodesOf(edges));
+    this.rules.forEach((rule, i) => {
+      const reads = this.linkReads[i];
+      if (!reads || whole[i]) return;
+      if (reads.match) return this.refind(i, nodesOn(), after, next);
+      // (a pattern of variables alone meets whatever value of its type: found again only where the type changed, F102)
+      if (reads.types && retyped.length) this.refind(i, nodesOf(retyped), after, next);
+      if (!reads.rate) return;
+      // (a deferred guard reading the value: each occurrence put in its spot or taken out as it now holds, F102)
+      if (this.defer[i]) {
+        this.recheck(nodesOn(), after, rule);
+        for (const k of this.toRate) {
+          const spot = this.spots.get(k);
+          if (spot) this.rateSpot(spot, after, true);
+        }
+        this.toRate.clear();
+      }
+      if (unrated?.has(rule)) return;
+      this.rerateRule(i, nodesOn(), after);
+    });
+  }
+
+  /** A rule's spots at these nodes rated again: what its rate reads there changed, and nothing it meets by. */
+  private rerateRule(i: number, at: Iterable<Id>, after: Index) {
+    const rule = this.rules[i];
+    const done = new Set<string>();
+    withinPass(() => {
+      for (const h of at)
+        for (const k of this.byNode.get(h) ?? []) {
+          const v = this.occs.get(k);
+          if (!v || v.rule !== rule || done.has(v.spot)) continue;
+          done.add(v.spot);
+          const spot = this.spots.get(v.spot);
+          if (spot) this.rateSpot(spot, after);
+        }
+    });
   }
 
   /**
@@ -860,7 +1258,7 @@ export class Discovery {
       for (const pn of rule.redex.nodes) {
         if (!this.sig.sub(n.type, pn.type) || payloadKey(pn) !== payloadKey(n) || memberKey(pn.member) !== memberKey(n.member)) continue;
         if (!this.literalsAgree(rule, pn.id, after, id)) continue;
-        for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id }, lazy: this.lazy[i] ?? undefined })) this.add(o, rule, after);
+        for (const o of discover(next, rule, this.sig, { index: after, anchor: { pattern: pn.id, state: id }, lazy: this.lazy[i] ?? undefined, deferGuard: this.defer[i] })) this.add(o, rule, after);
       }
     }
     for (const k of this.toRate) {
@@ -899,11 +1297,25 @@ export class Discovery {
     this.occs.set(k, { occ: o, spot: sk, rule });
     this.held.set(rule, (this.held.get(rule) ?? 0) + 1);
     const lz = this.lazy[this.rules.indexOf(rule)];
+    const qs = this.querySpecs[this.rules.indexOf(rule)];
     for (const [pn, s] of o.nodes) {
       (this.byNode.get(s) ?? this.byNode.set(s, new Set()).get(s)!).add(k);
+      if (qs?.some((q) => q.place === pn)) (this.queryAt.get(s) ?? this.queryAt.set(s, new Set()).get(s)!).add(k);
       if (!lz || !lz.has(pn)) (this.byNodeStrict.get(s) ?? this.byNodeStrict.set(s, new Set()).get(s)!).add(k);
       this.nodeVersion.set(s, (this.nodeVersion.get(s) ?? 0) + 1);
     }
+    if (this.defer[this.rules.indexOf(rule)] && !guardHolds(ix, rule, o, this.sig)) {
+      this.occs.get(k)!.dormant = true;
+      return;
+    }
+    this.attach(k, ix);
+  }
+
+  /** An occurrence put in its spot, which is rated again. */
+  private attach(k: string, ix: Index) {
+    const v = this.occs.get(k)!;
+    v.dormant = false;
+    const { occ: o, spot: sk, rule } = v;
     let spot = this.spots.get(sk);
     if (!spot) {
       spot = { rule, occurrences: [], rate: 0, keys: new Set(), key: sk };
@@ -925,8 +1337,14 @@ export class Discovery {
     for (const [, s] of v.occ.nodes) {
       this.byNode.get(s)?.delete(k);
       this.byNodeStrict.get(s)?.delete(k);
+      this.queryAt.get(s)?.delete(k);
       this.nodeVersion.set(s, (this.nodeVersion.get(s) ?? 0) + 1);
     }
+    if (!v.dormant) this.detach(k, v);
+  }
+
+  /** An occurrence taken out of its spot (the spot let go where it holds no other, else rated again). */
+  private detach(k: string, v: { occ: Occurrence; spot: string }) {
     const spot = this.spots.get(v.spot);
     if (!spot) return;
     spot.keys.delete(k);
@@ -936,6 +1354,25 @@ export class Discovery {
       if (spot.slot !== undefined) this.tree.release(spot.slot);
       this.liveVersion++;
     } else this.toRate.add(v.spot);
+  }
+
+  /**
+   * Where values read by deferred guards changed at these nodes (F99): each occurrence of such a rule meeting one is
+   * put in its spot if its guard now holds, or taken out if it no longer does. Its spot is then rated with the rest.
+   */
+  private recheck(hosts: Iterable<Id>, ix: Index, only?: Rule) {
+    if (!this.defer.some(Boolean)) return;
+    for (const h of hosts)
+      for (const k of [...(this.byNode.get(h) ?? [])]) {
+        const v = this.occs.get(k);
+        if (!v || (only && v.rule !== only) || !this.defer[this.rules.indexOf(v.rule)]) continue;
+        const holds = guardHolds(ix, v.rule, v.occ, this.sig);
+        if (v.dormant && holds) this.attach(k, ix);
+        else if (!v.dormant && !holds) {
+          v.dormant = true;
+          this.detach(k, v);
+        }
+      }
   }
 
   /**

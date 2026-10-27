@@ -6,9 +6,14 @@
  *   H[A](B)          a node of type H: ports and attributes A, members B
  *   k = t            a member at key k (in `[]`, an attribute; or, where H declares port k, a port)
  *   ~b               a link        ~b :: T   at a side's top level, a closed edge
+ *   ~b :: T = V[k = v]   a closed edge holding a value (SYNTAX §8); in a pattern `k = ?x` binds a field, `k = 3`
+ *                    meets it; `~b = V[…]`, in a rule's side, the value of a link the side names (§11; F97)
+ *   ~b.k   ~ps.k     in an expression: a field of a redex link's value; within sum[?ps …], of each point's link's
  *   ?x   k = ?x      a site, anonymous or at key k (written twice in a reactum it copies; left out it drops)
  *   ?c = t           a matched node, named: named on both sides it is kept
  *   L => R unless N  a rule; each negative names the redex's nodes it extends
+ *   R[x = E] = …     a rule's header: `rate`, `accept`, …, and values it names, read as ?x (F104)
+ *   count[T(k = v) in ?p]   sum[T(k = ?x) in ?p -> E]   a query over the place ?p, a node the redex names (F105)
  *   3  2.5  "t"  true   scalars; a bare literal is a scalar node typed by its slot, else by its kind
  *
  * Kaleidoscope conventions, beyond v004 (each said where it applies):
@@ -26,6 +31,7 @@ import {
   type Carrier,
   type Edge,
   type Handle,
+  type LinkValue,
   type Id,
   Index,
   type Member,
@@ -34,15 +40,17 @@ import {
   type PortGroup,
   type Scalar,
   emptyFace,
+  handleKey,
+  linkValue,
   isAttr,
   keyed,
   memberKey,
   scalarKey,
   memberScalar,
 } from './carrier';
-import type { Draw, Rule } from './rule';
+import type { Draw, LinkPattern, LinkWrite, Rule } from './rule';
 import { TARGET } from './keyed';
-import { type Expr, FUNCTIONS, NO_SITES, type ScalarKind, evaluate, keyedCountOf, kindOf, realDivision, sitesOf } from './expr';
+import { type Expr, FUNCTIONS, NO_SITES, type ScalarKind, evaluate, keyedCountOf, kindOf, queriesOf, realDivision, sitesOf } from './expr';
 import type { Signature } from './signature';
 
 // ── tokens ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -51,7 +59,7 @@ type Tok =
   | { t: 'id'; v: string; nl: boolean; at: number }
   | { t: 'num'; v: number; float: boolean; nl: boolean; at: number }
   | { t: 'str'; v: string; nl: boolean; at: number }
-  | { t: 'link'; v: string; nl: boolean; at: number }
+  | { t: 'link'; v: string; attr?: string; nl: boolean; at: number }
   | { t: 'site'; v: string; attr?: string; nl: boolean; at: number }
   | { t: 'sym'; v: string; nl: boolean; at: number }
   | { t: 'eof'; nl: boolean; at: number };
@@ -74,7 +82,7 @@ function lex(src: string): Tok[] {
       const two = src.slice(i, i + 2);
       const prev = out[out.length - 1];
       const afterValue = !!prev && (['id', 'num', 'str', 'site', 'link'].includes(prev.t) || (prev.t === 'sym' && (prev.v === ')' || prev.v === ']')));
-      if (['||', '=>', '::', '==', '!=', '<=', '>=', '++', '<:'].includes(two)) push({ t: 'sym', v: two, nl, at }), (i += 2);
+      if (['||', '=>', '::', '==', '!=', '<=', '>=', '++', '<:', '->'].includes(two)) push({ t: 'sym', v: two, nl, at }), (i += 2);
       else if (c === '-' && /[0-9]/.test(src[i + 1] ?? '') && !afterValue) {
         const m = /-\d+(\.\d+)?([eE][-+]?\d+)?/y;
         m.lastIndex = i;
@@ -87,14 +95,15 @@ function lex(src: string): Tok[] {
         const m = ident.exec(src);
         if (!m) throw new ReadError(`a name must follow ${c} at ${i}`);
         i = ident.lastIndex;
-        // `?ps.x`: in a fold over a rest of points, the far node's attribute x
+        // `?ps.x`: in a fold over a rest of points, the far node's attribute x; `~t.k`, a field of a link's value, and
+        // `~ps.k` in a fold, of the value of each point's link (F97)
         let attr: string | undefined;
-        if (c === '?' && src[i] === '.') {
+        if (src[i] === '.') {
           ident.lastIndex = i + 1;
           const a = ident.exec(src);
           if (a) (attr = a[0]), (i = ident.lastIndex);
         }
-        push(c === '~' ? { t: 'link', v: m[0], nl, at } : { t: 'site', v: m[0], ...(attr ? { attr } : {}), nl, at });
+        push(c === '~' ? { t: 'link', v: m[0], ...(attr ? { attr } : {}), nl, at } : { t: 'site', v: m[0], ...(attr ? { attr } : {}), nl, at });
       } else if (c === '"') {
         let s = '';
         i++;
@@ -137,13 +146,22 @@ export type Value =
   | { k: 'site'; name: string; attr?: string }
   /** A port's points: links, free points, and at most one rest (`(~c | ?ps)`). */
   | { k: 'points'; items: Value[] }
-  | { k: 'link'; name: string }
+  /** A link at a port; with `attr`, in an expression, a field of the value it holds (`~t.k`, F97). */
+  | { k: 'link'; name: string; attr?: string }
   | { k: 'free' }
   /** An expression: an operator (or a function) applied to values. */
-  | { k: 'expr'; op: string; args: Value[] };
+  | { k: 'expr'; op: string; args: Value[] }
+  /**
+   * A query (F105; SYNTAX §7, "A pattern in code is a query"): `count[T(…) in ?p]`, `sum[T(k = ?x) in ?p -> E]`, the
+   * one-node pattern's occurrences within the place a redex node names, counted or each folded into a sum.
+   */
+  | { k: 'query'; fold: 'sum' | 'count'; pattern: Value; place: Value; body: Value | null };
 export type Item =
   | { k: 'member'; key: Key | null; named: string | null; value: Value }
-  | { k: 'edge'; name: string; type: string };
+  /** `~b :: T`, a closed edge; `~b :: T = V[k = v | …]`, holding the value V (SYNTAX §8, F97). */
+  | { k: 'edge'; name: string; type: string; value?: Term }
+  /** `~b = V[…]`: in a pattern, the value of a link the side names (SYNTAX §11, `~l = ?v`); in a reactum, written on it. */
+  | { k: 'linkValue'; name: string; value: Term };
 export type MemberItem = Extract<Item, { k: 'member' }>;
 export type Term = Extract<Value, { k: 'term' }>;
 /** A rule as written: its sides, each a list of regions. */
@@ -194,13 +212,23 @@ class Parser {
 
   item(): Item {
     const t = this.peek();
-    // ~b :: T  — a closed edge
-    if (t.t === 'link' && this.isSym('::', 1)) {
+    // ~b :: T  — a closed edge; ~b :: T = V — holding a value
+    if (t.t === 'link' && !t.attr && this.isSym('::', 1)) {
       this.next();
       this.next();
       const ty = this.next();
       if (ty.t !== 'id') throw new ReadError(`a type must follow :: at ${ty.at}`);
+      if (this.isSym('=') && !this.peek().nl) {
+        this.next();
+        return { k: 'edge', name: t.v, type: ty.v, value: this.linkValue(t.v) };
+      }
       return { k: 'edge', name: t.v, type: ty.v };
+    }
+    // ~b = V  — the value a link holds
+    if (t.t === 'link' && !t.attr && this.isSym('=', 1)) {
+      this.next();
+      this.next();
+      return { k: 'linkValue', name: t.v, value: this.linkValue(t.v) };
     }
     // ?c = term  — a named match
     if (t.t === 'site' && this.isSym('=', 1)) {
@@ -226,6 +254,14 @@ class Parser {
     return { k: 'member', key: null, named: null, value: this.value() };
   }
 
+  /** A link's value: a record, `V[k = v | …]` (F97: kaleidoscope's links hold records of scalars). */
+  linkValue(name: string): Term {
+    const at = this.peek().at;
+    const v = this.value();
+    if (v.k !== 'term' || v.body !== null) throw new ReadError(`~${name} = …: a link holds a record, written V[k = v | …], at ${at}`);
+    return v;
+  }
+
   /** A value, perhaps an expression: operators bind by precedence, and never across a line break. */
   value(min = 0): Value {
     let lhs = this.primary();
@@ -248,7 +284,7 @@ class Parser {
     const items: Value[] = [];
     for (;;) {
       const t = this.peek();
-      if (t.t === 'link') items.push({ k: 'link', name: (this.next() as { v: string }).v });
+      if (t.t === 'link' && !t.attr) items.push({ k: 'link', name: (this.next() as { v: string }).v });
       else if (t.t === 'site' && !t.attr) items.push({ k: 'site', name: (this.next() as { v: string }).v });
       else if (t.t === 'sym' && t.v === '!') this.next(), items.push({ k: 'free' });
       else if (t.t === 'sym' && t.v === '|') this.next();
@@ -290,6 +326,21 @@ class Parser {
         }
         if (this.peek().t === 'eof') throw new ReadError(`an unclosed ${t.v}[`);
         args.push(this.value());
+        // `count[T(…) in ?p]`, `sum[T(k = ?x) in ?p -> E]`: a query over a place (F105)
+        const q = this.peek();
+        if (args.length === 1 && q.t === 'id' && q.v === 'in' && (t.v === 'sum' || t.v === 'count')) {
+          this.next();
+          const place = this.value();
+          let body: Value | null = null;
+          if (t.v === 'sum') {
+            if (!this.isSym('->')) throw new ReadError(`sum[T(…) in ?p -> E]: what each occurrence adds follows ->, at ${this.peek().at}`);
+            this.next();
+            body = this.value();
+          }
+          while (this.isSym('|')) this.next();
+          this.expect(']');
+          return { k: 'query', fold: t.v, pattern: args[0], place, body };
+        }
       }
       this.next();
       const [lo, hi] = FUNCTIONS[t.v];
@@ -321,7 +372,7 @@ class Parser {
   atom(): Value {
     const t = this.next();
     if (t.t === 'site') return { k: 'site', name: t.v, ...(t.attr ? { attr: t.attr } : {}) };
-    if (t.t === 'link') return { k: 'link', name: t.v };
+    if (t.t === 'link') return { k: 'link', name: t.v, ...(t.attr ? { attr: t.attr } : {}) };
     if (t.t === 'sym' && t.v === '!') return { k: 'free' };
     if (t.t === 'num') return { k: 'lit', v: t.float || !Number.isInteger(t.v) ? { float: t.v } : { int: t.v } };
     if (t.t === 'str') return { k: 'lit', v: { text: t.v } };
@@ -596,20 +647,106 @@ interface Ids {
 const KIND_TYPE: Record<ScalarKind, string> = { int: 'Int', float: 'Float', text: 'Text', bool: 'Bool' };
 const ZERO: Record<ScalarKind, Scalar> = { int: { int: 0 }, float: { float: 0 }, text: { text: '' }, bool: { bool: false } };
 
+/**
+ * What a rule's expressions read of its links' values (F97): each variable a redex link's value pattern binds
+ * (`~t :: T = V[k = ?v]`), and each redex link by name, as its handle in the redex (`e3`, `x1`), for `~t.k`.
+ */
+interface LinkScope {
+  vars: Map<string, Expr>;
+  handles: Map<string, string>;
+  /**
+   * The values a rule names in its header (F104; SYNTAX §7, `tally[g = …] = … => … ?g …`): `R[x = E] = …`, read as `?x`
+   * wherever the rule's expressions read, each built once and shared, so it is worked out once per occurrence.
+   */
+  lets?: { values: Map<string, Value>; built: Map<string, Expr>; building: string[] };
+}
+
+/** A value the rule names, `?x` where its header has `x = E` (F104): `let[x E]`, built once. */
+function letOf(name: string, sites: Map<string, number> | null, rests: Set<string>, named: Map<string, Id> | null, links: LinkScope): Expr {
+  const L = links.lets!;
+  const hit = L.built.get(name);
+  if (hit) return hit;
+  if (L.building.includes(name)) throw new ReadError(`the rule's values ${[...L.building.slice(L.building.indexOf(name)), name].join(' → ')} name each other`);
+  L.building.push(name);
+  let inner: Expr;
+  try {
+    inner = toExpr(L.values.get(name)!, sites, rests, named, links);
+  } finally {
+    L.building.pop();
+  }
+  const e: Expr = { op: 'let', args: [{ lit: { text: name } }, inner] };
+  L.built.set(name, e);
+  return e;
+}
+
+/** Within a query's body (F105): each variable its pattern binds, as the attribute it reads of the occurrence's node. */
+let queryVars: Map<string, Expr> | null = null;
+let queries = 0;
+
 /** An expression as the engine evaluates it: sites by their index in the redex. */
-function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> = new Set(), named: Map<string, Id> | null = null): Expr {
+function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> = new Set(), named: Map<string, Id> | null = null, links: LinkScope | null = null): Expr {
+  const sub = (x: Value) => toExpr(x, sites, rests, named, links);
   switch (v.k) {
     case 'lit':
       return { lit: v.v };
+    case 'link': {
+      if (!v.attr) break;
+      // `~ps.k`: in a fold over a rest of points, the value of each point's link; `~t.k`, of a link the redex names
+      if (rests.has(v.name)) return { restLink: v.name, key: v.attr };
+      const h = links?.handles.get(v.name);
+      if (h === undefined) throw new ReadError(`~${v.name}.${v.attr}: ~${v.name} is no link of the redex, nor a rest of points`);
+      return { link: h, key: v.attr };
+    }
     case 'site': {
+      if (!v.attr && queryVars?.has(v.name)) return queryVars.get(v.name)!;
       if (rests.has(v.name)) return v.attr ? { restAttr: v.name, key: v.attr } : { rest: v.name };
       // a node the redex names: a host method's receiver or argument
       if (!v.attr && named?.has(v.name) && !sites?.has(v.name)) return { node: named.get(v.name)! };
       if (v.attr) throw new ReadError(`?${v.name}.${v.attr}: ?${v.name} is no rest of points`);
+      // a field of a link's value, bound by the redex's pattern on the link (F97)
+      if (links?.vars.has(v.name) && !sites?.has(v.name)) return links.vars.get(v.name)!;
+      // a value the rule names in its header (F104)
+      if (links?.lets?.values.has(v.name) && !sites?.has(v.name)) return letOf(v.name, sites, rests, named, links);
       if (!sites) throw new ReadError(`?${v.name}: a site is read only in a reactum or a guard`);
       const i = sites.get(v.name);
       if (i === undefined) throw new ReadError(`?${v.name} is no site of the redex`);
       return { site: i };
+    }
+    case 'query': {
+      // a query over the place a redex node names (F105): its pattern one node, each attribute a literal, a value of the
+      // occurrence (a join), or a variable it binds for the body
+      if (v.place.k !== 'site' || v.place.attr || !named?.has(v.place.name)) throw new ReadError(`${v.fold}[… in ?p]: ?p is a node the redex names`);
+      const pat = v.pattern;
+      if (pat.k !== 'term') throw new ReadError(`${v.fold}[T(…) in ?p]: a query's pattern is one node, T(k = ?x | …)`);
+      const qid = `#q${queries++}`;
+      const filters: Expr[] = [], binds: Expr[] = [];
+      const vars = new Map<string, Expr>();
+      for (const it of [...pat.attrs, ...(pat.body ?? [])]) {
+        if (it.k !== 'member' || !it.key || !('text' in it.key) || it.named || it.value.k === 'term')
+          throw new ReadError(`${v.fold}[${pat.head}(…) in ?p]: a query's pattern is one node, each of its attributes k = ?x or k = a value`);
+        const key = it.key.text, x = it.value;
+        const fresh = x.k === 'site' && !x.attr && !sites?.has(x.name) && !named?.has(x.name) && !rests.has(x.name) && !links?.vars.has(x.name) && !links?.lets?.values.has(x.name) && !queryVars?.has(x.name);
+        if (fresh) {
+          if (vars.has(x.name)) throw new ReadError(`${v.fold}[${pat.head}(…) in ?p]: ?${x.name} is bound twice`);
+          const at: Expr = { op: 'qattr', args: [{ lit: { text: qid } }, { lit: { text: key } }] };
+          vars.set(x.name, at);
+          binds.push({ lit: { text: key } });
+        } else filters.push({ op: 'is', args: [{ lit: { text: key } }, sub(x)] });
+      }
+      let body: Expr | undefined;
+      if (v.body) {
+        const outer = queryVars;
+        queryVars = new Map([...(outer ?? []), ...vars]);
+        try {
+          body = sub(v.body);
+        } finally {
+          queryVars = outer;
+        }
+      }
+      return {
+        op: 'query',
+        args: [{ lit: { text: v.fold } }, { lit: { text: qid } }, { node: named.get(v.place.name)! }, { type: pat.head }, { op: 'class', args: filters }, { op: 'keys', args: binds }, ...(body ? [body] : [])],
+      };
     }
     case 'expr':
       if (v.op === 'amount') {
@@ -619,18 +756,58 @@ function toExpr(v: Value, sites: Map<string, number> | null, rests: Set<string> 
         if (!cls || cls.k !== 'term' || cls.body !== null) throw new ReadError('amount[?p Type[…]]: a type and its attributes');
         const filters: Expr[] = cls.attrs.map((it) => {
           if (it.k !== 'member' || !it.key || !('text' in it.key)) throw new ReadError('amount: each filter is `key = value`');
-          return { op: 'is', args: [{ lit: { text: it.key.text } }, toExpr(it.value, sites, rests, named)] };
+          return { op: 'is', args: [{ lit: { text: it.key.text } }, sub(it.value)] };
         });
         return { op: 'amount', args: [{ node: named.get(p.name)! }, { op: 'class', args: [{ type: cls.head }, ...filters] }] };
       }
-      return { op: v.op, args: v.args.map((a) => toExpr(a, sites, rests, named)) };
+      return { op: v.op, args: v.args.map(sub) };
     case 'term':
       // a bare type name: what count[?x Type] counts
       if (!v.attrs.length && v.body === null) return { type: v.head };
       throw new ReadError(`${v.head}[…]: only a bare type name stands in an expression`);
     default:
-      throw new ReadError('an expression is made of values, sites and operations');
   }
+  throw new ReadError('an expression is made of values, sites and operations');
+}
+
+// ── link values (F97) ──────────────────────────────────────────────────────────────────────────────────────
+
+/** A link value's type: a declared type, its head. */
+function valueType(sig: Signature, v: Term): Id {
+  if (!sig.has(v.head)) throw new ReadError(`${v.head}[…]: no type ${v.head}`);
+  return sig.id(v.head);
+}
+
+/** A field of a link value as written: `k = v`, its key a name. */
+function fieldKey(it: Item, link: string): string {
+  if (it.k !== 'member' || !it.key || !('text' in it.key) || it.named) throw new ReadError(`~${link}: each field of its value is written k = v`);
+  return it.key.text;
+}
+
+/** The kind a field's declaration gives it (on the type or a supertype), or null where it declares none. */
+function fieldKind(sig: Signature, type: Id, key: string): ScalarKind | null {
+  for (const t of sig.ups(type)) {
+    const a = sig.get(t).attrs.find((x) => x.key === key);
+    if (a) {
+      const k = sig.get(a.type).kind;
+      return k === 'int' || k === 'float' || k === 'text' || k === 'bool' ? k : null;
+    }
+  }
+  return null;
+}
+
+/** The defaults a link value's type declares for its fields. */
+function fieldDefaults(sig: Signature, type: Id): [string, Scalar][] {
+  const out = new Map<string, Scalar>();
+  for (const t of [...sig.ups(type)].reverse()) for (const a of sig.get(t).attrs) if (a.dflt) out.set(a.key, a.dflt);
+  return [...out];
+}
+
+/** A literal as the kind its field declares: a whole number written in a Float field is a float. */
+function asKind(s: Scalar, kind: ScalarKind | null): Scalar {
+  if (kind === 'float' && 'int' in s) return { float: s.int };
+  if (kind && !(kind in s)) throw new ReadError(`a ${kind} field holds ${scalarKey(s)}`);
+  return s;
 }
 
 const literalType = (s: Scalar) => ('int' in s ? 'Int' : 'float' in s ? 'Float' : 'text' in s ? 'Text' : 'Bool');
@@ -658,6 +835,10 @@ class Builder {
   siteSource: (MemberItem | null)[] = [];
   /** In a negative: its sites joined to a redex value by name (its own index, the redex site's name). */
   negJoins: [number, string][] = [];
+  /** In a redex or a reactum: the values written on links (F97), resolved to handles once the side is built. */
+  linkItems: { name: string; value: Term }[] = [];
+  /** In a reactum: what its expressions read of the redex's links' values. */
+  readLinks: LinkScope | null = null;
   constructor(
     readonly sig: Signature,
     readonly mode: Mode,
@@ -669,9 +850,44 @@ class Builder {
     readonly referSites: Set<string> = new Set(),
   ) {}
 
-  region(items: Item[], r: number) {
-    for (const it of items) if (it.k === 'edge') this.closedEdge(it.name, it.type);
-    for (const it of items) if (it.k === 'member') this.member(it, { region: r }, false, null);
+  /**
+   * A side, its regions joined by `||`. Its closed edges are declared first, whichever region each is written in (F100):
+   * an edge stands at the carrier's top level, beside the faces and outside every place (SYNTAX §13, "Edges are declared
+   * at the top level"), so a link a region uses is the edge another region declares, not an outer name of its own.
+   */
+  side(regions: Item[][]) {
+    for (const items of regions)
+      for (const it of items) {
+        if (it.k === 'edge') {
+          const e = this.closedEdge(it.name, it.type);
+          if (it.value) this.linkItem(it.name, it.value, e);
+        } else if (it.k === 'linkValue') this.linkItem(it.name, it.value, null);
+      }
+    regions.forEach((items, r) => {
+      for (const it of items) if (it.k === 'member') this.member(it, { region: r }, false, null);
+    });
+  }
+
+  /** A link written with its value (F97): in a state, held by its edge now; in a rule's side, resolved once it is built. */
+  linkItem(name: string, value: Term, edge: Id | null) {
+    if (this.mode === 'negative') throw new ReadError(`~${name} = …: an unless meets no link's value (not yet)`);
+    if (this.mode !== 'state') return void this.linkItems.push({ name, value });
+    if (edge === null) throw new ReadError(`~${name} = …: a state's link is declared with its value, ~${name} :: T = V[…]`);
+    const type = valueType(this.sig, value);
+    const fields = new Map(fieldDefaults(this.sig, type));
+    for (const it of value.attrs) {
+      const k = fieldKey(it, name);
+      const v = (it as MemberItem).value;
+      const kind = fieldKind(this.sig, type, k);
+      let lit: Scalar;
+      try {
+        lit = v.k === 'lit' ? v.v : evaluate(toExpr(v, null), NO_SITES, kind ?? kindOf(toExpr(v, null)));
+      } catch (e) {
+        throw new ReadError(`~${name}: ${k}: ${(e as Error).message}`);
+      }
+      fields.set(k, asKind(lit, kind));
+    }
+    this.edges.find((e) => e.id === edge)!.held = linkValue(type, [...fields]);
   }
 
   closedEdge(name: string, type: string): Id {
@@ -714,7 +930,10 @@ class Builder {
   member(it: Extract<Item, { k: 'member' }>, parent: Parent, attr: boolean, slotType: Id | null) {
     const member: Member = attr ? { attr: it.key } : { held: it.key };
     const v = it.value;
-    if (v.k === 'site') {
+    // (in a reactum, `k = ?x` where ?x is no site of the redex but a value the rule names or a field of a link's value
+    // is that value, computed: F104)
+    const valueName = v.k === 'site' && !v.attr && this.mode === 'reactum' && !this.readSites?.has(v.name) && it.key !== null && (!!this.readLinks?.lets?.values.has(v.name) || !!this.readLinks?.vars.has(v.name));
+    if (v.k === 'site' && !valueName) {
       if (this.mode === 'negative' && this.referSites.has(v.name)) {
         // a redex value named at an attribute of what a negative adds: a join (F68, F73), its own site equal to it
         if (!attr || it.key === null) return;
@@ -728,12 +947,12 @@ class Builder {
       return;
     }
     if (v.k === 'link' || v.k === 'free' || v.k === 'points') throw new ReadError(`a link stands only at a port`);
-    if (v.k === 'expr') {
+    if (v.k === 'expr' || v.k === 'query' || valueName) {
       const kinds: ScalarKind[] = ['int', 'float', 'text', 'bool'];
       const slotKind = slotType !== null && (kinds as string[]).includes(this.sig.get(slotType).kind) ? (this.sig.get(slotType).kind as ScalarKind) : null;
       if (this.mode === 'reactum') {
         // a value computed from what the redex's sites hold, when the rule fires
-        const expr = toExpr(v, this.readSites ?? new Map(), this.readRests ?? new Set(), this.readNamed);
+        const expr = toExpr(v, this.readSites ?? new Map(), this.readRests ?? new Set(), this.readNamed, this.readLinks);
         const kind = slotKind ?? kindOf(expr);
         const type = slotType ?? this.sig.id(KIND_TYPE[kind]);
         this.source.set(this.ids.node, it);
@@ -760,6 +979,7 @@ class Builder {
       this.nodes.push({ id: this.ids.node++, type, parent, member, payload: { scalar: v.v }, ports: [] });
       return;
     }
+    if (v.k !== 'term') throw new ReadError(`${valueText(v)}: no site here`);
     this.term(v, parent, member, it.named, it);
   }
 
@@ -945,7 +1165,7 @@ export interface Sources {
 /** A ground state: every link an edge. */
 export function buildState(regions: Item[][], sig: Signature): { carrier: Carrier; sources: Sources } {
   const b = new Builder(sig, 'state', { node: 0, edge: 0, name: 0 }, new Map());
-  regions.forEach((items, r) => b.region(items, r));
+  b.side(regions);
   return { carrier: b.carrier(regions.length, []), sources: { nodes: b.source, sites: b.siteSource, names: new Map() } };
 }
 
@@ -960,6 +1180,11 @@ export interface RuleOptions {
   split?: string;
   /** Draws of a class (F72), each `take[?p Type[filters] ?count Type[rewrites]]` (as text). */
   draws?: string[];
+  /**
+   * The values the rule names in its header (F104), `R[x = E] = …`: each read as `?x` by its guard, rate, acceptance,
+   * draws and reactum (as text, or as read). A name its expressions never read is only a label.
+   */
+  lets?: Record<string, string | Value>;
 }
 
 /** A rule, `redex => reactum unless negative …`. */
@@ -975,7 +1200,7 @@ export function buildRule(
   if (lhs.length !== rhs.length) throw new ReadError('redex and reactum have different numbers of regions');
 
   const redex = new Builder(sig, 'redex', ids, outer);
-  lhs.forEach((items, r) => redex.region(items, r));
+  redex.side(lhs);
   // a join on a value (F60, F68): a variable written at two attribute sites of the redex meets only where they hold
   // equal values. Each later writing is its own site, renamed, and an equality joins it to the first; the reactum and
   // the rate read the first. (No index by value: the equality is tested on what the redex's structure meets, B5.)
@@ -988,16 +1213,95 @@ export function buildRule(
     joins.push([j, i]);
     x.name = `${x.name}#${i}`;
   });
+  // the values the redex's links hold (F97): each met by a pattern on its link, `~t :: T = V[k = 5 | j = ?v]`, its
+  // literal fields tested where the redex meets, its variables read by the guard, the rate and the reactum. A variable
+  // written at two fields is a join, as at two attributes (F60)
+  const handleOf = (b: Builder, name: string, side: string): Handle => {
+    const e = b.edgeNames.get(name);
+    if (e !== undefined) return { edge: e };
+    const x = outer.get(name);
+    if (x !== undefined) return { name: x };
+    throw new ReadError(`~${name} = …: ~${name} is no link of the ${side}${side === 'reactum' ? ` (a link it keeps or makes is declared there, ~${name} :: T = V[…])` : ''}`);
+  };
+  const links: LinkScope = {
+    vars: new Map(),
+    handles: new Map([...[...redex.edgeNames].map(([n, e]): [string, string] => [n, `e${e}`]), ...[...outer].map(([n, x]): [string, string] => [n, `x${x}`])]),
+  };
+  if (opts.lets && Object.keys(opts.lets).length) {
+    const values = new Map<string, Value>();
+    for (const [k, x] of Object.entries(opts.lets)) {
+      try {
+        values.set(k, typeof x === 'string' ? parseValue(x) : x);
+      } catch (e) {
+        throw new ReadError(`${k}: ${(e as Error).message}`);
+      }
+    }
+    links.lets = { values, built: new Map(), building: [] };
+  }
+  const linkPatterns: LinkPattern[] = [];
+  const linkJoins: Expr[] = [];
+  {
+    const siteNames = new Set(redex.sites.map((x) => x.name));
+    for (const { name, value } of redex.linkItems) {
+      const link = handleOf(redex, name, 'redex');
+      const hk = handleKey(link);
+      if (linkPatterns.some((q) => handleKey(q.link) === hk)) throw new ReadError(`~${name}'s value is met twice`);
+      const type = valueType(sig, value);
+      const fields: [string, Scalar][] = [];
+      for (const it of value.attrs) {
+        const k = fieldKey(it, name), v = (it as MemberItem).value, kind = fieldKind(sig, type, k);
+        if (v.k === 'site' && !v.attr) {
+          if (siteNames.has(v.name) || redex.named.has(v.name) || redex.rests.has(v.name)) throw new ReadError(`?${v.name}: named in the redex already`);
+          const x: Expr = { link: hk, key: k };
+          const was = links.vars.get(v.name);
+          if (was) linkJoins.push({ op: '==', args: [was, x] });
+          else links.vars.set(v.name, x);
+          continue;
+        }
+        let lit: Scalar;
+        try {
+          lit = v.k === 'lit' ? v.v : evaluate(toExpr(v, null), NO_SITES, kind ?? kindOf(toExpr(v, null)));
+        } catch (e) {
+          throw new ReadError(`~${name}: ${k}: a pattern's field is a literal or a variable (${(e as Error).message})`);
+        }
+        fields.push([k, asKind(lit, kind)]);
+      }
+      linkPatterns.push({ link, type, fields });
+    }
+  }
+  // (a name the header gives a value is no name of the redex too: which one `?x` read would be ambiguous)
+  for (const k of links.lets?.values.keys() ?? [])
+    if (redex.sites.some((x) => x.name === k) || redex.named.has(k) || redex.rests.has(k) || links.vars.has(k))
+      throw new ReadError(`?${k} is named in the redex and given a value in the rule's header (${k} = …): one name, one meaning`);
   const reactum = new Builder(sig, 'reactum', ids, outer);
   reactum.readSites = new Map(redex.sites.map((x, i) => [x.name, i]));
   reactum.readRests = redex.rests;
   reactum.readNamed = redex.named;
-  rhs.forEach((items, r) => reactum.region(items, r));
-  const written = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests, redex.named) : undefined;
-  const guard = joins.reduce<Expr | undefined>((g, [a, b]) => {
-    const eq: Expr = { op: '==', args: [{ site: a }, { site: b }] };
-    return g ? { op: 'and', args: [g, eq] } : eq;
-  }, written);
+  reactum.readLinks = links;
+  reactum.side(rhs);
+  // the values the reactum writes on links (F97): a link it keeps or makes (`~t :: T = V[…]`), or an outer name's
+  const linkWrites: LinkWrite[] = [];
+  for (const { name, value } of reactum.linkItems) {
+    const link = handleOf(reactum, name, 'reactum');
+    if (linkWrites.some((w) => handleKey(w.link) === handleKey(link))) throw new ReadError(`~${name}'s value is written twice`);
+    const type = valueType(sig, value);
+    const fields = value.attrs.map((it): [string, Expr, ScalarKind] => {
+      const k = fieldKey(it, name), v = (it as MemberItem).value, kind = fieldKind(sig, type, k);
+      if (v.k === 'lit') {
+        const lit = asKind(v.v, kind);
+        return [k, { lit }, kind ?? kindOf({ lit })];
+      }
+      const x = toExpr(v, reactum.readSites, redex.rests, redex.named, links);
+      return [k, x, kind ?? kindOf(x)];
+    });
+    const defaults = fieldDefaults(sig, type);
+    linkWrites.push({ link, type, fields, ...(defaults.length ? { defaults } : {}) });
+  }
+  const written = ast.guard ? toExpr(ast.guard, reactum.readSites, redex.rests, redex.named, links) : undefined;
+  const guard = [...joins.map(([a, b]): Expr => ({ op: '==', args: [{ site: a }, { site: b }] })), ...linkJoins].reduce<Expr | undefined>(
+    (g, eq) => (g ? { op: 'and', args: [g, eq] } : eq),
+    written,
+  );
   let rate: number | undefined;
   let rateExpr: Expr | undefined;
   if (typeof opts.rate === 'number') rate = opts.rate;
@@ -1006,7 +1310,7 @@ export function buildRule(
     if (Number.isFinite(n)) rate = n;
     else {
       try {
-        rateExpr = realDivision(toExpr(parseValue(opts.rate), reactum.readSites, redex.rests, redex.named));
+        rateExpr = realDivision(toExpr(parseValue(opts.rate), reactum.readSites, redex.rests, redex.named, links));
       } catch (e) {
         throw new ReadError(`rate: ${(e as Error).message}`);
       }
@@ -1015,7 +1319,7 @@ export function buildRule(
   let accept: Expr | undefined;
   if (typeof opts.accept === 'string' && opts.accept.trim()) {
     try {
-      accept = realDivision(toExpr(parseValue(opts.accept), reactum.readSites, redex.rests, redex.named));
+      accept = realDivision(toExpr(parseValue(opts.accept), reactum.readSites, redex.rests, redex.named, links));
     } catch (e) {
       throw new ReadError(`accept: ${(e as Error).message}`);
     }
@@ -1063,7 +1367,7 @@ export function buildRule(
     // (put back as the class's type, or another keyed type: each attribute it keeps, and its rewrites)
     const pairs = (t: Term) => t.attrs.map((it): [string, Expr] => {
       if (it.k !== 'member' || !it.key || !('text' in it.key)) throw new ReadError('draw: each attribute is `key = value`');
-      return [it.key.text, toExpr(it.value, reactum.readSites, redex.rests, redex.named)];
+      return [it.key.text, toExpr(it.value, reactum.readSites, redex.rests, redex.named, links)];
     });
     // (put back by each molecule's own type, where the rewrite names a style key no type has: `uncharged[]` puts a
     // molecule back as the keyed type its type's `uncharged` names, F77; every keyed type of the class must name one)
@@ -1078,7 +1382,7 @@ export function buildRule(
       intoBy = rw.head;
     } else if (keyedCountOf(sig, sig.id(rw.head)) === null) throw new ReadError(`draw: ${rw.head} is no keyed type`);
     const d: Draw = {
-      place: redex.named.get(pv.name)!, type: cls.head, filters: pairs(cls), count: toExpr(kv, reactum.readSites, redex.rests, redex.named), set: pairs(rw),
+      place: redex.named.get(pv.name)!, type: cls.head, filters: pairs(cls), count: toExpr(kv, reactum.readSites, redex.rests, redex.named, links), set: pairs(rw),
       ...(intoBy ? { intoBy } : rw.head !== cls.head ? { into: rw.head } : {}),
     };
     draws.push(d);
@@ -1157,7 +1461,7 @@ export function buildRule(
   const negatives = negs.map((regions) => {
     const nb = new Builder(sig, 'negative', ids, outer, redex.named, new Set(redex.sites.map((s) => s.name)));
     nb.edgeNames = new Map(redex.edgeNames);
-    regions.forEach((items, r) => nb.region(items, r));
+    nb.side(regions);
     negSources.push({ nodes: nb.source, sites: [...R.sites.map(() => null), ...nb.siteSource], names: new Map([...nb.negOuter].map(([n, x]) => [x, n])) });
     negGuards.push(
       nb.negJoins.reduce<Expr | undefined>((g, [i, name]) => {
@@ -1176,6 +1480,12 @@ export function buildRule(
     };
   });
 
+  // a query's pattern names a type, and attributes it declares (F105): a misspelling would count nothing, silently
+  for (const e of [guard, rateExpr, accept, ...reactum.computed.map((c) => c.expr), ...linkWrites.flatMap((w) => w.fields.map(([, x]) => x)), ...draws.flatMap((d) => [d.count, ...d.filters.map(([, x]) => x), ...d.set.map(([, x]) => x)])])
+    for (const q of queriesOf(e)) {
+      if (!sig.has(q.type)) throw new ReadError(`a query's pattern: no type ${q.type}`);
+      for (const k of q.keys) if (!fieldKind(sig, sig.id(q.type), k) && ![...sig.ups(sig.id(q.type))].some((t) => sig.get(t).attrs.some((a) => a.key === k))) throw new ReadError(`a query's pattern: ${q.type} has no attribute ${k}`);
+    }
   const nameOf = new Map([...outer].map(([n, x]) => [x, n]));
   return {
     rule: {
@@ -1185,6 +1495,8 @@ export function buildRule(
       ...(split !== undefined ? { split } : {}),
       ...(draws.length ? { draws } : {}),
       ...(negGuards.some(Boolean) ? { negativeGuards: negGuards } : {}),
+      ...(linkPatterns.length ? { linkPatterns } : {}),
+      ...(linkWrites.length ? { linkWrites } : {}),
     },
     redex: { nodes: redex.source, sites: redex.siteSource, names: nameOf },
     reactum: {
@@ -1212,11 +1524,13 @@ export function valueText(v: Value): string {
   switch (v.k) {
     case 'site': return `?${v.name}${v.attr ? `.${v.attr}` : ''}`;
     case 'points': return `(${v.items.map(valueText).join(' | ')})`;
-    case 'link': return `~${v.name}`;
+    case 'link': return `~${v.name}${v.attr ? `.${v.attr}` : ''}`;
     case 'free': return '!';
     case 'lit': return litOut(v.v);
     case 'expr':
       return exprText(v, 0);
+    case 'query':
+      return `${v.fold}[${valueText(v.pattern)} in ${valueText(v.place)}${v.body ? ` -> ${valueText(v.body)}` : ''}]`;
     case 'term':
       return `${v.head}${v.attrs.length ? `[${v.attrs.map(itemText).join(' | ')}]` : ''}${v.body !== null ? `(${v.body.map(itemText).join(' | ')})` : ''}`;
   }
@@ -1233,7 +1547,8 @@ function exprText(v: Value, outer: number): string {
 }
 
 export function itemText(it: Item): string {
-  if (it.k === 'edge') return `~${it.name} :: ${it.type}`;
+  if (it.k === 'edge') return `~${it.name} :: ${it.type}${it.value ? ` = ${valueText(it.value)}` : ''}`;
+  if (it.k === 'linkValue') return `~${it.name} = ${valueText(it.value)}`;
   return `${it.key ? `${keyOut(it.key)} = ` : ''}${it.named ? `?${it.named} = ` : ''}${valueText(it.value)}`;
 }
 
@@ -1270,7 +1585,8 @@ export function print(g: Carrier, sig: Signature): string {
   });
   let names = new Map<string, string>();
   const linkName = (h: Handle): string => {
-    if ('edge' in h && ix.pointsOn(h).length === 1) return '!';
+    // (a link of one point is free, `!`, unless it holds a value, which is written where it is declared: F97)
+    if ('edge' in h && ix.pointsOn(h).length === 1 && !ix.edge.get(h.edge)?.held) return '!';
     const k = 'edge' in h ? `e${h.edge}` : 'name' in h ? `x${h.name}` : `b${h.binder}`;
     if (!names.has(k)) names.set(k, `~${'name' in h ? 'x' : 'e'}${names.size}`);
     return names.get(k)!;
@@ -1324,9 +1640,20 @@ export function print(g: Carrier, sig: Signature): string {
         const k = memberScalar(g.siteKeys[i] ?? ANON);
         return k === null ? `?s${i}` : `${keyText(k)} = ?s${i}`;
       });
-  const text = g.outer.places
-    .map((_, r) => [...members(kidsOf({ region: r })), ...sites(`r${r}`, false)].join(' | ') || '()')
-    .join(' || ');
+  const regions = g.outer.places.map((_, r) => [...members(kidsOf({ region: r })), ...sites(`r${r}`, false)]);
+  // the links holding values, declared with them where they are first met, in the order they were named (F97)
+  const declared: string[] = [];
+  const heldText = (v: LinkValue) => {
+    const fields = v.fields.map(([k, x]) => `${keyText({ text: k })} = ${scalarText(x)}`);
+    return `${sig.name(v.type)}${fields.length ? `[${fields.join(' | ')}]` : ''}`;
+  };
+  for (const [k, name] of names) {
+    if (k[0] !== 'e') continue;
+    const e = ix.edge.get(Number(k.slice(1)));
+    if (e?.held) declared.push(`${name} :: ${sig.name(e.contract)} = ${heldText(e.held)}`);
+  }
+  if (declared.length && regions.length) regions[0] = [...declared, ...regions[0]];
+  const text = regions.map((items) => items.join(' | ') || '()').join(' || ');
   return text || '()';
 }
 
