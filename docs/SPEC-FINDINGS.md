@@ -2154,3 +2154,65 @@ refused. With the in-place staleness switched off it fails at step 12; with quer
    spec's `discoverIn` should say whether a query meets the place's members only or what they hold too.
 4. Only `count` and `sum` of a one-node pattern; `group`, `->` pairs, patterns of several nodes or with links, and a
    query's own guard are not read.
+
+## Found making rules as values (reactioncraft, for Spangler's answer 1)
+
+### F106. Rule values, native: sealed once per structure, live where wired, quoted inside (proposed; semantics, PROVISIONAL)
+
+Spangler, `spangler/ANSWERS.md` 1 (reactioncraft, 2026-10-27): rule values should be native, "yes, emphatically.
+Rule values, or any state, should be something the system can generate itself." Chrysalis DESIGN §Reactions
+(a8a3939): a rule is a place and rules are matter; a rule acts only where it is wired; containment wires nothing, and an
+unwired rule is matter. Reactioncraft's minted life (`termlife/MINTING.md`, its F247) did it from outside the engine,
+a runner sealing `Rule(Lhs(Q3 | Q2) | Rhs(Q4))` values with a quoting convention (`Qk`). This does it in the engine,
+as a proposal: `src/engine/reactions.ts`, and 20 lines in `match.ts`.
+
+- **A rule value is a node,** `Reaction[at = ~w | rate = 2.0](Lhs(A | A) | Rhs(B))`, in a program that declares the
+  forms (`Reaction` with an `at` port, `Lhs`, `Rhs`; the names are options) and gives a place type a `reactions` port.
+  The value acts in the place whose `reactions` link its `at` is on, and nowhere else. One on no place's link is matter:
+  carried, copied, rewritten, inert.
+- **Sealed once per structure.** A structure is each side's items printed canonically (`print`), so values alike up to
+  identity are one structure. Met for the first time, it is compiled by `readRule`, the reader every written rule goes
+  through, into ordinary rules whose redex holds the value node for node and its items as members of the wired place;
+  so each copy wired is its own spot, the value is kept (never remade) when it fires, and a thousand copies cost one
+  compile. Two forms, which never meet the same thing twice: the value outside the place (two regions, `~w` an outer
+  name), and the value a member of the place (one region), since two regions cannot meet a value in the place they
+  meet (it would stand in the place's site, and a region's root stands in the context).
+- **Quoted inside.** Where a signature names the forms (`match.ts` `quotes`), a redex root meets no node inside a rule
+  value unless the root is one of the forms. So `eat = A => ()` cannot eat the `A` in a value's `Lhs`, and `mutate =
+  ?l = Lhs(A | ?x) => ?l = Lhs(C | ?x)` rewrites values, and the value rewritten acts as its new structure at the next
+  step. A program that names no forms is unchanged (the whole suite passes as before).
+- **Refused with a code,** the value carried as matter: `E-form` (not one `Lhs` and one `Rhs`), `E-linked` (an item on a
+  link), `E-empty` (no items to meet), `still` (it changes nothing), `E-read` (the reader refused it), or a code from the
+  world's own judgement (`admit`; minted life's mass and energy are the world's books, not the language's).
+- **Run:** `Run` steps a program by `policy.step` and, after each reaction, reads only the values it touched (made,
+  moved, copied, kept or rewritten, and their ancestors: the quote means a rule reaches inside a value only through a
+  form it keeps or makes anew), sealing what is new; a new structure rebuilds `Discovery` with its rules.
+
+**Tests:** `test/reactions.test.ts`, 10: wired acts, unwired or wired nowhere is inert, containment wires nothing, a
+value held in its own place acts there and one deeper does not yet, two copies twice the spots (control one), the
+value kept node for node, the quote (control: the engine without it eats both `A`s inside the value), forms read
+inside and the rewritten value acting at once, once per structure with refusals by code, the world's judgement, a
+system that copies, miscopies and invents values (discovery equal to a full search at every step of 300, and a full
+read of the state finding nothing the touched-values read missed), and one seed one run (control: another seed).
+Seven planted faults each turn a test red: no rebuild of discovery, forms not exempt from the quote, no held form, no
+quote, the value matched unnamed (remade at each firing), touched-values read missing what was made, and (first
+version of the discovery test) a comparison of two full searches, which never went red and was rewritten.
+
+**Measured** (3,000 reactions of that system, 2,000 to 3,000 nodes, sealing off so the same rules act throughout): 295
+and 337 reactions a second; with the outside form left out, 356 and 375, so a form a world never uses costs 10 to 20%
+(its two regions are found whole every step, `incremental.ts`); a hand-written rule of the runner-sealed kind (`Cell(A |
+A | Reaction(?v) | ?g)`) on the same world and seeds, 39 and 165.
+
+**PROVISIONAL / for the spec:**
+1. Values are ground in this version: no sites or variables in `Lhs`/`Rhs`, no links, no guard, so a value meets exact
+   items. Patterns with variables as values are what `whole.ys` `mutate` reads into; quoting them needs a site form.
+2. Wired and deeper in the place (`Cell(Genome(Reaction[at = ~c](…)))`, wired to the cell) meets nothing: v004 has no
+   "anywhere within" pattern. Should a value act from anywhere within the place it is wired to?
+3. The quote's rule: a redex root inside a value only where the root is one of the forms. Is that the language's, or
+   should quoting be by a type a program declares quoting?
+4. A value wired into the place that holds it makes its rules meet the values there (a system wired into its own place).
+   Reactioncraft measured, in its own runner (F270 there), that a law allowed to read its own value always matches
+   itself and erases itself first; here a ground value cannot match a value (its items are members of the place, and a
+   value's insides are quoted), so the question is open for values with sites.
+5. `Discovery` is rebuilt when a structure is sealed; a native `addRule` would keep it incremental. Keyed draws (DESIGN
+   D-a-draw-is-keyed-by-its-channels-own-clock) are not used: one sequential stream, as `policy.step`.

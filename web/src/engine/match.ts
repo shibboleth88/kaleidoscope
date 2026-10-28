@@ -98,6 +98,27 @@ interface Bound {
 /** How much searching there has been (for profiling). */
 export const stats = { calls: 0, found: 0 };
 
+/**
+ * PROPOSED (rule values, `reactions.ts`): the inside of a rule value is quoted. Where a signature names its rule value
+ * and its forms (`quote` there), a redex root meets no node inside a rule value unless the root is one of those forms:
+ * a rule reads or rewrites a rule value only by naming it as one, so the `A` a rule value's redex holds is never the
+ * `A` an ordinary rule eats. Signatures that name none (every program written so far) are unchanged.
+ */
+export const quotes = new WeakMap<Signature, { value: Id; forms: Set<Id> }>();
+
+function quoted(ix: Index, rule: Rule, occ: Omit<Occurrence, 'rule'>, sig: Signature): boolean {
+  const q = quotes.get(sig);
+  if (!q) return false;
+  const P = patternIndex(rule.redex);
+  for (const [pn, sn] of occ.nodes) {
+    const p = P.node.get(pn)!;
+    if (!('region' in p.parent) || q.forms.has(p.type)) continue;
+    const above = (n: Node | undefined) => (n && 'node' in n.parent ? ix.node.get(n.parent.node) : undefined);
+    for (let up = above(ix.node.get(sn)); up; up = above(up)) if (up.type === q.value) return true;
+  }
+  return false;
+}
+
 /** Every occurrence of the rule's redex in `g`, not blocked by its negatives. */
 export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOptions = {}): Occurrence[] {
   stats.calls++;
@@ -131,6 +152,7 @@ export function discover(g: Carrier, rule: Rule, sig: Signature, opts: MatchOpti
     (occ) => {
       // the guard first: it is cheap, and a negative is a search (a deferred guard is the rate's, F99)
       if (opts.deferGuard ? !matchedPart(ix, rule, occ, sig) : !computable(ix, rule, occ, sig)) return;
+      if (quoted(ix, rule, occ, sig)) return;
       if (blocked(ix, rule, occ, sig)) return;
       found.push({ ...occ, rule: rule.name });
       stats.found++;
@@ -153,6 +175,7 @@ export function discoverReference(g: Carrier, rule: Rule, sig: Signature): Occur
   const found: Occurrence[] = [];
   for (const occ of search(ix, rule.redex, sig)) {
     if (!computable(ix, rule, occ, sig)) continue;
+    if (quoted(ix, rule, occ, sig)) continue;
     if (blockedReference(ix, rule, occ, sig)) continue;
     found.push({ ...occ, rule: rule.name });
   }
