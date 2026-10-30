@@ -205,6 +205,8 @@ class RateTree {
   private changes = 0;
   readonly spots: (LiveSpot | undefined)[] = [];
   private free: number[] = [];
+  /** How many slots weigh anything: none, and the total is exactly zero, whatever rounding the sum has gathered. */
+  private weighed = 0;
   sum = 0;
 
   clear() {
@@ -212,6 +214,7 @@ class RateTree {
     this.w.fill(0);
     this.spots.length = 0;
     this.free.length = 0;
+    this.weighed = 0;
     this.sum = 0;
   }
 
@@ -236,8 +239,10 @@ class RateTree {
     const v = rate > 0 && Number.isFinite(rate) ? rate : 0;
     const d = v - this.w[i];
     if (d === 0) return;
+    if (this.w[i] === 0) this.weighed++;
+    else if (v === 0) this.weighed--;
     this.w[i] = v;
-    this.sum += d;
+    this.sum = this.weighed ? this.sum + d : 0;
     for (let j = i + 1; j <= this.n; j += j & -j) this.tree[j] += d;
     if (++this.changes >= 1 << 16) this.rebuild();
   }

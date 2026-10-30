@@ -116,6 +116,12 @@ export function decompose(g: Carrier, rule: Rule, occ: Occurrence): Decompositio
 
   // what a rest of points holds is linked outside the redex: through names of its own, as a site's contents are
   for (const [, r] of occ.rests ?? []) for (const p of r.ports) innerNameFor(p.target);
+  // and so is a port group the redex does not write at all (a subtype's own, F109): named now, before the faces are
+  for (const pn of R.nodes) {
+    const gn = ix.node.get(nmap.get(pn.id)!)!;
+    for (const grp of gn.ports)
+      if (!pn.ports.some((x) => scalarKey(x.key) === scalarKey(grp.key))) for (const [, p] of grp.points) innerNameFor(p.target);
+  }
 
   const extend = (f: Interface): Interface => ({ ...f, names: [...f.names, ...implicit.map(([z]) => [z, NAME_TYPE] as [Id, Id])] });
   const metInner = extend(R.inner);
@@ -331,6 +337,16 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
       const points = [...g.points.map(([, p]) => p), ...held.map((p) => ({ contract: p.contract, target: { name: nameOfHandle.get(handleKey(p.target))! } }))];
       return { ...g, points: points.map((p, i) => [{ int: i }, p] as [{ int: number }, typeof p]) };
     });
+  // a kept node keeps the port groups the rule does not write (a subtype's own, F109), through the names the
+  // decomposition gave their points
+  const keptState = new Set(keptTo.values());
+  const unwritten = (n: Node): PortGroup[] =>
+    keptState.has(n.id)
+      ? ix.node
+          .get(n.id)!
+          .ports.filter((g) => !n.ports.some((x) => scalarKey(x.key) === scalarKey(g.key)))
+          .map((g) => ({ ...g, points: g.points.map(([k, p]) => [k, { ...p, target: { name: nameOfHandle.get(handleKey(p.target))! } }] as [typeof k, typeof p]) }))
+      : [];
   const freshReactum: Carrier = {
     ...relabelled,
     edges: reactumEdges,
@@ -338,7 +354,7 @@ export function react(g: Carrier, rule: Rule, occ: Occurrence, sig?: Signature, 
     outer: extend(relabelled.outer),
     nodes: relabelled.nodes.map((n) => ({
       ...n,
-      ports: withRests(n.ports),
+      ports: [...withRests(n.ports), ...unwritten(n)],
       type: keptRetype.get(n.id) ?? n.type,
       ...(computed.has(n.id) ? { payload: { scalar: computed.get(n.id)! } } : {}),
     })),

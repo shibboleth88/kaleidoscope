@@ -651,13 +651,15 @@ export class World {
       const from = keptFrom.get(n.id);
       const stateType = from !== undefined ? ix.node.get(nmap.get(from)!)!.type : n.type;
       const type = from !== undefined && redexType.get(from) === n.type ? stateType : n.type;
+      // a kept node keeps the port groups the rule does not write (a subtype's own, F109), as they stood
+      const unwritten = from !== undefined ? ix.node.get(id)!.ports.filter((g) => !n.ports.some((x) => scalarKey(x.key) === scalarKey(g.key))) : [];
       return {
         id,
         type,
         parent: n.parent,
         member: n.member,
         payload: computedOf.has(n.id) ? { scalar: computedOf.get(n.id)! } : n.payload,
-        ports: portsOf(n.ports),
+        ports: [...portsOf(n.ports), ...unwritten],
       };
     });
 

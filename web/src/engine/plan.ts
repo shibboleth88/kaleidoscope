@@ -31,6 +31,7 @@ import {
   scalarKey,
 } from './carrier';
 import type { Signature } from './signature';
+import { portsFit } from './match';
 
 export interface Found {
   nodes: [Id, Id][];
@@ -444,7 +445,7 @@ export function runPlan(
     for (const gn of candidates(k, st)) {
       if (stopped) return;
       if (used.has(gn.id)) continue;
-      if (!sig.sub(gn.type, st.pn.type) || payloadKey(gn) !== st.payload || memberKey(gn.member) !== st.member || gn.ports.length !== st.ports.length) continue;
+      if (!sig.sub(gn.type, st.pn.type) || payloadKey(gn) !== st.payload || memberKey(gn.member) !== st.member || !portsFit(st.pn.type, st.ports.length, gn)) continue;
       if (st.parent !== NONE) {
         if (!('node' in gn.parent) || gn.parent.node !== nodeOf[st.parent]) continue;
       }

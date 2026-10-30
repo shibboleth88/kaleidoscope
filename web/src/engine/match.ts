@@ -36,6 +36,14 @@ import { runPlan } from './plan';
 import { type Env, EvalError, type Expr, evaluate, holds, readsLinks } from './expr';
 import type { Signature } from './signature';
 
+/**
+ * Whether a state node's port groups fit a pattern node's (F109): the same groups, or, for a node of a strict subtype
+ * of the pattern's type, more (the ports the subtype adds, which the pattern does not name: matching binds the groups the
+ * pattern names, by key, and a reaction keeps the others as they stood).
+ */
+export const portsFit = (patternType: number, patternGroups: number, gn: Node) =>
+  gn.ports.length === patternGroups || (gn.type !== patternType && gn.ports.length > patternGroups);
+
 /** One place a rule meets the state. */
 export interface Occurrence {
   rule: string;
@@ -380,8 +388,10 @@ function* search(
     while (trail.length > mark) trail.pop()!();
   };
 
+  // a node of a strict subtype may have ports its supertype does not declare (F109): the pattern binds the groups it
+  // names, by key, and the others pass through the decomposition as points the redex does not write
   const compatible = (pn: Node, gn: Node) =>
-    sig.sub(gn.type, pn.type) && samePayload(pn.payload, gn.payload) && sameMember(pn.member, gn.member) && pn.ports.length === gn.ports.length;
+    sig.sub(gn.type, pn.type) && samePayload(pn.payload, gn.payload) && sameMember(pn.member, gn.member) && portsFit(pn.type, pn.ports.length, gn);
 
   /** Bind `pn`'s points to `gn`'s, or refuse. Pushes undo steps on the trail. */
   const bindLinks = (pn: Node, gn: Node): boolean => {

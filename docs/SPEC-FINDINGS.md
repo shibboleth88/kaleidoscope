@@ -2264,3 +2264,33 @@ and twelve firings move twelve molecules with the counter. The suite: 37 files, 
 
 **For the spec:** whether a draw can ever be stepped k at once (a multivariate hypergeometric of k × count) is open; as
 written, each firing draws.
+
+### F109. A rule written for a type meets its subtypes, ports and all (changed; semantics, attributes open)
+
+**Came up:** fuga (`../fuga`), music as a bigraph. A bar is a span (`Bar <: Span`), so a rule that divides spans should
+divide bars, halves and beats alike; but a bar also links to its meter (`meter :: Measure`), a port a span does not
+have. Every rule written for spans met beats (a subtype with exactly a span's ports) and never a bar: the program
+stopped with its bars undivided. Before that, with the meter as attributes on the bar (`beats`, `unit`), the same.
+
+**What the code did:** the matchers required a pattern node and the state node it meets to have the same number of
+port groups (`compatible` in `engine/match.ts`, `assign` in `engine/plan.ts`), though the type test already allowed a
+subtype (`sig.sub`). So a subtype that adds a port was never met. `keptRetype` (react, `World.apply`) already kept a met
+node's own subtype through a reaction: subtype matching had been meant, and stopped at the ports. A subtype adding an
+attribute is not met either: its attribute is a member the pattern does not account for (F1 makes a declared attribute
+left unwritten a site at its key; one the pattern's type does not declare has no site).
+
+**Changed:** a node of a strict subtype of the pattern's type may have more port groups than the pattern (`portsFit`,
+`engine/match.ts`, used by both matchers); the groups the pattern names are bound by key, as before. A group the redex
+does not write at all passes through the decomposition as points the redex does not write already do, through names of
+their own, registered with a rest's before the faces are (`decompose`, `engine/react.ts`), and a kept node keeps such a
+group as it stood, on the links it was on (`react`; `World.apply`, `engine/world.ts`). A node not kept loses them with
+itself, as it loses any port. **Test:** `test/subtypes.test.ts`: a subtype with the same ports is met and keeps its
+type; one with a port of its own is met and keeps the port on its link, by `react` and in place; one with an attribute
+of its own is not met (open). The suite: 38 files, 186 tests.
+
+**For the spec:** what a rule's node of type T meets. As changed: any node of a subtype S of T, S's ports beyond T's
+unwritten (any link, kept on a kept node), which is F1's reading of an unwritten port extended to the ports T cannot
+name. Open: an attribute S adds. Read like F1's, it would be a site at its key, but a rule's sites are fixed when it is
+read and S is known only when a node is met; meeting one would need either a rule's sites to vary by what it meets, or
+a subtype's attributes to be held where a supertype's rule cannot see them (fuga moved the meter off the bar onto a node
+the bar links to, which reads better anyway: a meter is a thing many bars are in).
