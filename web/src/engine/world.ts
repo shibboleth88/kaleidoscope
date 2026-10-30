@@ -874,6 +874,9 @@ export function affine(rule: Rule): Affine[] | null {
   if (R.outer.places.length !== 1) return null;
   // (a value written on a link is no count: F97)
   if (rule.linkWrites?.length) return null;
+  // (nor is a draw: it moves molecules between keyed entries the reactum does not name, by chance, each firing its own,
+  // F72; a rule affine but for its draws, read as affine, was fired k at once or flowed with its draws dropped: F108)
+  if (rule.draws?.length) return null;
   const keptTo = new Map(rule.kept.map(([a, b]) => [b, a]));
   // every redex node kept, but for literals at a kept node's attributes, each written back unchanged (below; F73)
   const keptR = new Set(rule.kept.map(([a]) => a));

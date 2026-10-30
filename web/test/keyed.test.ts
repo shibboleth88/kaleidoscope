@@ -232,6 +232,28 @@ Program(
     expect(r1).toEqual({ makeA: 10 });
   });
 
+  it('a rule affine but for its draw is not affine: each firing draws (F108)', () => {
+    const q = readProgram(`
+Program(
+  module = (
+    Charged[mark :: Int | n :: Int = 0] = Type[keyed = "n"]()
+    Free[mark :: Int | n :: Int = 0] = Type[keyed = "n"]()
+    Pool = Type()
+    Held[n :: Int = 0] = Type()
+    bind[rate = 1.0 | draw = take[?p Free[] 1 Charged[]]] = (?h = Held[n = ?k] | ?p = Pool(?x)) => (?h = Held[n = ?k + 1] | ?p = Pool(?x))
+  )
+  world = (Pool(Free[mark = 0 | n = 30] | Free[mark = 1 | n = 70]) | Held)
+)`);
+    expect(affine(q.rules.find((r) => r.name === 'bind')!)).toBeNull();
+    let g = q.world;
+    for (let i = 1; i <= 12; i++) g = step(g, q.rules, q.sig, rng(i))!.state;
+    const by = (t: string) => g.nodes.filter((x) => q.sig.name(x.type) === t).reduce((a, x) => a + val(g, x.id, 'n'), 0);
+    // the counter and the molecules drawn move together, one each firing
+    expect(by('Held')).toBe(12);
+    expect(by('Charged')).toBe(12);
+    expect(by('Free')).toBe(88);
+  });
+
   it('a draw puts its molecules back as another keyed type, each keeping its marks (F72)', () => {
     const q = readProgram(`
 Program(

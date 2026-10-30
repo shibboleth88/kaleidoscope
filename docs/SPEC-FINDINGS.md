@@ -2245,3 +2245,22 @@ module-level value nor for supplying one when a program is read.
    AFM tension time course, now written into the rule as knots) or a value of a record type is not read.
 5. **Units.** wyrm's parameters are in degrees, minutes, µm; DESIGN's units-as-types would let `ab_spindle :: Degree`
    convert at the read, where here the program multiplies by π/180.
+
+### F108. A rule with a draw is not affine (changed; a bug)
+
+**Came up:** boundary's H10a, tRNA charging's fine form. A synthetase binding a tRNA is written as a count moved
+(`Held[n = ?k + 1]`) with a draw (`take[?p Free[] 1 Bound[]]`) moving one molecule between keyed entries. The run
+counted 551 bindings and moved no tRNA: the rule's explicit reactum only adds constants to counts, so `affine` read
+it as affine, and τ-leaping (`World.applyRepeated`) and the runtime's flows fired it with its draws dropped. No earlier
+rule met this: every rule with a draw also made or removed a node.
+
+**What the spec decides, and what was followed:** a draw (F72) is a library draw at each firing, without replacement,
+among the class's entries; k firings are k draws, each by chance, not one constant step. So a rule with a draw is not
+affine, whatever its reactum's counts do.
+
+**Changed:** `affine` returns null for a rule with draws (`web/src/engine/world.ts`). Rules without draws are
+unchanged; the bench is at parity. **Test:** `test/keyed.test.ts`, a counter rule affine but for its draw: not affine,
+and twelve firings move twelve molecules with the counter. The suite: 37 files, 182 tests.
+
+**For the spec:** whether a draw can ever be stepped k at once (a multivariate hypergeometric of k × count) is open; as
+written, each firing draws.
